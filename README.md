@@ -24,6 +24,8 @@ Think Redis RDB+AOF semantics with full SQL query power — in a single Go impor
 
 ## Installation
 
+### As a library
+
 ```bash
 go get github.com/voicetel/memdb
 ```
@@ -36,9 +38,6 @@ apt install gcc
 
 # macOS
 xcode-select --install
-
-# Windows
-# Install MinGW-w64: https://www.mingw-w64.org
 ```
 
 For a pure Go build with no CGo requirement:
@@ -48,8 +47,34 @@ go build -tags purego ./...
 ```
 
 > **Note:** The `purego` tag uses `modernc.org/sqlite` which does not expose the native backup API.
-> Persistence falls back to `sqlite3_serialize`/`sqlite3_deserialize`. Functionality is identical;
+> Snapshot flush and restore are unavailable in purego builds. All other functionality is identical;
 > performance is approximately 10-20% lower.
+
+### As a CLI binary (from source)
+
+A `Makefile` is provided for common development and build tasks.
+
+```bash
+git clone https://github.com/voicetel/memdb
+cd memdb
+
+make build          # build ./build/memdb
+make install        # install to /usr/local/bin
+```
+
+For a purego (no CGo) binary:
+
+```bash
+make build-purego   # build ./build/memdb-purego
+```
+
+For all supported platforms at once:
+
+```bash
+make build-all      # linux/amd64, linux/arm64, darwin/amd64, darwin/arm64
+```
+
+Run `make help` to see every available target.
 
 ---
 
@@ -451,21 +476,60 @@ srv := server.New(db, server.Config{
 
 ## CLI
 
-```bash
-# Start server
-memdb serve --config /etc/memdb/config.yaml
+Build and install the CLI with `make install`, then:
 
-# Force a snapshot
+```bash
+# Start the PostgreSQL wire-protocol server
+memdb serve --file /var/lib/myapp/data.db --addr 127.0.0.1:5433 --flush 30s
+
+# Force a snapshot flush to disk
 memdb snapshot --file /var/lib/myapp/data.db
 
-# Restore from snapshot
-memdb restore --from /var/lib/myapp/data.db
+# Restore a snapshot file to a new location
+memdb restore --from /var/lib/myapp/data.db --to /var/lib/myapp/data-copy.db
+```
 
-# Inspect WAL
-memdb wal inspect --file /var/lib/myapp/data.wal
+Each sub-command accepts `-h` for flag details:
 
-# Replay WAL against a snapshot
-memdb wal replay --snapshot data.db --wal data.wal --output recovered.db
+```bash
+memdb serve -h
+memdb snapshot -h
+memdb restore -h
+```
+
+### Makefile reference
+
+```bash
+make help               # list all targets
+
+# Build
+make build              # CGo binary → ./build/memdb
+make build-purego       # purego binary → ./build/memdb-purego
+make build-prod         # optimised production binary
+make build-all          # all platforms (linux/darwin × amd64/arm64)
+
+# Test
+make test               # run all tests
+make test-race          # run all tests with race detector
+make test-coverage      # generate HTML coverage report → ./coverage/coverage.html
+make test-ci            # vet + lint + race + coverage threshold (CI pipeline)
+make test-smoke         # quick open/write/flush/restore sanity check
+make test-specific TEST=TestFlushAndRestore  # run one test
+
+# Benchmarks
+make bench              # all benchmarks, 5 s each
+make bench-compare      # memdb vs file SQLite comparison
+make bench-concurrency  # concurrent reads at -cpu=1,4,8
+
+# Code quality
+make check              # fmt-check + vet + lint
+make lint               # golangci-lint
+make fmt                # gofmt all files
+make security           # gosec scan
+
+# Release
+make release            # clean → check → test → build-all → tarballs
+make tag VERSION_TAG=v1.2.0
 ```
 
 ---
@@ -476,9 +540,8 @@ memdb wal replay --snapshot data.db --wal data.wal --output recovered.db
 
 | Version | Status |
 |---|---|
-| 1.18 | Minimum (`any` alias required) |
-| 1.21 | Recommended |
-| 1.22+ | Fully supported |
+| 1.24 | Minimum (required by dependency graph) |
+| 1.24+ | Fully supported |
 
 ### Operating Systems
 
@@ -728,6 +791,7 @@ memdb/
 │   ├── local.go          # Atomic local file backend
 │   ├── compressed.go     # zstd compression wrapper
 │   └── encrypted.go      # AES-256-GCM encryption wrapper
+├── Makefile              # Build, test, lint, benchmark, and release targets
 └── cmd/
     └── memdb/            # CLI: serve, snapshot, restore
 ```
