@@ -11,6 +11,28 @@ import (
 	"github.com/voicetel/memdb/replication"
 )
 
+func init() {
+	// Register concrete types that may appear as SQL argument values in
+	// WALEntry.Args so that gob can encode and decode []any correctly
+	// across process boundaries and after restarts.
+	gob.Register(int(0))
+	gob.Register(int8(0))
+	gob.Register(int16(0))
+	gob.Register(int32(0))
+	gob.Register(int64(0))
+	gob.Register(uint(0))
+	gob.Register(uint8(0))
+	gob.Register(uint16(0))
+	gob.Register(uint32(0))
+	gob.Register(uint64(0))
+	gob.Register(float32(0))
+	gob.Register(float64(0))
+	gob.Register(bool(false))
+	gob.Register(string(""))
+	gob.Register([]byte(nil))
+	gob.Register(time.Time{})
+}
+
 // FSM implements raft.FSM using a *sql.DB-compatible exec function as the
 // state machine. All nodes in the cluster apply the same WAL entries in
 // the same order via Raft consensus.

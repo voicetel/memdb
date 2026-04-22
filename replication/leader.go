@@ -102,7 +102,11 @@ func (l *Leader) FollowerLag() map[string]time.Duration {
 	defer l.mu.RUnlock()
 	out := make(map[string]time.Duration, len(l.followers))
 	for id, f := range l.followers {
-		out[id] = time.Since(f.lastAck)
+		if f.lastAck.IsZero() {
+			out[id] = -1 // never acknowledged
+		} else {
+			out[id] = time.Since(f.lastAck)
+		}
 	}
 	return out
 }
