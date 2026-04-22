@@ -130,8 +130,9 @@ type Node struct {
 	cfg          NodeConfig
 	raft         *hraft.Raft
 	transport    *hraft.NetworkTransport
-	forwarder    *forwarder        // nil when ForwardAddr is empty
-	forwardPeers map[string]string // nodeID → forwardAddr
+	forwarder    *forwarder               // nil when ForwardAddr is empty
+	forwardPeers map[string]string        // nodeID → forwardAddr
+	pool         atomic.Pointer[connPool] // current leader's connection pool
 	seq          atomic.Uint64
 	isLeader     atomic.Bool
 }
@@ -262,25 +263,9 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 		}
 	}
 
-	// ── leader change observation ─────────────────────────────────────────────
-	if cfg.OnLeaderChange != nil {
-		obs := make(chan hraft.Observation, 8)
-		r.RegisterObserver(hraft.NewObserver(obs, false, func(o *hraft.Observation) bool {
-			_, ok := o.Data.(hraft.LeaderObservation)
-			return ok
-		}))
-		go func() {
-			for o := range obs {
-				if lo, ok := o.Data.(hraft.LeaderObservation); ok {
-					isLeader := string(lo.LeaderID) == cfg.NodeID
-					node.isLeader.Store(isLeader)
-					cfg.OnLeaderChange(isLeader)
-				}
-			}
-		}()
-	}
-
 	// ── forward peers map ────────────────────────────────────────────────────
+	// Must be built before the observer goroutine starts — the goroutine reads
+	// forwardPeers via poolForLeader and would race with this write otherwise.
 	forwardPeers := make(map[string]string, len(cfg.ForwardPeers))
 	for _, p := range cfg.ForwardPeers {
 		idx := -1
@@ -295,6 +280,36 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 		}
 	}
 	node.forwardPeers = forwardPeers
+
+	// ── leader change observation ─────────────────────────────────────────────
+	// Always register the observer so we can maintain the connection pool
+	// regardless of whether the caller supplied an OnLeaderChange callback.
+	obs := make(chan hraft.Observation, 8)
+	r.RegisterObserver(hraft.NewObserver(obs, false, func(o *hraft.Observation) bool {
+		_, ok := o.Data.(hraft.LeaderObservation)
+		return ok
+	}))
+	go func() {
+		for o := range obs {
+			lo, ok := o.Data.(hraft.LeaderObservation)
+			if !ok {
+				continue
+			}
+			isLeader := string(lo.LeaderID) == cfg.NodeID
+			node.isLeader.Store(isLeader)
+
+			// Swap the connection pool to point at the new leader's
+			// ForwardAddr. Close the old pool so its idle connections are
+			// not handed to callers targeting the previous leader.
+			if old := node.pool.Swap(node.poolForLeader(string(lo.LeaderID))); old != nil {
+				old.Close()
+			}
+
+			if cfg.OnLeaderChange != nil {
+				cfg.OnLeaderChange(isLeader)
+			}
+		}
+	}()
 
 	// ── forwarder (optional) ─────────────────────────────────────────────────
 	if cfg.ForwardAddr != "" {
@@ -313,6 +328,11 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 // is committed on a quorum of nodes (or the apply timeout is reached).
 // If this node is not the leader and ForwardPeers is configured, the write
 // is transparently forwarded to the leader. Otherwise ErrNotLeader is returned.
+// Exec submits a SQL write through Raft consensus. Blocks until the entry
+// is committed on a quorum of nodes (or the apply timeout is reached).
+// If this node is not the leader and ForwardPeers is configured, the write
+// is transparently forwarded to the leader using a pooled TLS connection.
+// Otherwise ErrNotLeader is returned.
 func (n *Node) Exec(sql string, args ...any) error {
 	// If we are the leader, apply directly through Raft.
 	if n.raft.State() == hraft.Leader {
@@ -325,22 +345,44 @@ func (n *Node) Exec(sql string, args ...any) error {
 		return Apply(n.raft, entry, n.cfg.ApplyTimeout)
 	}
 
-	// We are not the leader. Forward to the leader's forwarding endpoint.
+	// We are not the leader. Forward to the leader using the connection pool.
 	leaderAddr, leaderID := n.raft.LeaderWithID()
 	if leaderAddr == "" {
 		return fmt.Errorf("%w: no leader elected yet", ErrNotLeader)
 	}
 
-	fwdAddr, ok := n.forwardPeers[string(leaderID)]
-	if !ok {
-		// ForwardPeers not configured — fall back to error.
-		return fmt.Errorf("%w: leader is %s (configure ForwardPeers to enable transparent forwarding)", ErrNotLeader, leaderID)
+	pool := n.pool.Load()
+	if pool == nil {
+		// Pool not yet initialised (leader just elected) — try to build one.
+		pool = n.poolForLeader(string(leaderID))
+		if pool == nil {
+			return fmt.Errorf("%w: leader is %s (configure ForwardPeers to enable transparent forwarding)", ErrNotLeader, leaderID)
+		}
+		// Store only if nobody beat us to it; if they did, use theirs and
+		// discard the one we just created.
+		if !n.pool.CompareAndSwap(nil, pool) {
+			pool.Close()
+			pool = n.pool.Load()
+		}
 	}
 
-	return sendForward(fwdAddr, n.cfg.TLSConfig, ForwardRequest{
+	return sendForward(pool, ForwardRequest{
 		SQL:  sql,
 		Args: args,
 	}, n.cfg.ApplyTimeout)
+}
+
+// poolForLeader returns a connPool for the given leader's ForwardAddr, or nil
+// if ForwardPeers is not configured for that leader ID.
+func (n *Node) poolForLeader(leaderID string) *connPool {
+	if leaderID == "" {
+		return nil
+	}
+	fwdAddr, ok := n.forwardPeers[leaderID]
+	if !ok {
+		return nil
+	}
+	return NewConnPool(fwdAddr, n.cfg.TLSConfig, defaultPoolSize)
 }
 
 // IsLeader reports whether this node is the current Raft leader.
@@ -377,6 +419,10 @@ func (n *Node) RemoveServer(nodeID string, timeout time.Duration) error {
 func (n *Node) Shutdown() error {
 	if n.forwarder != nil {
 		_ = n.forwarder.close()
+	}
+	// Close and discard the connection pool so idle connections are not leaked.
+	if pool := n.pool.Swap(nil); pool != nil {
+		pool.Close()
 	}
 	f := n.raft.Shutdown()
 	return f.Error()
