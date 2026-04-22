@@ -1,5 +1,11 @@
 # Build output
 /memdb
+/build/
+
+# Coverage reports
+/coverage/
+coverage.out
+coverage.html
 
 # SQLite files generated during development / testing
 *.db
@@ -10,7 +16,6 @@
 # Test artifacts
 *.test
 *.out
-coverage.html
 
 # Go workspace files (local developer overrides — not committed)
 go.work
