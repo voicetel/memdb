@@ -17,3 +17,11 @@ func copyMemToWriter(_ context.Context, _ *DB, _ io.Writer, _ int) error {
 func copyReaderToMem(_ context.Context, _ *DB, _ io.Reader, _ int) error {
 	return fmt.Errorf("memdb: purego build does not support snapshot restore (no backup API)")
 }
+
+func (d *DB) Serialize() ([]byte, error) {
+	return nil, fmt.Errorf("memdb: Serialize not supported in purego builds")
+}
+
+func (d *DB) Restore(_ []byte) error {
+	return fmt.Errorf("memdb: Restore not supported in purego builds")
+}

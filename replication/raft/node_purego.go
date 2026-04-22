@@ -14,6 +14,8 @@ type NodeConfig struct {
 	NodeID            string
 	BindAddr          string
 	AdvertiseAddr     string
+	ForwardAddr       string
+	ForwardPeers      []string
 	Peers             []string
 	DataDir           string
 	TLSConfig         *tls.Config

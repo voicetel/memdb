@@ -571,6 +571,53 @@ func TestWrapBackend_FlushAndRestore(t *testing.T) {
 
 // TestDB_WithTx_OnClosedDB verifies that WithTx propagates ErrClosed when the
 // underlying DB has been shut down.
+func TestExec_WithOnExec_SkipsLocalWrite(t *testing.T) {
+	cfg := testConfig(t)
+	var called bool
+	var gotSQL string
+	cfg.OnExec = func(sql string, args []any) error {
+		called = true
+		gotSQL = sql
+		return nil
+	}
+	db, err := memdb.Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES (?, ?)`, "k", "v"); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if !called {
+		t.Error("OnExec was not called")
+	}
+	if gotSQL != `INSERT INTO kv (key, value) VALUES (?, ?)` {
+		t.Errorf("unexpected SQL: %q", gotSQL)
+	}
+	// Row should NOT be in local DB — Raft would apply it via ExecDirect.
+	var val string
+	err = db.QueryRow(`SELECT value FROM kv WHERE key = ?`, "k").Scan(&val)
+	if err == nil {
+		t.Error("expected row to NOT be in local DB when OnExec is set, but it was found")
+	}
+}
+
+func TestBegin_WithOnExec_ReturnsError(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.OnExec = func(_ string, _ []any) error { return nil }
+	db, err := memdb.Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = db.Begin()
+	if !errors.Is(err, memdb.ErrTransactionNotSupported) {
+		t.Errorf("expected ErrTransactionNotSupported, got: %v", err)
+	}
+}
+
 func TestDB_WithTx_OnClosedDB(t *testing.T) {
 	db, err := memdb.Open(extraTestConfig(t))
 	if err != nil {
