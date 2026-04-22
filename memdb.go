@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +40,15 @@ type DB struct {
 	stop     chan struct{}
 	wg       sync.WaitGroup
 	closed   atomic.Bool
+}
+
+// logger returns the slog.Logger to use, falling back to slog.Default() when
+// no logger was provided in Config.
+func (d *DB) logger() *slog.Logger {
+	if d.cfg.Logger != nil {
+		return d.cfg.Logger
+	}
+	return slog.Default()
 }
 
 // readDB returns the *sql.DB to use for read operations. When a replica pool
@@ -84,9 +94,16 @@ func Open(cfg Config) (*DB, error) {
 		stop: make(chan struct{}),
 	}
 
+	// Check whether a snapshot exists so we can log after a successful restore.
+	// restore() performs the same check internally; errors are surfaced there.
+	snapshotExists, _ := cfg.Backend.Exists(context.Background())
+
 	if err := db.restore(); err != nil {
 		mem.Close()
 		return nil, err
+	}
+	if snapshotExists {
+		db.logger().Info("memdb: restored from snapshot", "backend", fmt.Sprintf("%T", cfg.Backend))
 	}
 
 	if cfg.Durability == DurabilityWAL && cfg.FilePath != "" {
@@ -105,6 +122,7 @@ func Open(cfg Config) (*DB, error) {
 			db.wal.Close()
 			return nil, fmt.Errorf("memdb: wal replay: %w", err)
 		}
+		db.logger().Info("memdb: WAL replayed")
 	}
 
 	if cfg.InitSchema != nil {
@@ -284,6 +302,17 @@ func (d *DB) Flush(ctx context.Context) error {
 		})
 	}
 
+	if err != nil {
+		d.logger().Error("memdb: flush failed",
+			"error", err,
+			"backend", fmt.Sprintf("%T", d.cfg.Backend),
+		)
+	} else {
+		d.logger().Info("memdb: flushed to backend",
+			"duration", time.Since(start).String(),
+			"backend", fmt.Sprintf("%T", d.cfg.Backend),
+		)
+	}
 	return err
 }
 
@@ -334,8 +363,11 @@ func (d *DB) replicaRefreshLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			if err := d.replica.refresh(d); err != nil && d.cfg.OnFlushError != nil {
-				d.cfg.OnFlushError(fmt.Errorf("memdb: replica refresh: %w", err))
+			if err := d.replica.refresh(d); err != nil {
+				d.logger().Error("memdb: replica refresh failed", "error", err)
+				if d.cfg.OnFlushError != nil {
+					d.cfg.OnFlushError(fmt.Errorf("memdb: replica refresh: %w", err))
+				}
 			}
 		case <-d.stop:
 			return

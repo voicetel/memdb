@@ -9,11 +9,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	hclog "github.com/hashicorp/go-hclog"
 	hraft "github.com/hashicorp/raft"
+	"github.com/voicetel/memdb/logging"
 	"github.com/voicetel/memdb/replication"
 
 	"crypto/tls"
+	"log/slog"
 )
 
 // NodeConfig holds all options for a Raft cluster node.
@@ -77,8 +78,11 @@ type NodeConfig struct {
 	// Default: 10s.
 	ApplyTimeout time.Duration
 
-	// Logger is optional. Defaults to a null logger (silent).
-	Logger hclog.Logger
+	// Logger is used for structured log output from this node and the underlying
+	// hashicorp/raft instance. If nil, slog.Default() is used.
+	// Use logging.NewSyslogHandler, logging.NewJSONHandler, or
+	// logging.NewTextHandler to construct a suitable logger.
+	Logger *slog.Logger
 
 	// OnLeaderChange is called whenever this node gains or loses leadership.
 	OnLeaderChange func(isLeader bool)
@@ -106,9 +110,6 @@ func (c *NodeConfig) applyDefaults() {
 	if c.ApplyTimeout == 0 {
 		c.ApplyTimeout = 10 * time.Second
 	}
-	if c.Logger == nil {
-		c.Logger = hclog.NewNullLogger()
-	}
 }
 
 // DB is the subset of memdb.DB that Node needs.
@@ -122,6 +123,15 @@ type DB interface {
 
 	// Restore replaces the complete database from a raw byte slice.
 	Restore(data []byte) error
+}
+
+// logger returns the slog.Logger to use, falling back to slog.Default() when
+// no logger was provided in NodeConfig.
+func (n *Node) logger() *slog.Logger {
+	if n.cfg.Logger != nil {
+		return n.cfg.Logger
+	}
+	return slog.Default()
 }
 
 // Node is a member of a Raft cluster backed by a memdb database.
@@ -171,7 +181,13 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 			"use 1, 3, 5, or 7 nodes", len(cfg.Peers))
 	}
 	if len(cfg.Peers) == 1 {
-		cfg.Logger.Warn("single-node cluster has no fault tolerance — any failure halts the cluster")
+		l := cfg.Logger
+		if l == nil {
+			l = slog.Default()
+		}
+		l.Warn("memdb raft: single-node cluster has no fault tolerance",
+			"nodeID", cfg.NodeID,
+		)
 	}
 
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
@@ -188,7 +204,7 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 		Stream:  stream,
 		MaxPool: 5,
 		Timeout: 10 * time.Second,
-		Logger:  cfg.Logger,
+		Logger:  logging.NewHCLogAdapter(cfg.Logger, "raft.transport"),
 	})
 
 	// ── stores ───────────────────────────────────────────────────────────────
@@ -205,7 +221,8 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	}
 
 	snapStore, err := hraft.NewFileSnapshotStoreWithLogger(
-		filepath.Join(cfg.DataDir, "snapshots"), 3, cfg.Logger,
+		filepath.Join(cfg.DataDir, "snapshots"), 3,
+		logging.NewHCLogAdapter(cfg.Logger, "raft.snapshot"),
 	)
 	if err != nil {
 		transport.Close()
@@ -235,7 +252,7 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	raftCfg.CommitTimeout = cfg.CommitTimeout
 	raftCfg.SnapshotInterval = cfg.SnapshotInterval
 	raftCfg.SnapshotThreshold = cfg.SnapshotThreshold
-	raftCfg.Logger = cfg.Logger
+	raftCfg.Logger = logging.NewHCLogAdapter(cfg.Logger, "raft")
 
 	r, err := hraft.NewRaft(raftCfg, fsm, logStore, stableStore, snapStore, transport)
 	if err != nil {
@@ -251,6 +268,10 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 		return nil, fmt.Errorf("raft node: check state: %w", err)
 	}
 	if !hasState {
+		node.logger().Info("memdb raft: bootstrapping new cluster",
+			"nodeID", cfg.NodeID,
+			"peers", len(cfg.Peers),
+		)
 		servers, err := parsePeers(cfg.Peers)
 		if err != nil {
 			r.Shutdown()
@@ -297,6 +318,12 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 			}
 			isLeader := string(lo.LeaderID) == cfg.NodeID
 			node.isLeader.Store(isLeader)
+
+			node.logger().Info("memdb raft: leadership changed",
+				"nodeID", cfg.NodeID,
+				"isLeader", isLeader,
+				"leaderID", string(lo.LeaderID),
+			)
 
 			// Swap the connection pool to point at the new leader's
 			// ForwardAddr. Close the old pool so its idle connections are
@@ -350,6 +377,11 @@ func (n *Node) Exec(sql string, args ...any) error {
 	if leaderAddr == "" {
 		return fmt.Errorf("%w: no leader elected yet", ErrNotLeader)
 	}
+
+	n.logger().Debug("memdb raft: forwarding write to leader",
+		"leaderID", string(leaderID),
+		"sql", sql,
+	)
 
 	pool := n.pool.Load()
 	if pool == nil {

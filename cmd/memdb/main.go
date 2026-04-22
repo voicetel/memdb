@@ -5,7 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -13,10 +13,18 @@ import (
 	"time"
 
 	"github.com/voicetel/memdb"
+	"github.com/voicetel/memdb/logging"
 	"github.com/voicetel/memdb/server"
 )
 
 func main() {
+	// Configure slog to write to syslog, falling back to stderr text logging.
+	if logger, err := logging.NewSyslogHandler("memdb", slog.LevelInfo); err == nil {
+		slog.SetDefault(logger)
+	} else {
+		slog.SetDefault(logging.NewTextHandler(os.Stderr, slog.LevelInfo))
+	}
+
 	serveCmd := flag.NewFlagSet("serve", flag.ExitOnError)
 	serveFile := serveCmd.String("file", "memdb.db", "path to SQLite snapshot file")
 	serveAddr := serveCmd.String("addr", "127.0.0.1:5433", "listen address (TCP or unix://path)")
@@ -37,22 +45,26 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		if err := serveCmd.Parse(os.Args[2:]); err != nil {
-			log.Fatalf("serve: %v", err)
+			slog.Error("serve parse flags", "error", err)
+			os.Exit(1)
 		}
 		runServe(*serveFile, *serveAddr, *serveFlush)
 
 	case "snapshot":
 		if err := snapCmd.Parse(os.Args[2:]); err != nil {
-			log.Fatalf("snapshot: %v", err)
+			slog.Error("snapshot parse flags", "error", err)
+			os.Exit(1)
 		}
 		runSnapshot(*snapFile)
 
 	case "restore":
 		if err := restoreCmd.Parse(os.Args[2:]); err != nil {
-			log.Fatalf("restore: %v", err)
+			slog.Error("restore parse flags", "error", err)
+			os.Exit(1)
 		}
 		if *restoreFrom == "" {
-			log.Fatal("--from is required")
+			slog.Error("--from is required")
+			os.Exit(1)
 		}
 		runRestore(*restoreFrom, *restoreTo)
 
@@ -68,11 +80,12 @@ func runServe(file, addr string, flush time.Duration) {
 		FlushInterval: flush,
 		Durability:    memdb.DurabilityWAL,
 		OnFlushError: func(err error) {
-			log.Printf("ERROR flush: %v", err)
+			slog.Error("flush error", "error", err)
 		},
 	})
 	if err != nil {
-		log.Fatalf("open: %v", err)
+		slog.Error("open failed", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
@@ -85,9 +98,9 @@ func runServe(file, addr string, flush time.Duration) {
 		srv.Stop()
 	}()
 
-	log.Printf("memdb listening on %s  file=%s  flush=%s", addr, file, flush)
+	slog.Info("memdb listening", "addr", addr, "file", file, "flush", flush)
 	if err := srv.ListenAndServe(); err != nil {
-		log.Printf("server: %v", err)
+		slog.Info("server stopped", "error", err)
 	}
 }
 
@@ -97,27 +110,31 @@ func runSnapshot(file string) {
 		FlushInterval: -1, // no background flush
 	})
 	if err != nil {
-		log.Fatalf("open: %v", err)
+		slog.Error("open failed", "error", err)
+		os.Exit(1)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := db.Flush(ctx); err != nil {
-		log.Fatalf("flush: %v", err)
+		slog.Error("flush failed", "error", err)
+		os.Exit(1)
 	}
 	if err := db.Close(); err != nil {
-		log.Printf("close: %v", err)
+		slog.Warn("close error", "error", err)
 	}
-	log.Printf("snapshot written to %s", file)
+	slog.Info("snapshot written", "file", file)
 }
 
 func runRestore(from, to string) {
 	if _, err := os.Stat(from); err != nil {
-		log.Fatalf("source not found: %v", err)
+		slog.Error("source not found", "error", err)
+		os.Exit(1)
 	}
 	if err := copyFileAtomic(from, to); err != nil {
-		log.Fatalf("restore: %v", err)
+		slog.Error("restore failed", "error", err)
+		os.Exit(1)
 	}
-	log.Printf("restored %s → %s", from, to)
+	slog.Info("snapshot restored", "from", from, "to", to)
 }
 
 // copyFileAtomic copies src to dst using a temp file + rename for atomicity.
