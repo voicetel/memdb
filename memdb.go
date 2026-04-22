@@ -3,6 +3,7 @@ package memdb
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,11 @@ import (
 // allowing multiple goroutines to read concurrently without contending on the
 // writer connection. Reads may observe a replica that is slightly behind the
 // writer (bounded by Config.ReplicaRefreshInterval).
+//
+// When Config.OnExec is set (Raft replication mode), Exec routes writes
+// exclusively through OnExec — the local database is only written by the
+// Raft FSM via ExecLocal after consensus is reached. Transactions (Begin,
+// BeginTx, WithTx) are not supported in this mode because they cannot
 type DB struct {
 	mem      *sql.DB // single writer connection (also used for Flush/WAL)
 	cfg      Config
@@ -137,11 +143,63 @@ func (d *DB) DB() *sql.DB {
 	return d.mem
 }
 
+// execDirect writes SQL directly to the local in-memory database, bypassing
+// the OnExec hook. Used by the Raft FSM to apply committed log entries on
+// every node without re-entering the replication path.
+func (d *DB) execDirect(query string, args ...any) error {
+	if d.closed.Load() {
+		return ErrClosed
+	}
+	if _, err := d.mem.Exec(query, args...); err != nil {
+		return err
+	}
+	if d.cfg.Durability == DurabilityWAL && d.wal != nil {
+		entry := WALEntry{
+			Seq:       d.wal.NextSeq(),
+			Timestamp: time.Now().UnixNano(),
+			SQL:       query,
+			Args:      args,
+		}
+		if walErr := d.wal.Append(entry); walErr != nil && d.cfg.OnFlushError != nil {
+			d.cfg.OnFlushError(fmt.Errorf("%w: wal: %v", ErrFlushFailed, walErr))
+		}
+	}
+	return nil
+}
+
+// ExecDirect writes SQL directly to the local in-memory database, bypassing
+// the OnExec hook. This is used by the Raft FSM adapter to apply committed
+// log entries without re-entering the replication path. Do not call this
+// directly in application code.
+func (d *DB) ExecDirect(query string, args ...any) error {
+	return d.execDirect(query, args...)
+}
+
 // Exec executes a query against the in-memory DB.
+//
+// When OnExec is set the write must go through Raft consensus first.
+// The FSM will call ExecDirect on every node (including this one) once
+// the entry is committed. Writing locally here would cause split-brain
+// on non-leader nodes.
 func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 	if d.closed.Load() {
 		return nil, ErrClosed
 	}
+
+	// When OnExec is set the write must go through Raft consensus first.
+	// The FSM will call execDirect on every node (including this one) once
+	// the entry is committed. Writing locally here would cause split-brain
+	// on non-leader nodes.
+	if d.cfg.OnExec != nil {
+		if err := d.cfg.OnExec(query, args); err != nil {
+			return nil, err
+		}
+		// Return a synthetic result — the actual rows-affected count is not
+		// available after a Raft round-trip without significant extra work.
+		return driver.RowsAffected(0), nil
+	}
+
+	// Standalone (no replication): write locally.
 	result, err := d.mem.Exec(query, args...)
 	if err != nil {
 		return nil, err
@@ -155,11 +213,6 @@ func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 		}
 		if walErr := d.wal.Append(entry); walErr != nil && d.cfg.OnFlushError != nil {
 			d.cfg.OnFlushError(fmt.Errorf("%w: wal: %v", ErrFlushFailed, walErr))
-		}
-	}
-	if d.cfg.OnExec != nil {
-		if err := d.cfg.OnExec(query, args); err != nil {
-			return nil, err
 		}
 	}
 	return result, nil
@@ -181,17 +234,25 @@ func (d *DB) QueryRow(query string, args ...any) *sql.Row {
 }
 
 // Begin starts a transaction against the in-memory DB.
+// Returns ErrTransactionNotSupported when OnExec is set (Raft mode).
 func (d *DB) Begin() (*sql.Tx, error) {
 	if d.closed.Load() {
 		return nil, ErrClosed
+	}
+	if d.cfg.OnExec != nil {
+		return nil, ErrTransactionNotSupported
 	}
 	return d.mem.Begin()
 }
 
 // BeginTx starts a transaction with the provided context and options.
+// Returns ErrTransactionNotSupported when OnExec is set (Raft mode).
 func (d *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
 	if d.closed.Load() {
 		return nil, ErrClosed
+	}
+	if d.cfg.OnExec != nil {
+		return nil, ErrTransactionNotSupported
 	}
 	return d.mem.BeginTx(ctx, opts)
 }
@@ -309,7 +370,11 @@ func (d *DB) flushLoop() {
 
 // WithTx runs fn inside a transaction. Commits on nil return, rolls back otherwise.
 // Transactions always run on the single writer connection regardless of ReadPoolSize.
+// Returns ErrTransactionNotSupported when OnExec is set (Raft mode).
 func WithTx(ctx context.Context, d *DB, fn func(*sql.Tx) error) error {
+	if d.cfg.OnExec != nil {
+		return ErrTransactionNotSupported
+	}
 	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return err

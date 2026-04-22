@@ -31,6 +31,18 @@ type NodeConfig struct {
 	// Example: "10.0.0.1:7000"
 	AdvertiseAddr string
 
+	// ForwardAddr is the TCP address this node listens on for forwarded write
+	// RPCs from follower nodes. Must be different from BindAddr.
+	// Example: "0.0.0.0:7001"
+	ForwardAddr string
+
+	// ForwardPeers maps each peer's nodeID to its ForwardAddr, in the same
+	// "nodeID=addr" format as Peers. Used by followers to locate the leader's
+	// forwarding endpoint. Must include an entry for every node in the cluster,
+	// including this node.
+	// Example: ["node-1=10.0.0.1:7001", "node-2=10.0.0.2:7001"]
+	ForwardPeers []string
+
 	// Peers is the list of all nodes in the initial cluster, including this
 	// node. Format: "nodeID=addr", e.g. ["node-1=10.0.0.1:7000", "node-2=10.0.0.2:7000"].
 	// Only used during first bootstrap. Ignored if state already exists.
@@ -115,11 +127,13 @@ type DB interface {
 // Node is a member of a Raft cluster backed by a memdb database.
 // All writes go through Raft consensus before being applied to the local DB.
 type Node struct {
-	cfg       NodeConfig
-	raft      *hraft.Raft
-	transport *hraft.NetworkTransport
-	seq       atomic.Uint64
-	isLeader  atomic.Bool
+	cfg          NodeConfig
+	raft         *hraft.Raft
+	transport    *hraft.NetworkTransport
+	forwarder    *forwarder        // nil when ForwardAddr is empty
+	forwardPeers map[string]string // nodeID → forwardAddr
+	seq          atomic.Uint64
+	isLeader     atomic.Bool
 }
 
 // NewNode creates and starts a Raft cluster node.
@@ -146,6 +160,17 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	}
 	if cfg.DataDir == "" {
 		return nil, fmt.Errorf("raft node: DataDir is required")
+	}
+	if len(cfg.Peers) == 0 {
+		return nil, fmt.Errorf("raft node: Peers must not be empty")
+	}
+	if len(cfg.Peers)%2 == 0 {
+		return nil, fmt.Errorf("raft node: cluster size must be odd (got %d peers) — "+
+			"even-sized clusters have no fault tolerance advantage over the next smaller odd size; "+
+			"use 1, 3, 5, or 7 nodes", len(cfg.Peers))
+	}
+	if len(cfg.Peers) == 1 {
+		cfg.Logger.Warn("single-node cluster has no fault tolerance — any failure halts the cluster")
 	}
 
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
@@ -255,25 +280,67 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 		}()
 	}
 
+	// ── forward peers map ────────────────────────────────────────────────────
+	forwardPeers := make(map[string]string, len(cfg.ForwardPeers))
+	for _, p := range cfg.ForwardPeers {
+		idx := -1
+		for i, c := range p {
+			if c == '=' {
+				idx = i
+				break
+			}
+		}
+		if idx > 0 {
+			forwardPeers[p[:idx]] = p[idx+1:]
+		}
+	}
+	node.forwardPeers = forwardPeers
+
+	// ── forwarder (optional) ─────────────────────────────────────────────────
+	if cfg.ForwardAddr != "" {
+		fwd, err := newForwarder(cfg.ForwardAddr, cfg.TLSConfig, node)
+		if err != nil {
+			r.Shutdown()
+			return nil, fmt.Errorf("raft node: forwarder: %w", err)
+		}
+		node.forwarder = fwd
+	}
+
 	return node, nil
 }
 
 // Exec submits a SQL write through Raft consensus. Blocks until the entry
 // is committed on a quorum of nodes (or the apply timeout is reached).
-// Returns ErrNotLeader if this node is not the current leader.
+// If this node is not the leader and ForwardPeers is configured, the write
+// is transparently forwarded to the leader. Otherwise ErrNotLeader is returned.
 func (n *Node) Exec(sql string, args ...any) error {
-	if n.raft.State() != hraft.Leader {
-		_, leaderID := n.raft.LeaderWithID()
-		return fmt.Errorf("%w: %s", ErrNotLeader, leaderID)
+	// If we are the leader, apply directly through Raft.
+	if n.raft.State() == hraft.Leader {
+		entry := replication.WALEntry{
+			Seq:       n.seq.Add(1),
+			Timestamp: time.Now().UnixNano(),
+			SQL:       sql,
+			Args:      args,
+		}
+		return Apply(n.raft, entry, n.cfg.ApplyTimeout)
 	}
 
-	entry := replication.WALEntry{
-		Seq:       n.seq.Add(1),
-		Timestamp: time.Now().UnixNano(),
-		SQL:       sql,
-		Args:      args,
+	// We are not the leader. Forward to the leader's forwarding endpoint.
+	leaderAddr, leaderID := n.raft.LeaderWithID()
+	if leaderAddr == "" {
+		return fmt.Errorf("%w: no leader elected yet", ErrNotLeader)
 	}
-	return Apply(n.raft, entry, n.cfg.ApplyTimeout)
+
+	fwdAddr, ok := n.forwardPeers[string(leaderID)]
+	if !ok {
+		// ForwardPeers not configured — fall back to error.
+		return fmt.Errorf("%w: leader is %s (configure ForwardPeers to enable transparent forwarding)", ErrNotLeader, leaderID)
+	}
+
+	return sendForward(fwdAddr, n.cfg.TLSConfig, ForwardRequest{
+		SQL:  sql,
+		Args: args,
+	}, n.cfg.ApplyTimeout)
 }
 
 // IsLeader reports whether this node is the current Raft leader.
@@ -308,6 +375,9 @@ func (n *Node) RemoveServer(nodeID string, timeout time.Duration) error {
 
 // Shutdown gracefully stops this Raft node.
 func (n *Node) Shutdown() error {
+	if n.forwarder != nil {
+		_ = n.forwarder.close()
+	}
 	f := n.raft.Shutdown()
 	return f.Error()
 }

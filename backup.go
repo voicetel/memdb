@@ -77,6 +77,28 @@ func copyReaderToMem(ctx context.Context, d *DB, r io.Reader, stepPages int) err
 	})
 }
 
+// Serialize returns the complete in-memory database as a raw SQLite byte
+// slice using sqlite3_serialize. Used by the Raft FSM for snapshots.
+func (d *DB) Serialize() ([]byte, error) {
+	var data []byte
+	if err := withRawConn(context.Background(), d.mem, func(conn *sqlite3.SQLiteConn) error {
+		var err error
+		data, err = conn.Serialize("main")
+		return err
+	}); err != nil {
+		return nil, fmt.Errorf("memdb: serialize: %w", err)
+	}
+	return data, nil
+}
+
+// Restore replaces the complete in-memory database from raw SQLite bytes
+// using sqlite3_deserialize. Used by the Raft FSM to install snapshots.
+func (d *DB) Restore(data []byte) error {
+	return withRawConn(context.Background(), d.mem, func(conn *sqlite3.SQLiteConn) error {
+		return conn.Deserialize(data, "main")
+	})
+}
+
 // copyDB copies all pages from src to dst using the SQLite Online Backup API.
 // stepPages controls pages copied per step; -1 copies all pages in one call.
 // src remains fully readable and writable during the copy.
