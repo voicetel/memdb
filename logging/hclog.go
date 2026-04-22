@@ -35,7 +35,7 @@ type hclogAdapter struct {
 // ── hclog.Logger implementation ───────────────────────────────────────────────
 
 func (a *hclogAdapter) Log(level hclog.Level, msg string, args ...any) {
-	a.log.Log(context.TODO(), hclogToSlog(level), msg, a.withArgs(args)...)
+	a.log.Log(context.Background(), hclogToSlog(level), msg, a.withArgs(args)...)
 }
 
 func (a *hclogAdapter) Trace(msg string, args ...any) {
@@ -59,11 +59,11 @@ func (a *hclogAdapter) Error(msg string, args ...any) {
 	a.log.Error(msg, a.withArgs(args)...)
 }
 
-func (a *hclogAdapter) IsTrace() bool { return a.log.Enabled(context.TODO(), slog.LevelDebug) }
-func (a *hclogAdapter) IsDebug() bool { return a.log.Enabled(context.TODO(), slog.LevelDebug) }
-func (a *hclogAdapter) IsInfo() bool  { return a.log.Enabled(context.TODO(), slog.LevelInfo) }
-func (a *hclogAdapter) IsWarn() bool  { return a.log.Enabled(context.TODO(), slog.LevelWarn) }
-func (a *hclogAdapter) IsError() bool { return a.log.Enabled(context.TODO(), slog.LevelError) }
+func (a *hclogAdapter) IsTrace() bool { return a.log.Enabled(context.Background(), slog.LevelDebug) }
+func (a *hclogAdapter) IsDebug() bool { return a.log.Enabled(context.Background(), slog.LevelDebug) }
+func (a *hclogAdapter) IsInfo() bool  { return a.log.Enabled(context.Background(), slog.LevelInfo) }
+func (a *hclogAdapter) IsWarn() bool  { return a.log.Enabled(context.Background(), slog.LevelWarn) }
+func (a *hclogAdapter) IsError() bool { return a.log.Enabled(context.Background(), slog.LevelError) }
 
 func (a *hclogAdapter) ImpliedArgs() []any { return a.args }
 func (a *hclogAdapter) Name() string       { return a.name }
@@ -93,11 +93,11 @@ func (a *hclogAdapter) SetLevel(level hclog.Level) {}
 
 func (a *hclogAdapter) GetLevel() hclog.Level {
 	switch {
-	case a.log.Enabled(context.TODO(), slog.LevelDebug):
+	case a.log.Enabled(context.Background(), slog.LevelDebug):
 		return hclog.Debug
-	case a.log.Enabled(context.TODO(), slog.LevelInfo):
+	case a.log.Enabled(context.Background(), slog.LevelInfo):
 		return hclog.Info
-	case a.log.Enabled(context.TODO(), slog.LevelWarn):
+	case a.log.Enabled(context.Background(), slog.LevelWarn):
 		return hclog.Warn
 	default:
 		return hclog.Error
