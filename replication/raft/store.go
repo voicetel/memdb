@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	hraft "github.com/hashicorp/raft"
@@ -54,30 +55,41 @@ func newLogStore(path string) (hraft.LogStore, error) {
 }
 
 // load scans the entire file and rebuilds the in-memory index.
+// All reads use ReadAt so no seek state is mutated.
 func (s *fileLogStore) load() error {
-	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
+	var offset int64
 	for {
-		offset, err := s.f.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return err
+		// Read the 8-byte length prefix at the current offset.
+		var lenBuf [8]byte
+		n, err := s.f.ReadAt(lenBuf[:], offset)
+		if n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
+			break
 		}
-		var length uint64
-		if err := binary.Read(s.f, binary.BigEndian, &length); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
+		if err != nil && err != io.EOF {
+			if n < 8 {
+				break // truncated length prefix — stop
 			}
 			return err
 		}
-		data := make([]byte, length)
-		if _, err := io.ReadFull(s.f, data); err != nil {
-			break // truncated record — stop here
+		if n < 8 {
+			break
 		}
+		length := binary.BigEndian.Uint64(lenBuf[:])
+		if length == 0 || length > 64*1024*1024 {
+			break // corrupt or zero-length record
+		}
+
+		data := make([]byte, length)
+		n2, err2 := s.f.ReadAt(data, offset+8)
+		if uint64(n2) < length || (err2 != nil && err2 != io.EOF) {
+			break // truncated body — stop
+		}
+
 		var log hraft.Log
 		if err := json.Unmarshal(data, &log); err != nil {
-			break // corrupt record — stop here
+			break // corrupt record — stop
 		}
+
 		s.index[log.Index] = offset
 		if !s.hasData || log.Index < s.first {
 			s.first = log.Index
@@ -86,6 +98,7 @@ func (s *fileLogStore) load() error {
 			s.last = log.Index
 		}
 		s.hasData = true
+		offset += 8 + int64(length)
 	}
 	return nil
 }
@@ -110,21 +123,25 @@ func (s *fileLogStore) LastIndex() (uint64, error) {
 
 func (s *fileLogStore) GetLog(idx uint64, out *hraft.Log) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	offset, ok := s.index[idx]
+	s.mu.RUnlock()
 	if !ok {
 		return hraft.ErrLogNotFound
 	}
-	if _, err := s.f.Seek(offset, io.SeekStart); err != nil {
-		return err
+
+	// Read the length prefix using ReadAt — no seek, safe for concurrent use.
+	var lenBuf [8]byte
+	if _, err := s.f.ReadAt(lenBuf[:], offset); err != nil {
+		return fmt.Errorf("log store: read length at %d: %w", offset, err)
 	}
-	var length uint64
-	if err := binary.Read(s.f, binary.BigEndian, &length); err != nil {
-		return err
+	length := binary.BigEndian.Uint64(lenBuf[:])
+	if length == 0 || length > 64*1024*1024 {
+		return fmt.Errorf("log store: invalid record length %d at offset %d", length, offset)
 	}
+
 	data := make([]byte, length)
-	if _, err := io.ReadFull(s.f, data); err != nil {
-		return err
+	if _, err := s.f.ReadAt(data, offset+8); err != nil {
+		return fmt.Errorf("log store: read body at %d: %w", offset+8, err)
 	}
 	return json.Unmarshal(data, out)
 }
@@ -137,24 +154,32 @@ func (s *fileLogStore) StoreLogs(logs []*hraft.Log) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Seek to end once to get the current append position.
+	appendOffset, err := s.f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("log store: seek end: %w", err)
+	}
+
 	for _, log := range logs {
 		data, err := json.Marshal(log)
 		if err != nil {
 			return fmt.Errorf("log store: marshal: %w", err)
 		}
-		// Seek to end to get the write offset.
-		offset, err := s.f.Seek(0, io.SeekEnd)
-		if err != nil {
-			return err
-		}
 		length := uint64(len(data))
-		if err := binary.Write(s.f, binary.BigEndian, length); err != nil {
-			return err
+
+		// Build the record in a single buffer: [8-byte length][data].
+		record := make([]byte, 8+len(data))
+		binary.BigEndian.PutUint64(record[:8], length)
+		copy(record[8:], data)
+
+		// WriteAt is positionally explicit — no implicit seek state used.
+		if _, err := s.f.WriteAt(record, appendOffset); err != nil {
+			return fmt.Errorf("log store: write at %d: %w", appendOffset, err)
 		}
-		if _, err := s.f.Write(data); err != nil {
-			return err
-		}
-		s.index[log.Index] = offset
+
+		s.index[log.Index] = appendOffset
+		appendOffset += int64(len(record))
+
 		if !s.hasData || log.Index < s.first {
 			s.first = log.Index
 		}
@@ -168,7 +193,8 @@ func (s *fileLogStore) StoreLogs(logs []*hraft.Log) error {
 }
 
 // DeleteRange removes log entries with indices in [min, max].
-// We rewrite the file keeping only entries outside the deleted range.
+// We rewrite the file keeping only entries outside the deleted range,
+// using ReadAt so there is no seek-state contention.
 func (s *fileLogStore) DeleteRange(min, max uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -184,19 +210,24 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 		if idx >= min && idx <= max {
 			continue
 		}
-		if _, err := s.f.Seek(offset, io.SeekStart); err != nil {
-			return err
+		// Read length prefix via ReadAt.
+		var lenBuf [8]byte
+		if _, err := s.f.ReadAt(lenBuf[:], offset); err != nil {
+			return fmt.Errorf("log store: delete range read length: %w", err)
 		}
-		var length uint64
-		if err := binary.Read(s.f, binary.BigEndian, &length); err != nil {
-			return err
+		length := binary.BigEndian.Uint64(lenBuf[:])
+		if length == 0 || length > 64*1024*1024 {
+			return fmt.Errorf("log store: delete range invalid length %d", length)
 		}
 		data := make([]byte, length)
-		if _, err := io.ReadFull(s.f, data); err != nil {
-			return err
+		if _, err := s.f.ReadAt(data, offset+8); err != nil {
+			return fmt.Errorf("log store: delete range read body: %w", err)
 		}
 		keep = append(keep, entry{idx: idx, data: data})
 	}
+
+	// Sort survivors by log index so the file is written in order.
+	sort.Slice(keep, func(i, j int) bool { return keep[i].idx < keep[j].idx })
 
 	// Rewrite the file atomically via a temp file + rename.
 	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".logstore-tmp-*")
@@ -208,26 +239,22 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 	newIndex := make(map[uint64]int64, len(keep))
 	var newFirst, newLast uint64
 	hasData := false
+	var writeOffset int64
 
 	for _, e := range keep {
-		offset, err := tmp.Seek(0, io.SeekCurrent)
-		if err != nil {
-			tmp.Close()
-			os.Remove(tmpName)
-			return err
-		}
 		length := uint64(len(e.data))
-		if err := binary.Write(tmp, binary.BigEndian, length); err != nil {
+		record := make([]byte, 8+len(e.data))
+		binary.BigEndian.PutUint64(record[:8], length)
+		copy(record[8:], e.data)
+
+		if _, err := tmp.WriteAt(record, writeOffset); err != nil {
 			tmp.Close()
 			os.Remove(tmpName)
-			return err
+			return fmt.Errorf("log store: delete range write: %w", err)
 		}
-		if _, err := tmp.Write(e.data); err != nil {
-			tmp.Close()
-			os.Remove(tmpName)
-			return err
-		}
-		newIndex[e.idx] = offset
+		newIndex[e.idx] = writeOffset
+		writeOffset += int64(len(record))
+
 		if !hasData || e.idx < newFirst {
 			newFirst = e.idx
 		}
