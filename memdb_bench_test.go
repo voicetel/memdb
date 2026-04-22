@@ -1,0 +1,475 @@
+package memdb_test
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"os"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/voicetel/memdb"
+)
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+func benchConfig(b *testing.B) memdb.Config {
+	b.Helper()
+	f, err := os.CreateTemp(b.TempDir(), "memdb-bench-*.db")
+	if err != nil {
+		b.Fatal(err)
+	}
+	f.Close()
+	os.Remove(f.Name())
+
+	return memdb.Config{
+		FilePath:      f.Name(),
+		FlushInterval: -1,
+		InitSchema:    schemaKV,
+	}
+}
+
+func benchConfigWAL(b *testing.B) memdb.Config {
+	b.Helper()
+	cfg := benchConfig(b)
+	cfg.Durability = memdb.DurabilityWAL
+	return cfg
+}
+
+func schemaKV(db *memdb.DB) error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS kv (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)`)
+	return err
+}
+
+// openBench opens a DB, seeds n rows, resets the benchmark timer, and returns
+// the DB. A Cleanup is registered to close it automatically.
+func openBench(b *testing.B, cfg memdb.Config, rows int) *memdb.DB {
+	b.Helper()
+	db, err := memdb.Open(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { db.Close() })
+
+	for i := 0; i < rows; i++ {
+		if _, err := db.Exec(
+			`INSERT INTO kv (key, value) VALUES (?, ?)`,
+			fmt.Sprintf("seed-key-%d", i),
+			fmt.Sprintf("seed-val-%d", i),
+		); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	return db
+}
+
+// ── single-row writes ─────────────────────────────────────────────────────────
+
+// BenchmarkExec_Insert measures the cost of a single parameterised INSERT.
+func BenchmarkExec_Insert(b *testing.B) {
+	db := openBench(b, benchConfig(b), 0)
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			if _, err := db.Exec(
+				`INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+				fmt.Sprintf("k-%d", i), "v",
+			); err != nil {
+				b.Error(err)
+			}
+			i++
+		}
+	})
+}
+
+// BenchmarkExec_Insert_WAL measures INSERT throughput with WAL durability enabled.
+// This reveals the per-write fsync overhead added by DurabilityWAL.
+func BenchmarkExec_Insert_WAL(b *testing.B) {
+	db := openBench(b, benchConfigWAL(b), 0)
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			if _, err := db.Exec(
+				`INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+				fmt.Sprintf("k-%d", i), "v",
+			); err != nil {
+				b.Error(err)
+			}
+			i++
+		}
+	})
+}
+
+// BenchmarkExec_Update measures a point UPDATE against a pre-populated table.
+func BenchmarkExec_Update(b *testing.B) {
+	db := openBench(b, benchConfig(b), 1000)
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			if _, err := db.Exec(
+				`UPDATE kv SET value = ? WHERE key = ?`,
+				"updated", fmt.Sprintf("seed-key-%d", i%1000),
+			); err != nil {
+				b.Error(err)
+			}
+			i++
+		}
+	})
+}
+
+// BenchmarkExec_Delete measures a point DELETE by primary key.
+// Rows are pre-inserted before the timer starts so each iteration has a row to delete.
+func BenchmarkExec_Delete(b *testing.B) {
+	db := openBench(b, benchConfig(b), 0)
+
+	for i := 0; i < b.N; i++ {
+		if _, err := db.Exec(
+			`INSERT INTO kv (key, value) VALUES (?, ?)`,
+			fmt.Sprintf("del-key-%d", i), "v",
+		); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := db.Exec(
+			`DELETE FROM kv WHERE key = ?`, fmt.Sprintf("del-key-%d", i),
+		); err != nil {
+			b.Error(err)
+		}
+	}
+}
+
+// ── single-row reads ──────────────────────────────────────────────────────────
+
+// BenchmarkQueryRow measures a point-lookup via QueryRow + Scan.
+func BenchmarkQueryRow(b *testing.B) {
+	db := openBench(b, benchConfig(b), 1000)
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		var val string
+		for pb.Next() {
+			if err := db.QueryRow(
+				`SELECT value FROM kv WHERE key = ?`,
+				fmt.Sprintf("seed-key-%d", i%1000),
+			).Scan(&val); err != nil {
+				b.Error(err)
+			}
+			i++
+		}
+	})
+}
+
+// BenchmarkQuery_RangeScan measures a range scan that returns 100 rows per call.
+func BenchmarkQuery_RangeScan(b *testing.B) {
+	db := openBench(b, benchConfig(b), 1000)
+	b.RunParallel(func(pb *testing.PB) {
+		var k, v string
+		for pb.Next() {
+			rows, err := db.Query(`SELECT key, value FROM kv LIMIT 100`)
+			if err != nil {
+				b.Error(err)
+				continue
+			}
+			for rows.Next() {
+				if err := rows.Scan(&k, &v); err != nil {
+					b.Error(err)
+				}
+			}
+			rows.Close()
+		}
+	})
+}
+
+// ── transactions ──────────────────────────────────────────────────────────────
+
+// BenchmarkWithTx_SingleInsert measures the overhead of WithTx wrapping one INSERT.
+func BenchmarkWithTx_SingleInsert(b *testing.B) {
+	db := openBench(b, benchConfig(b), 0)
+	ctx := context.Background()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := fmt.Sprintf("tx-k-%d", i)
+			if err := memdb.WithTx(ctx, db, func(tx *sql.Tx) error {
+				_, err := tx.Exec(
+					`INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`, key, "v",
+				)
+				return err
+			}); err != nil {
+				b.Error(err)
+			}
+			i++
+		}
+	})
+}
+
+// BenchmarkWithTx_BatchInsert measures committing 50 INSERTs inside a single transaction.
+// Compare with BenchmarkExec_Insert to see the amortised benefit of batching.
+func BenchmarkWithTx_BatchInsert(b *testing.B) {
+	const batchSize = 50
+	db := openBench(b, benchConfig(b), 0)
+	ctx := context.Background()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			base := i * batchSize
+			if err := memdb.WithTx(ctx, db, func(tx *sql.Tx) error {
+				for j := 0; j < batchSize; j++ {
+					if _, err := tx.Exec(
+						`INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+						fmt.Sprintf("batch-k-%d", base+j), "v",
+					); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				b.Error(err)
+			}
+			i++
+		}
+	})
+}
+
+// BenchmarkWithTx_ReadOnly measures a read-only transaction (BEGIN + SELECT + COMMIT).
+func BenchmarkWithTx_ReadOnly(b *testing.B) {
+	db := openBench(b, benchConfig(b), 500)
+	ctx := context.Background()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			if err := memdb.WithTx(ctx, db, func(tx *sql.Tx) error {
+				var v string
+				return tx.QueryRow(
+					`SELECT value FROM kv WHERE key = ?`,
+					fmt.Sprintf("seed-key-%d", i%500),
+				).Scan(&v)
+			}); err != nil {
+				b.Error(err)
+			}
+			i++
+		}
+	})
+}
+
+// ── flush ─────────────────────────────────────────────────────────────────────
+
+// BenchmarkFlush measures the cost of a full snapshot flush at increasing table sizes.
+// The sub-benchmark names make it easy to spot how flush time scales with data volume.
+func BenchmarkFlush(b *testing.B) {
+	for _, n := range []int{100, 1_000, 10_000} {
+		n := n
+		b.Run(fmt.Sprintf("rows=%d", n), func(b *testing.B) {
+			db := openBench(b, benchConfig(b), n)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := db.Flush(ctx); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// ── mixed read/write concurrency ──────────────────────────────────────────────
+
+// BenchmarkConcurrentReadWrite models realistic mixed workloads at three
+// read/write ratios. Use -benchtime=5s and -cpu=1,4,8 to see contention curves.
+func BenchmarkConcurrentReadWrite(b *testing.B) {
+	cases := []struct {
+		name         string
+		writePercent int // out of 100 operations, how many are writes
+	}{
+		{"writes=10%", 10},
+		{"writes=50%", 50},
+		{"writes=90%", 90},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		b.Run(tc.name, func(b *testing.B) {
+			db := openBench(b, benchConfig(b), 1000)
+			var counter atomic.Int64
+
+			b.RunParallel(func(pb *testing.PB) {
+				var val string
+				for pb.Next() {
+					n := counter.Add(1)
+					if int(n%100) < tc.writePercent {
+						if _, err := db.Exec(
+							`INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+							fmt.Sprintf("w-%d", n), "v",
+						); err != nil {
+							b.Error(err)
+						}
+					} else {
+						_ = db.QueryRow(
+							`SELECT value FROM kv WHERE key = ?`,
+							fmt.Sprintf("seed-key-%d", n%1000),
+						).Scan(&val)
+					}
+				}
+			})
+		})
+	}
+}
+
+// ── open / restore lifecycle ──────────────────────────────────────────────────
+
+// BenchmarkOpen measures the cost of opening a fresh DB with schema initialisation.
+func BenchmarkOpen(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		f, err := os.CreateTemp(b.TempDir(), "memdb-open-*.db")
+		if err != nil {
+			b.Fatal(err)
+		}
+		f.Close()
+		os.Remove(f.Name())
+		cfg := memdb.Config{
+			FilePath:      f.Name(),
+			FlushInterval: -1,
+			InitSchema:    schemaKV,
+		}
+		b.StartTimer()
+
+		db, err := memdb.Open(cfg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.StopTimer()
+		db.Close()
+		b.StartTimer()
+	}
+}
+
+// BenchmarkOpenRestore measures open + snapshot restore with a 1 000-row DB.
+// A single snapshot is written once; each iteration restores it into a fresh
+// in-memory DB, exercising the full SQLite backup-API restore path.
+func BenchmarkOpenRestore(b *testing.B) {
+	f, err := os.CreateTemp(b.TempDir(), "memdb-restore-*.db")
+	if err != nil {
+		b.Fatal(err)
+	}
+	f.Close()
+	os.Remove(f.Name())
+
+	cfg := memdb.Config{
+		FilePath:      f.Name(),
+		FlushInterval: -1,
+		InitSchema:    schemaKV,
+	}
+
+	// Seed and flush once.
+	seed, err := memdb.Open(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < 1000; i++ {
+		if _, err := seed.Exec(
+			`INSERT INTO kv (key, value) VALUES (?, ?)`,
+			fmt.Sprintf("k-%d", i), fmt.Sprintf("v-%d", i),
+		); err != nil {
+			b.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := seed.Flush(ctx); err != nil {
+		b.Fatal(err)
+	}
+	seed.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db, err := memdb.Open(cfg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.StopTimer()
+		db.Close()
+		b.StartTimer()
+	}
+}
+
+// ── WAL primitives ────────────────────────────────────────────────────────────
+
+// BenchmarkWAL_Append measures the raw cost of a WAL append including fsync.
+func BenchmarkWAL_Append(b *testing.B) {
+	f, err := os.CreateTemp(b.TempDir(), "memdb-wal-*.wal")
+	if err != nil {
+		b.Fatal(err)
+	}
+	f.Close()
+
+	wal, err := memdb.OpenWAL(f.Name())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { wal.Close() })
+
+	entry := memdb.WALEntry{
+		Timestamp: time.Now().UnixNano(),
+		SQL:       `INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+		Args:      []any{"bench-key", "bench-val"},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		entry.Seq = wal.NextSeq()
+		if err := wal.Append(entry); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkWAL_Replay measures the cost of reading and decoding a pre-filled WAL.
+func BenchmarkWAL_Replay(b *testing.B) {
+	for _, n := range []int{100, 1_000, 10_000} {
+		n := n
+		b.Run(fmt.Sprintf("entries=%d", n), func(b *testing.B) {
+			f, err := os.CreateTemp(b.TempDir(), "memdb-wal-replay-*.wal")
+			if err != nil {
+				b.Fatal(err)
+			}
+			f.Close()
+
+			wal, err := memdb.OpenWAL(f.Name())
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { wal.Close() })
+
+			for i := 0; i < n; i++ {
+				e := memdb.WALEntry{
+					Seq:       wal.NextSeq(),
+					Timestamp: time.Now().UnixNano(),
+					SQL:       `INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+					Args:      []any{fmt.Sprintf("k-%d", i), "v"},
+				}
+				if err := wal.Append(e); err != nil {
+					b.Fatal(err)
+				}
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := wal.Replay(func(memdb.WALEntry) error { return nil }); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
