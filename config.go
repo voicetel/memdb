@@ -109,6 +109,13 @@ type Config struct {
 	// Called after each completed flush.
 	OnFlushComplete MetricsHandler
 
+	// OnExec is called synchronously after every successful Exec, with the
+	// SQL statement and its arguments. Use this to hook Raft replication:
+	// submit the entry to the cluster and block until consensus is reached
+	// before returning. Return a non-nil error to propagate back to the caller.
+	// If nil, Exec operates locally only.
+	OnExec func(sql string, args []any) error
+
 	// Executed once against the memory DB after restore or on first open.
 	// Use for CREATE TABLE IF NOT EXISTS statements.
 	InitSchema func(db *DB) error
