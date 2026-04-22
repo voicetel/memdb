@@ -15,7 +15,8 @@ Think Redis RDB+AOF semantics with full SQL query power — in a single Go impor
 - **Pluggable backends** — local disk or any custom `Backend` implementation
 - **Snapshot compression** — zstd compression built in, ~50-70% size reduction on typical schemas
 - **Change notifications** — `OnChange` hook via SQLite update hook for cache invalidation and audit
-- **Raft replication** — strong-consistency multi-node replication via `hashicorp/raft` over mutual TLS; any node accepts writes and transparently forwards to the leader
+- **Replication** — strong-consistency multi-node replication via `hashicorp/raft` over mutual TLS; any node accepts writes and transparently forwards to the leader
+- **Structured logging** — `log/slog` throughout with syslog, JSON, and text handlers; `hclog` bridge routes Raft internals through the same pipeline
 - **PostgreSQL wire protocol** — optional server mode accepts any Postgres client or ORM
 - **Pure Go build tag** — swap `mattn/go-sqlite3` for `modernc.org/sqlite` with `-tags purego`
 - **ORM compatible** — exposes `*sql.DB` for use with `sqlx`, `bun`, `ent`, `sqlc`, GORM, and others
@@ -372,6 +373,97 @@ cfg.OnFlushComplete = func(m memdb.FlushMetrics) {
 	}
 }
 ```
+
+---
+
+## Logging
+
+memdb uses [`log/slog`](https://pkg.go.dev/log/slog) as its single structured
+logging interface. All components — the core DB, WAL, replica pool, Raft node,
+and CLI — write through the same pipeline. Three handler constructors are
+provided in the `logging` sub-package; no external dependencies are required.
+
+### Handlers
+
+```go
+import (
+    "log/slog"
+    "os"
+    "github.com/voicetel/memdb/logging"
+)
+
+// Human-readable key=value output — good for development
+logger := logging.NewTextHandler(os.Stderr, slog.LevelDebug)
+
+// Structured JSON — good for log aggregators (Datadog, Splunk, Loki)
+logger := logging.NewJSONHandler(os.Stderr, slog.LevelInfo)
+
+// Syslog via /dev/log — recommended for production Linux deployments
+logger, err := logging.NewSyslogHandler("memdb", slog.LevelInfo)
+if err != nil {
+    // syslog unavailable (e.g. macOS, container without syslogd)
+    // fall back to text or JSON
+    logger = logging.NewTextHandler(os.Stderr, slog.LevelInfo)
+}
+```
+
+### Levels
+
+| `slog` level | When it fires | Syslog priority |
+|---|---|---|
+| `Debug` | Forwarded writes, replica refresh ticks | `LOG_DEBUG` |
+| `Info` | Flush complete, WAL replay, restore, leader election, bootstrap | `LOG_INFO` |
+| `Warn` | Single-node cluster warning | `LOG_WARNING` |
+| `Error` | Flush failure, replica refresh error, apply error | `LOG_ERR` |
+
+### Wiring the logger
+
+Pass the logger in `Config` for the core DB and in `NodeConfig` for the Raft
+node. Both default to `slog.Default()` when nil.
+
+```go
+logger, _ := logging.NewSyslogHandler("memdb", slog.LevelInfo)
+
+db, err := memdb.Open(memdb.Config{
+    FilePath: "/var/lib/myapp/data.db",
+    Logger:   logger,
+    // ...
+})
+
+node, err := mraft.NewNode(adapter, mraft.NodeConfig{
+    Logger: logger, // bridges to hclog internally for hashicorp/raft
+    // ...
+})
+```
+
+### Application-wide default
+
+Set `slog.Default` once at startup and all memdb components that receive a nil
+`Logger` will automatically use it:
+
+```go
+slog.SetDefault(logging.NewJSONHandler(os.Stderr, slog.LevelInfo))
+
+// Now Open with Logger: nil — uses slog.Default() automatically
+db, err := memdb.Open(memdb.Config{FilePath: "..."})
+```
+
+### hclog bridge
+
+`hashicorp/raft` uses its own `hclog.Logger` interface internally. The
+`logging.NewHCLogAdapter` function wraps any `*slog.Logger` as an `hclog.Logger`
+so Raft's internal events (elections, heartbeats, log compaction, snapshot
+installs) flow through the same slog pipeline:
+
+```go
+// Used automatically by NodeConfig — no manual wiring needed.
+// Available for custom integrations:
+hclogLogger := logging.NewHCLogAdapter(logger, "raft")
+```
+
+Level mapping: `hclog.Trace` → `slog.Debug`, `hclog.Debug` → `slog.Debug`,
+`hclog.Info` → `slog.Info`, `hclog.Warn` → `slog.Warn`,
+`hclog.Error` → `slog.Error`.
 
 ---
 
@@ -961,6 +1053,11 @@ memdb/
 ├── memdb_test.go         # Unit and integration tests
 ├── memdb_bench_test.go   # Throughput benchmarks
 ├── memdb_compare_test.go # memdb vs file SQLite comparison benchmarks
+├── logging/
+│   ├── logging.go        # NewTextHandler, NewJSONHandler
+│   ├── syslog.go         # NewSyslogHandler (Linux/macOS)
+│   ├── syslog_stub.go    # NewSyslogHandler stub (Windows/Plan9)
+│   └── hclog.go          # NewHCLogAdapter — hclog.Logger → *slog.Logger bridge
 ├── server/
 │   ├── server.go         # PostgreSQL wire protocol server
 │   └── handler.go        # Simple Query, DML dispatch, wire helpers

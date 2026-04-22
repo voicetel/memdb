@@ -2,6 +2,7 @@ package memdb
 
 import (
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -122,6 +123,12 @@ type Config struct {
 
 	// Storage backend. Defaults to LocalBackend{Path: FilePath}.
 	Backend Backend
+
+	// Logger is used for internal structured log output (flush events, WAL
+	// replay, restore, replica refresh errors). If nil, slog.Default() is used.
+	// Use logging.NewSyslogHandler, logging.NewJSONHandler, or
+	// logging.NewTextHandler to construct a suitable logger.
+	Logger *slog.Logger
 }
 
 func (c *Config) validate() error {
