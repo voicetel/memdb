@@ -11,10 +11,6 @@ import (
 type FollowerConfig struct {
 	Transport Transport
 
-	// AllowStaleReads — if true, Query returns without waiting for the
-	// follower to catch up to the leader's latest seq.
-	AllowStaleReads bool
-
 	// OnGapDetected is called when a sequence gap is detected, before resync.
 	OnGapDetected func(expected, got uint64)
 
@@ -36,7 +32,8 @@ func NewFollower(db *sql.DB, cfg FollowerConfig) *Follower {
 }
 
 // Start begins receiving WAL entries from the leader.
-// Returns immediately; processing runs in a background goroutine.
+// Returns immediately; processing runs in a background goroutine that stops
+// when ctx is cancelled or the subscription channel is closed.
 func (f *Follower) Start(ctx context.Context) error {
 	ch, err := f.cfg.Transport.Subscribe(ctx)
 	if err != nil {
@@ -66,17 +63,30 @@ func (f *Follower) Start(ctx context.Context) error {
 
 func (f *Follower) applyEntry(ctx context.Context, entry WALEntry) error {
 	expected := f.lastSeq.Load() + 1
-	if entry.Seq != expected && f.lastSeq.Load() != 0 {
-		if f.cfg.OnGapDetected != nil {
-			f.cfg.OnGapDetected(expected, entry.Seq)
+
+	if entry.Seq != expected {
+		// Allow the very first entry to start at seq 1 when we have no history.
+		if f.lastSeq.Load() == 0 && entry.Seq == 1 {
+			// Correct start — fall through to apply.
+		} else {
+			if f.cfg.OnGapDetected != nil {
+				f.cfg.OnGapDetected(expected, entry.Seq)
+			}
+			if err := f.resync(ctx); err != nil {
+				return err
+			}
+			// The entry that triggered the gap may already be covered by the
+			// snapshot (entry.Seq <= snapshotSeq). If so, skip it; otherwise
+			// fall through and apply it now so it is not lost.
+			if entry.Seq <= f.lastSeq.Load() {
+				return nil
+			}
 		}
-		return f.resync(ctx)
 	}
 
 	if _, err := f.db.Exec(entry.SQL, entry.Args...); err != nil {
 		return fmt.Errorf("follower: apply seq %d: %w", entry.Seq, err)
 	}
-
 	f.lastSeq.Store(entry.Seq)
 	return nil
 }
