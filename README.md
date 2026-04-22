@@ -15,7 +15,7 @@ Think Redis RDB+AOF semantics with full SQL query power — in a single Go impor
 - **Pluggable backends** — local disk or any custom `Backend` implementation
 - **Snapshot compression** — zstd compression built in, ~50-70% size reduction on typical schemas
 - **Change notifications** — `OnChange` hook via SQLite update hook for cache invalidation and audit
-- **Replication** — async leader/follower WAL shipping over gRPC or NATS; optional Raft consensus
+- **Raft replication** — strong-consistency multi-node replication via `hashicorp/raft` over mutual TLS; any node accepts writes and transparently forwards to the leader
 - **PostgreSQL wire protocol** — optional server mode accepts any Postgres client or ORM
 - **Pure Go build tag** — swap `mattn/go-sqlite3` for `modernc.org/sqlite` with `-tags purego`
 - **ORM compatible** — exposes `*sql.DB` for use with `sqlx`, `bun`, `ent`, `sqlc`, GORM, and others
@@ -203,6 +203,13 @@ type Config struct {
 
 	// Storage backend. Default: LocalBackend{Path: FilePath}.
 	Backend Backend
+
+	// Called after every successful Exec with the SQL and its arguments.
+	// When set, Exec no longer writes locally — the write only happens when
+	// the Raft FSM calls ExecDirect after consensus. Use this to route all
+	// writes through a raft.Node for cluster replication.
+	// If nil, Exec operates locally (standalone mode).
+	OnExec func(sql string, args []any) error
 }
 ```
 
@@ -370,60 +377,165 @@ cfg.OnFlushComplete = func(m memdb.FlushMetrics) {
 
 ## Replication
 
-### Leader / Follower (Async WAL Shipping)
+memdb uses **Raft consensus** (`hashicorp/raft`) for multi-node replication. All
+nodes are peers — there is no separate leader/follower configuration. Any node
+accepts writes and transparently forwards them to the current leader over a
+dedicated TLS RPC connection. Once the leader commits the entry through Raft,
+every node's FSM applies it locally.
+
+### Cluster sizing
+
+Raft requires an **odd** number of nodes. Quorum is `⌊N/2⌋ + 1`.
+
+| Nodes | Quorum | Survives |
+|---|---|---|
+| 1 | 1 | No failures (development only) |
+| 3 | 2 | 1 failure |
+| 5 | 3 | 2 failures |
+| 7 | 4 | 3 failures |
+
+Even-sized clusters are rejected at startup — they offer no fault-tolerance
+advantage over the next smaller odd size.
+
+### Network ports
+
+Each node uses **two TLS ports**:
+
+| Port | Purpose |
+|---|---|
+| `BindAddr` | Raft consensus RPCs (AppendEntries, RequestVote, InstallSnapshot) |
+| `ForwardAddr` | Write-forwarding RPC — followers dial the leader here |
+
+### Wiring a node to a memdb.DB
+
+The `replication/raft` package's `Node` is decoupled from `memdb.DB` via the
+`DB` interface (`ExecLocal`, `Serialize`, `Restore`). Wire them together with
+a thin adapter and the `OnExec` hook:
 
 ```go
-// Leader node
-leader, err := replication.NewLeader(db, replication.LeaderConfig{
-	Transport: &replication.GRPCTransport{
-		ListenAddr: ":7070",
-		TLSConfig:  tlsCfg,
-	},
-	SyncMode: replication.SyncModeAsync,
-})
-leader.Start(ctx)
+import (
+    "crypto/tls"
 
-// Follower node
-follower, err := replication.NewFollower(db, replication.FollowerConfig{
-	Transport: &replication.GRPCTransport{
-		LeaderAddr: "leader.internal:7070",
-		TLSConfig:  tlsCfg,
-	},
-	AllowStaleReads: true,
-	OnGapDetected: func(expected, got uint64) {
-		log.Printf("WAL gap detected: expected seq %d got %d — resyncing", expected, got)
-	},
-})
-follower.Start(ctx)
-```
+    memdb  "github.com/voicetel/memdb"
+    mraft  "github.com/voicetel/memdb/replication/raft"
+)
 
-### Raft Consensus (Strong Consistency + Leader Election)
+// adapter bridges memdb.DB to the raft.DB interface.
+type adapter struct{ db *memdb.DB }
 
-```go
-node, err := replication.NewRaftNode(db, replication.RaftConfig{
-	NodeID:    "node-1",
-	BindAddr:  "10.0.0.1:7071",
-	Peers: []string{
-		"10.0.0.2:7071",
-		"10.0.0.3:7071",
-	},
-	DataDir: "/var/lib/myapp/raft",
-})
-node.Start(ctx)
+func (a *adapter) ExecLocal(sql string, args ...any) error {
+    return a.db.ExecDirect(sql, args...)   // bypasses OnExec — no Raft loop
+}
+func (a *adapter) Serialize() ([]byte, error) { return a.db.Serialize() }
+func (a *adapter) Restore(data []byte) error  { return a.db.Restore(data) }
 
-// Writes are forwarded to leader automatically
-if err := node.Exec(ctx, "INSERT INTO ...", args...); err != nil {
-	if errors.Is(err, replication.ErrNotLeader) {
-		// node.LeaderAddr() returns the current leader for client redirect
-	}
+// openClusterNode opens a memdb.DB and a Raft node together.
+// OnExec is set in Config so that every db.Exec routes through Raft consensus.
+// ExecDirect (called by the FSM on every node after commit) bypasses OnExec
+// to avoid an infinite Raft → Exec → Raft loop.
+func openClusterNode(tlsCfg *tls.Config, nodeID string) (*memdb.DB, *mraft.Node, error) {
+    peers := []string{
+        "node-1=10.0.0.1:7000",
+        "node-2=10.0.0.2:7000",
+        "node-3=10.0.0.3:7000",
+    }
+    fwdPeers := []string{
+        "node-1=10.0.0.1:7001",
+        "node-2=10.0.0.2:7001",
+        "node-3=10.0.0.3:7001",
+    }
+
+    // node is captured in the OnExec closure below; declare it first.
+    var node *mraft.Node
+
+    db, err := memdb.Open(memdb.Config{
+        FilePath:      "/var/lib/myapp/data.db",
+        FlushInterval: 30 * time.Second,
+        InitSchema: func(db *memdb.DB) error {
+            _, err := db.ExecDirect(`CREATE TABLE IF NOT EXISTS kv (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )`)
+            return err
+        },
+        // Route every Exec through Raft. ExecDirect (the FSM path) bypasses
+        // this hook so committed entries are applied without looping back.
+        OnExec: func(sql string, args []any) error {
+            return node.Exec(sql, args...)
+        },
+    })
+    if err != nil {
+        return nil, nil, err
+    }
+
+    node, err = mraft.NewNode(&adapter{db}, mraft.NodeConfig{
+        NodeID:        nodeID,
+        BindAddr:      "0.0.0.0:7000",    // Raft consensus port
+        AdvertiseAddr: "10.0.0.1:7000",   // address announced to peers
+        ForwardAddr:   "0.0.0.0:7001",    // write-forwarding port
+        Peers:         peers,
+        ForwardPeers:  fwdPeers,
+        DataDir:       "/var/lib/myapp/raft",
+        TLSConfig:     tlsCfg,            // mutual TLS — required
+        OnLeaderChange: func(isLeader bool) {
+            log.Printf("leadership changed: isLeader=%v", isLeader)
+        },
+    })
+    if err != nil {
+        db.Close()
+        return nil, nil, err
+    }
+
+    return db, node, nil
 }
 ```
 
-Replication lag per follower:
+> **Note:** When `OnExec` is set, `db.Exec` no longer writes locally —
+> the write only happens when the Raft FSM calls `ExecDirect` after consensus
+> is reached. Transactions (`Begin`, `BeginTx`, `WithTx`) return
+> `ErrTransactionNotSupported` when replication is enabled; use `node.Exec`
+> (or `db.Exec` which routes through it via `OnExec`) for all writes.
+> Use `db.ExecDirect` only inside `InitSchema` and the FSM adapter, never in
+> application code.
+
+### Write flow
+
+```
+Any node receives db.Exec(sql)
+  → OnExec fires → node.Exec(sql)
+  → IsLeader?
+      Yes → hraft.Apply → consensus → FSM.Apply on all nodes → ExecDirect
+      No  → dial leader ForwardAddr (TLS) → ForwardRequest
+           → leader: hraft.Apply → consensus → FSM.Apply on all nodes
+           → ForwardResponse → return to caller
+```
+
+Writes block until a quorum of nodes commits the entry. The caller always
+gets a consistent result regardless of which node it called.
+
+### Membership changes
 
 ```go
-for id, lag := range leader.FollowerLag() {
-	log.Printf("follower %s is %s behind", id, lag)
+// Add a new node (call on the leader)
+if err := node.AddVoter("node-4", "10.0.0.4:7000", 10*time.Second); err != nil {
+    log.Fatal(err)
+}
+
+// Remove a node (call on the leader)
+if err := node.RemoveServer("node-2", 10*time.Second); err != nil {
+    log.Fatal(err)
+}
+
+// Check leadership and stats
+log.Printf("leader: %v  addr: %s", node.IsLeader(), node.LeaderAddr())
+log.Printf("stats: %v", node.Stats())
+```
+
+### Shutdown
+
+```go
+if err := node.Shutdown(); err != nil {
+    log.Printf("raft shutdown: %v", err)
 }
 ```
 
@@ -577,45 +689,61 @@ For cross-compilation without Docker, use the `-tags purego` build tag to elimin
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                        Caller                             │
-│               Exec / Query / Begin / WithTx               │
-└───────┬───────────────────────────┬───────────────────────┘
-        │ writes                    │ reads (ReadPoolSize > 0)
-┌───────▼───────────┐   ┌───────────▼──────────────────────┐
-│   Writer (×1)     │   │        replicaPool (×N)           │
-│                   │   │                                   │
-│  SQLite :memory:  │──▶│  sqlite3_serialize →             │
-│  (single conn)    │   │  sqlite3_deserialize              │
-│                   │   │  into N independent :memory: DBs  │
-└───────┬───────────┘   │  refreshed every ReplicaRefresh-  │
-        │               │  Interval (default 1 ms)          │
-        │               └──────────────────────────────────┘
-        │
-        │  OnChange hook (UPDATE / INSERT / DELETE)
-        ▼
-  ┌─────────────┐
-  │ Update Hook │ fires synchronously before Exec returns
-  │ OnChange()  │
-  └─────────────┘
-        │
-        │  DurabilityWAL path
-        ▼
-  ┌─────────────┐
-  │  WAL Writer │ append-only gob file, fsync per write
-  └──────┬──────┘
-         │
-         │  Periodic snapshot (SQLite Online Backup API)
-         ▼
-  ┌─────────────┐
-  │   Backend   │ Local / Encrypted / Compressed / Custom
-  └─────────────┘
-         │                          │
-┌────────▼────────┐   ┌─────────────▼────────────┐
-│  server/        │   │  replication/             │
-│  Postgres wire  │   │  Leader/Follower + Raft   │
-│  Unix socket    │   │  gRPC / NATS transport    │
-└─────────────────┘   └──────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                          Caller                               │
+│                 Exec / Query / Begin / WithTx                 │
+└───────┬──────────────────────────────┬────────────────────────┘
+        │ writes (OnExec set)          │ reads (ReadPoolSize > 0)
+        ▼                              ▼
+  ┌───────────┐              ┌─────────────────────────────────┐
+  │ OnExec()  │              │       replicaPool (×N)          │
+  │ node.Exec │              │  sqlite3_serialize/deserialize  │
+  └─────┬─────┘              │  N independent :memory: DBs     │
+        │                    │  refreshed every 1 ms (default) │
+        │ IsLeader?          └─────────────────────────────────┘
+        ├─ Yes ──────────────────────────────────────┐
+        │                                            │
+        │  No: dial leader ForwardAddr (TLS)         │
+        │  → ForwardRequest{SQL, Args}               │
+        │  ← ForwardResponse{Err}                    │
+        │                                            │
+        └────────────────────────────────────────────┤
+                                                     ▼
+                                           hraft.Apply (consensus)
+                                                     │
+                                    quorum of nodes commit
+                                                     │
+                                           FSM.Apply on ALL nodes
+                                                     │
+                                                     ▼
+                                    ┌────────────────────────────┐
+                                    │   Writer (×1) per node     │
+                                    │   SQLite :memory:          │
+                                    │   ExecDirect (no OnExec)   │
+                                    └──────────┬─────────────────┘
+                                               │
+                           ┌───────────────────┤
+                           │                   │
+                    OnChange hook        DurabilityWAL path
+                    (UPDATE/INSERT/      ┌─────────────┐
+                     DELETE)            │  WAL Writer │ fsync/write
+                                        └──────┬──────┘
+                                               │
+                                    Periodic snapshot (Backup API)
+                                               │
+                                        ┌──────▼──────┐
+                                        │   Backend   │
+                                        │ Local / Enc │
+                                        │ / Compr /   │
+                                        │ Custom      │
+                                        └─────────────┘
+
+┌─────────────────────┐   ┌────────────────────────────────────┐
+│  server/            │   │  replication/raft/                 │
+│  Postgres wire      │   │  Node — Raft consensus over TLS    │
+│  Unix socket        │   │  BindAddr: Raft RPCs               │
+└─────────────────────┘   │  ForwardAddr: write forwarding RPC │
+                          └────────────────────────────────────┘
 ```
 
 ---
@@ -783,10 +911,14 @@ memdb/
 │   ├── server.go         # PostgreSQL wire protocol server
 │   └── handler.go        # Simple Query, DML dispatch, wire helpers
 ├── replication/
-│   ├── leader.go         # WAL shipping leader with quorum enforcement
-│   ├── follower.go       # WAL replay follower with gap detection
-│   ├── transport.go      # Transport interface
-│   └── raft/             # Raft FSM + hashicorp/raft integration
+│   ├── replication.go    # WALEntry type (shared between packages)
+│   └── raft/
+│       ├── raft.go       # FSM: Apply, Snapshot, Restore; gob type registry
+│       ├── node.go       # Node: NewNode, Exec, forward, AddVoter, Shutdown
+│       ├── tls.go        # tlsStreamLayer — TLS StreamLayer for hashicorp/raft
+│       ├── forwarder.go  # Write-forwarding RPC server (leader side)
+│       ├── rpc.go        # ForwardRequest/Response wire protocol (gob framed)
+│       └── store.go      # Crash-safe fileLogStore + fileStableStore
 ├── backends/
 │   ├── local.go          # Atomic local file backend
 │   ├── compressed.go     # zstd compression wrapper

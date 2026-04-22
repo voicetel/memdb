@@ -821,6 +821,20 @@ func TestNode_ForwardsWriteToLeader(t *testing.T) {
 		}
 	}
 
+	// Wait for all nodes to agree on who the leader is. The elected node won
+	// the election but followers may not have received the first heartbeat yet,
+	// so LeaderAddr() may still be empty on a follower. Give it up to 5s.
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if follower.LeaderAddr() != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if follower.LeaderAddr() == "" {
+		t.Fatal("follower does not know the leader address after 5s")
+	}
+
 	// Send the write through the FOLLOWER. It should be transparently
 	// forwarded to the leader and committed via Raft on all three nodes.
 	if err := follower.Exec("INSERT INTO kv VALUES (1)"); err != nil {
