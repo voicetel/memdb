@@ -513,6 +513,60 @@ Any node receives db.Exec(sql)
 Writes block until a quorum of nodes commits the entry. The caller always
 gets a consistent result regardless of which node it called.
 
+### Connection pool
+
+Forwarded writes reuse TLS connections from a per-leader channel-based
+connection pool, eliminating the TLS handshake cost on every write when
+the leader is stable.
+
+```
+pool (buffered channel of idle *tls.Conn, capacity 8)
+
+Get()  → non-blocking receive from channel
+             hit  → return warm connection (no handshake)
+             miss → tls.DialWithDialer (new handshake)
+
+Put()  → non-blocking send to channel
+             channel not full → connection returned for reuse
+             channel full     → connection closed (pool bounded)
+
+Close() → drain channel, close every idle connection
+```
+
+The pool is keyed to the current leader. When the leader changes, the
+`LeaderObservation` goroutine atomically swaps the pool pointer and closes
+the old pool — idle connections to the previous leader are discarded and
+new connections are dialled to the new leader on the next write.
+
+### Leadership changes and consistency
+
+When the leader changes mid-write, one of two outcomes is possible:
+
+| Situation | Raft's guarantee | Result |
+|---|---|---|
+| Entry committed before leader stepped down | Entry in all quorum logs | Applied on every node — not lost |
+| Entry not committed before leader stepped down | Entry rolled back | Not applied anywhere — not lost |
+
+In both cases the cluster is consistent. The caller receives an error
+(`ErrLeadershipLost` or a forwarding error) and can retry safely.
+
+**Raft guarantees the cluster is always consistent.** A caller that retries
+on error may send the same write twice — the cluster will apply it twice
+unless the SQL is idempotent. Use retry-safe SQL patterns:
+
+```sql
+-- Safe to retry: duplicate key is a no-op
+INSERT OR REPLACE INTO sessions (id, data, ts) VALUES (?, ?, ?)
+
+-- Safe to retry: conflict is silently ignored
+INSERT INTO events (id, payload) VALUES (?, ?)
+ON CONFLICT (id) DO NOTHING
+```
+
+This is the standard recommendation for all distributed databases that
+use Raft (etcd, CockroachDB, rqlite, Consul) — push idempotency into the
+data model rather than building a distributed deduplication layer.
+
 ### Membership changes
 
 ```go
@@ -917,7 +971,7 @@ memdb/
 │       ├── node.go       # Node: NewNode, Exec, forward, AddVoter, Shutdown
 │       ├── tls.go        # tlsStreamLayer — TLS StreamLayer for hashicorp/raft
 │       ├── forwarder.go  # Write-forwarding RPC server (leader side)
-│       ├── rpc.go        # ForwardRequest/Response wire protocol (gob framed)
+│       ├── rpc.go        # ForwardRequest/Response wire protocol; channel-based connPool
 │       └── store.go      # Crash-safe fileLogStore + fileStableStore
 ├── backends/
 │   ├── local.go          # Atomic local file backend
