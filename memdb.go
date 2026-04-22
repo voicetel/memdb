@@ -157,6 +157,11 @@ func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 			d.cfg.OnFlushError(fmt.Errorf("%w: wal: %v", ErrFlushFailed, walErr))
 		}
 	}
+	if d.cfg.OnExec != nil {
+		if err := d.cfg.OnExec(query, args); err != nil {
+			return nil, err
+		}
+	}
 	return result, nil
 }
 

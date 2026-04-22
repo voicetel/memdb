@@ -1,0 +1,353 @@
+//go:build !purego
+
+package raft
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"time"
+
+	hclog "github.com/hashicorp/go-hclog"
+	hraft "github.com/hashicorp/raft"
+	"github.com/voicetel/memdb/replication"
+
+	"crypto/tls"
+)
+
+// NodeConfig holds all options for a Raft cluster node.
+type NodeConfig struct {
+	// NodeID uniquely identifies this node in the cluster. Must be unique
+	// across all nodes. Example: "node-1" or a UUID.
+	NodeID string
+
+	// BindAddr is the TCP address this node listens on for Raft RPCs.
+	// Example: "0.0.0.0:7000"
+	BindAddr string
+
+	// AdvertiseAddr is the address peers use to reach this node.
+	// Defaults to BindAddr if empty. Use this when binding 0.0.0.0.
+	// Example: "10.0.0.1:7000"
+	AdvertiseAddr string
+
+	// Peers is the list of all nodes in the initial cluster, including this
+	// node. Format: "nodeID=addr", e.g. ["node-1=10.0.0.1:7000", "node-2=10.0.0.2:7000"].
+	// Only used during first bootstrap. Ignored if state already exists.
+	Peers []string
+
+	// DataDir is the directory where Raft stores its logs, stable state, and
+	// snapshots. Must be persistent across restarts.
+	DataDir string
+
+	// TLSConfig is required. All inter-node communication is encrypted.
+	// Both server and client sides use the same config (mutual TLS recommended).
+	TLSConfig *tls.Config
+
+	// SnapshotInterval controls how often Raft checks whether a snapshot
+	// should be taken. Default: 30s.
+	SnapshotInterval time.Duration
+
+	// SnapshotThreshold is the number of log entries between snapshots.
+	// Default: 8192.
+	SnapshotThreshold uint64
+
+	// HeartbeatTimeout is the Raft heartbeat timeout. Default: 500ms.
+	HeartbeatTimeout time.Duration
+
+	// ElectionTimeout is the Raft election timeout. Default: 500ms.
+	ElectionTimeout time.Duration
+
+	// CommitTimeout is the maximum time to wait for a commit. Default: 50ms.
+	CommitTimeout time.Duration
+
+	// ApplyTimeout is the timeout for a single Apply call (one write).
+	// Default: 10s.
+	ApplyTimeout time.Duration
+
+	// Logger is optional. Defaults to a null logger (silent).
+	Logger hclog.Logger
+
+	// OnLeaderChange is called whenever this node gains or loses leadership.
+	OnLeaderChange func(isLeader bool)
+
+	// OnApplyError is called when the FSM fails to apply a log entry.
+	OnApplyError func(err error)
+}
+
+func (c *NodeConfig) applyDefaults() {
+	if c.SnapshotInterval == 0 {
+		c.SnapshotInterval = 30 * time.Second
+	}
+	if c.SnapshotThreshold == 0 {
+		c.SnapshotThreshold = 8192
+	}
+	if c.HeartbeatTimeout == 0 {
+		c.HeartbeatTimeout = 500 * time.Millisecond
+	}
+	if c.ElectionTimeout == 0 {
+		c.ElectionTimeout = 500 * time.Millisecond
+	}
+	if c.CommitTimeout == 0 {
+		c.CommitTimeout = 50 * time.Millisecond
+	}
+	if c.ApplyTimeout == 0 {
+		c.ApplyTimeout = 10 * time.Second
+	}
+	if c.Logger == nil {
+		c.Logger = hclog.NewNullLogger()
+	}
+}
+
+// DB is the subset of memdb.DB that Node needs.
+type DB interface {
+	// ExecLocal applies SQL directly to the local database, bypassing Raft.
+	// Used by the FSM when applying committed log entries.
+	ExecLocal(sql string, args ...any) error
+
+	// Serialize returns the complete database as a raw byte slice.
+	Serialize() ([]byte, error)
+
+	// Restore replaces the complete database from a raw byte slice.
+	Restore(data []byte) error
+}
+
+// Node is a member of a Raft cluster backed by a memdb database.
+// All writes go through Raft consensus before being applied to the local DB.
+type Node struct {
+	cfg       NodeConfig
+	raft      *hraft.Raft
+	transport *hraft.NetworkTransport
+	seq       atomic.Uint64
+	isLeader  atomic.Bool
+}
+
+// NewNode creates and starts a Raft cluster node.
+//
+// db must implement the DB interface — typically a *memdb.DB wrapped with a
+// thin adapter that routes FSM callbacks to the in-memory database without
+// triggering the OnExec hook (which would cause an infinite Raft→Exec→Raft
+// loop).
+//
+// On the very first start (no existing state in DataDir), the cluster is
+// bootstrapped using NodeConfig.Peers. On subsequent starts the existing
+// state is recovered automatically.
+func NewNode(db DB, cfg NodeConfig) (*Node, error) {
+	cfg.applyDefaults()
+
+	if cfg.NodeID == "" {
+		return nil, fmt.Errorf("raft node: NodeID is required")
+	}
+	if cfg.BindAddr == "" {
+		return nil, fmt.Errorf("raft node: BindAddr is required")
+	}
+	if cfg.TLSConfig == nil {
+		return nil, fmt.Errorf("raft node: TLSConfig is required")
+	}
+	if cfg.DataDir == "" {
+		return nil, fmt.Errorf("raft node: DataDir is required")
+	}
+
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("raft node: create data dir: %w", err)
+	}
+
+	// ── TLS transport ────────────────────────────────────────────────────────
+	stream, err := newTLSStreamLayer(cfg.BindAddr, cfg.AdvertiseAddr, cfg.TLSConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	transport := hraft.NewNetworkTransportWithConfig(&hraft.NetworkTransportConfig{
+		Stream:  stream,
+		MaxPool: 5,
+		Timeout: 10 * time.Second,
+		Logger:  cfg.Logger,
+	})
+
+	// ── stores ───────────────────────────────────────────────────────────────
+	logStore, err := newLogStore(filepath.Join(cfg.DataDir, "raft-log"))
+	if err != nil {
+		transport.Close()
+		return nil, fmt.Errorf("raft node: log store: %w", err)
+	}
+
+	stableStore, err := newStableStore(filepath.Join(cfg.DataDir, "raft-stable"))
+	if err != nil {
+		transport.Close()
+		return nil, fmt.Errorf("raft node: stable store: %w", err)
+	}
+
+	snapStore, err := hraft.NewFileSnapshotStoreWithLogger(
+		filepath.Join(cfg.DataDir, "snapshots"), 3, cfg.Logger,
+	)
+	if err != nil {
+		transport.Close()
+		return nil, fmt.Errorf("raft node: snapshot store: %w", err)
+	}
+
+	// ── FSM ──────────────────────────────────────────────────────────────────
+	node := &Node{cfg: cfg, transport: transport}
+
+	fsm := NewFSM(
+		func(sql string, args ...any) error {
+			return db.ExecLocal(sql, args...)
+		},
+		func() ([]byte, error) {
+			return db.Serialize()
+		},
+		func(data []byte) error {
+			return db.Restore(data)
+		},
+	)
+
+	// ── raft config ──────────────────────────────────────────────────────────
+	raftCfg := hraft.DefaultConfig()
+	raftCfg.LocalID = hraft.ServerID(cfg.NodeID)
+	raftCfg.HeartbeatTimeout = cfg.HeartbeatTimeout
+	raftCfg.ElectionTimeout = cfg.ElectionTimeout
+	raftCfg.CommitTimeout = cfg.CommitTimeout
+	raftCfg.SnapshotInterval = cfg.SnapshotInterval
+	raftCfg.SnapshotThreshold = cfg.SnapshotThreshold
+	raftCfg.Logger = cfg.Logger
+
+	r, err := hraft.NewRaft(raftCfg, fsm, logStore, stableStore, snapStore, transport)
+	if err != nil {
+		transport.Close()
+		return nil, fmt.Errorf("raft node: new raft: %w", err)
+	}
+	node.raft = r
+
+	// ── bootstrap if no existing state ───────────────────────────────────────
+	hasState, err := hraft.HasExistingState(logStore, stableStore, snapStore)
+	if err != nil {
+		r.Shutdown()
+		return nil, fmt.Errorf("raft node: check state: %w", err)
+	}
+	if !hasState {
+		servers, err := parsePeers(cfg.Peers)
+		if err != nil {
+			r.Shutdown()
+			return nil, fmt.Errorf("raft node: parse peers: %w", err)
+		}
+		bootstrap := hraft.Configuration{Servers: servers}
+		if f := r.BootstrapCluster(bootstrap); f.Error() != nil {
+			r.Shutdown()
+			return nil, fmt.Errorf("raft node: bootstrap: %w", f.Error())
+		}
+	}
+
+	// ── leader change observation ─────────────────────────────────────────────
+	if cfg.OnLeaderChange != nil {
+		obs := make(chan hraft.Observation, 8)
+		r.RegisterObserver(hraft.NewObserver(obs, false, func(o *hraft.Observation) bool {
+			_, ok := o.Data.(hraft.LeaderObservation)
+			return ok
+		}))
+		go func() {
+			for o := range obs {
+				if lo, ok := o.Data.(hraft.LeaderObservation); ok {
+					isLeader := string(lo.LeaderID) == cfg.NodeID
+					node.isLeader.Store(isLeader)
+					cfg.OnLeaderChange(isLeader)
+				}
+			}
+		}()
+	}
+
+	return node, nil
+}
+
+// Exec submits a SQL write through Raft consensus. Blocks until the entry
+// is committed on a quorum of nodes (or the apply timeout is reached).
+// Returns ErrNotLeader if this node is not the current leader.
+func (n *Node) Exec(sql string, args ...any) error {
+	if n.raft.State() != hraft.Leader {
+		_, leaderID := n.raft.LeaderWithID()
+		return fmt.Errorf("%w: %s", ErrNotLeader, leaderID)
+	}
+
+	entry := replication.WALEntry{
+		Seq:       n.seq.Add(1),
+		Timestamp: time.Now().UnixNano(),
+		SQL:       sql,
+		Args:      args,
+	}
+	return Apply(n.raft, entry, n.cfg.ApplyTimeout)
+}
+
+// IsLeader reports whether this node is the current Raft leader.
+func (n *Node) IsLeader() bool {
+	return n.raft.State() == hraft.Leader
+}
+
+// LeaderAddr returns the Raft address of the current leader, or empty string
+// if the leader is unknown.
+func (n *Node) LeaderAddr() string {
+	addr, _ := n.raft.LeaderWithID()
+	return string(addr)
+}
+
+// AddVoter adds a new voting member to the cluster. Must be called on the leader.
+func (n *Node) AddVoter(nodeID, addr string, timeout time.Duration) error {
+	f := n.raft.AddVoter(hraft.ServerID(nodeID), hraft.ServerAddress(addr), 0, timeout)
+	if err := f.Error(); err != nil {
+		return fmt.Errorf("raft node: add voter %s: %w", nodeID, err)
+	}
+	return nil
+}
+
+// RemoveServer removes a node from the cluster. Must be called on the leader.
+func (n *Node) RemoveServer(nodeID string, timeout time.Duration) error {
+	f := n.raft.RemoveServer(hraft.ServerID(nodeID), 0, timeout)
+	if err := f.Error(); err != nil {
+		return fmt.Errorf("raft node: remove server %s: %w", nodeID, err)
+	}
+	return nil
+}
+
+// Shutdown gracefully stops this Raft node.
+func (n *Node) Shutdown() error {
+	f := n.raft.Shutdown()
+	return f.Error()
+}
+
+// Stats returns internal Raft statistics for monitoring.
+func (n *Node) Stats() map[string]string {
+	return n.raft.Stats()
+}
+
+// ErrNotLeader is returned when a write is attempted on a non-leader node.
+// The error message includes the current leader's address.
+var ErrNotLeader = fmt.Errorf("raft: not leader")
+
+// parsePeers converts "nodeID=addr" strings into raft.Server entries.
+func parsePeers(peers []string) ([]hraft.Server, error) {
+	servers := make([]hraft.Server, 0, len(peers))
+	for _, p := range peers {
+		// Split on the first '=' only.
+		idx := -1
+		for i, c := range p {
+			if c == '=' {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("invalid peer %q: expected nodeID=addr", p)
+		}
+		id := p[:idx]
+		addr := p[idx+1:]
+		if id == "" || addr == "" {
+			return nil, fmt.Errorf("invalid peer %q: nodeID and addr must be non-empty", p)
+		}
+		servers = append(servers, hraft.Server{
+			ID:      hraft.ServerID(id),
+			Address: hraft.ServerAddress(addr),
+		})
+	}
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("no peers provided")
+	}
+	return servers, nil
+}
