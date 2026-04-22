@@ -1,0 +1,17 @@
+# Build output
+/memdb
+
+# SQLite files generated during development / testing
+*.db
+*.db.wal
+*.db.zst
+*.db.enc
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+
+# Go workspace files (local developer overrides — not committed)
+go.work
+go.work.sum
