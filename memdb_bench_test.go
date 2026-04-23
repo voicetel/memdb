@@ -445,6 +445,7 @@ func BenchmarkOpen(b *testing.B) {
 			FilePath:      f.Name(),
 			FlushInterval: -1,
 			InitSchema:    schemaKV,
+			Logger:        discardLogger(),
 		}
 		b.StartTimer()
 
@@ -473,6 +474,7 @@ func BenchmarkOpenRestore(b *testing.B) {
 		FilePath:      f.Name(),
 		FlushInterval: -1,
 		InitSchema:    schemaKV,
+		Logger:        discardLogger(),
 	}
 
 	// Seed and flush once.

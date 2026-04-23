@@ -1057,6 +1057,16 @@ For cross-compilation without Docker, use the `-tags purego` build tag to elimin
 
 ## Benchmarks
 
+> **For the current v1.4.0 report see [BENCHMARKS.md](./BENCHMARKS.md).**
+> It contains the full throughput table (core DB + Postgres wire server),
+> the `ReplicaRefreshInterval` parameter sweep, the side-by-side vs
+> file-SQLite comparison, and a section-by-section pprof analysis of
+> where the remaining CPU is spent. Re-run the numbers locally with
+> `make bench`, `make pprof`, and `make pprof-server`.
+
+The section below is a short summary of the most frequently-cited
+microbenchmarks for quick reference.
+
 Benchmarks run on a 12th Gen Intel Core i7-1280P, Linux, Go 1.24, `github.com/mattn/go-sqlite3`.
 All file-SQLite numbers use WAL journal mode and `cache_size=-64000` (64 MB), identical to memdb's
 in-memory configuration. Run with `-benchtime=5s -benchmem`.
