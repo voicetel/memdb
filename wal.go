@@ -122,11 +122,12 @@ func (w *WAL) NextSeq() uint64 {
 // Append encodes entry in the binary v1 format, writes the length-prefixed
 // record, and fsyncs.
 //
-// Hot path: the encoder scratch buffer is drawn from a sync.Pool so the
-// steady-state allocation is a single []byte for the length-prefixed record.
-// The 4-byte length prefix is written in the same write(2) call as the body
-// to guarantee that no reader (including a crash-recovery Replay) can ever
-// observe a header without its payload.
+// Hot path: the encoder scratch buffer is drawn from a sync.Pool and the
+// 4-byte length prefix is reserved as the first four bytes of that same
+// buffer. walEncodeBinary appends the body starting at offset 4, so the
+// final slice is [length-prefix][body] with zero extra allocations. The
+// 4-byte length prefix and body are written in one write(2) call, which
+// guarantees no reader can observe a header without its payload.
 //
 // If the binary encoder encounters an Arg of an unregistered type it
 // returns a typed error — the caller (Exec / execDirect) surfaces this
@@ -140,26 +141,26 @@ func (w *WAL) Append(entry WALEntry) error {
 		walEncBuf.Put(bufPtr)
 	}()
 
+	// Reserve 4 bytes for the length prefix. walEncodeBinary will append the
+	// body immediately after, giving us [prefix][body] in one contiguous
+	// slice — no second allocation or copy needed.
+	buf = append(buf, 0, 0, 0, 0)
+
 	var err error
 	buf, err = walEncodeBinary(buf, entry)
 	if err != nil {
 		return fmt.Errorf("memdb: wal encode: %w", err)
 	}
-	bodyLen := len(buf)
+	bodyLen := len(buf) - 4
 	if bodyLen > walMaxRecord {
 		return fmt.Errorf("memdb: wal entry too large (%d bytes)", bodyLen)
 	}
-
-	// Build [4-byte length][body] in a single allocation so the write is
-	// atomic from the kernel's perspective (one write(2) call).
-	record := make([]byte, 4+bodyLen)
-	binary.BigEndian.PutUint32(record[:4], uint32(bodyLen))
-	copy(record[4:], buf)
+	binary.BigEndian.PutUint32(buf[0:4], uint32(bodyLen))
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if _, err := w.f.Write(record); err != nil {
+	if _, err := w.f.Write(buf); err != nil {
 		return fmt.Errorf("memdb: wal write: %w", err)
 	}
 	return w.f.Sync()
