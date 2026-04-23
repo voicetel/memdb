@@ -1,7 +1,9 @@
 package server
 
 import (
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 
@@ -13,9 +15,10 @@ import (
 //
 // Full protocol spec: https://www.postgresql.org/docs/current/protocol.html
 type handler struct {
-	db   *memdb.DB
-	cfg  Config
-	conn net.Conn
+	db          *memdb.DB
+	cfg         Config
+	conn        net.Conn
+	startupUser string // username from startup packet
 }
 
 func newHandler(db *memdb.DB, cfg Config, conn net.Conn) *handler {
@@ -53,14 +56,43 @@ func (h *handler) serve() {
 
 func (h *handler) handleStartup() error {
 	buf := make([]byte, 8)
-	if _, err := readFull(h.conn, buf); err != nil {
+	if _, err := io.ReadFull(h.conn, buf); err != nil {
 		return err
 	}
-	length := int(buf[0])<<24 | int(buf[1])<<16 | int(buf[2])<<8 | int(buf[3])
+
+	// Check for SSLRequest magic number (80877103) before reading startup.
+	// psql and most drivers send this before the real startup message.
+	// We decline TLS upgrade at this layer (TLS should be configured on
+	// the listener itself) by responding with 'N'.
+	magic := int(binary.BigEndian.Uint32(buf[0:4]))
+	if magic == 80877103 {
+		if err := h.writeRaw([]byte{'N'}); err != nil {
+			return err
+		}
+		// Re-read the actual startup message.
+		if _, err := io.ReadFull(h.conn, buf); err != nil {
+			return err
+		}
+	}
+
+	length := int(binary.BigEndian.Uint32(buf[0:4]))
+	// Sanity-check: startup messages are at most a few hundred bytes.
+	// Reject anything over 64 KB to prevent memory exhaustion.
+	const maxStartupLen = 65536
+	if length < 8 || length > maxStartupLen {
+		return fmt.Errorf("server: invalid startup packet length %d", length)
+	}
 	if length > 8 {
 		rest := make([]byte, length-8)
-		if _, err := readFull(h.conn, rest); err != nil {
+		if _, err := io.ReadFull(h.conn, rest); err != nil {
 			return err
+		}
+		// Parse username from startup params if Auth is configured.
+		// Startup params are NUL-terminated key=value pairs after the protocol version.
+		// We skip the 4-byte protocol version already consumed, so rest contains
+		// the key-value pairs.
+		if h.cfg.Auth != nil {
+			h.startupUser = parseStartupUser(rest)
 		}
 	}
 
@@ -75,7 +107,11 @@ func (h *handler) handleStartup() error {
 			return fmt.Errorf("auth: expected password message")
 		}
 		password := strings.TrimRight(string(body), "\x00")
-		if !h.cfg.Auth.Authenticate("memdb", password) {
+		user := h.startupUser
+		if user == "" {
+			user = "memdb" // default if client didn't send username
+		}
+		if !h.cfg.Auth.Authenticate(user, password) {
 			_ = h.sendError("authentication failed")
 			return fmt.Errorf("auth: invalid credentials")
 		}
@@ -89,10 +125,51 @@ func (h *handler) handleStartup() error {
 	return h.sendReadyForQuery()
 }
 
+// parseStartupUser extracts the "user" parameter from PostgreSQL startup
+// key-value pairs (NUL-terminated key\0value\0 sequences).
+func parseStartupUser(params []byte) string {
+	// params is the rest after the 8-byte header, so it's already key-value pairs.
+	i := 0
+	for i < len(params) {
+		// Read key
+		j := i
+		for j < len(params) && params[j] != 0 {
+			j++
+		}
+		key := string(params[i:j])
+		if j >= len(params) {
+			break
+		}
+		j++ // skip NUL
+		// Read value
+		k := j
+		for k < len(params) && params[k] != 0 {
+			k++
+		}
+		value := string(params[j:k])
+		if key == "user" {
+			return value
+		}
+		if k >= len(params) {
+			break
+		}
+		i = k + 1
+	}
+	return ""
+}
+
 // handleSimpleQuery executes query and streams results back to the client.
 // Returns an error only when the connection is broken and should be closed.
 func (h *handler) handleSimpleQuery(query string) error {
-	verb := strings.ToUpper(strings.Fields(query)[0])
+	fields := strings.Fields(query)
+	if len(fields) == 0 {
+		// Empty query — respond with empty CommandComplete and ReadyForQuery.
+		if err := h.sendCommandComplete(""); err != nil {
+			return err
+		}
+		return h.sendReadyForQuery()
+	}
+	verb := strings.ToUpper(fields[0])
 	switch verb {
 	case "SELECT", "WITH", "EXPLAIN", "PRAGMA", "SHOW":
 		return h.handleSelect(query)
@@ -195,16 +272,16 @@ func (h *handler) handleExec(query, verb string) error {
 
 func (h *handler) readMessage() (byte, []byte, error) {
 	header := make([]byte, 5)
-	if _, err := readFull(h.conn, header); err != nil {
+	if _, err := io.ReadFull(h.conn, header); err != nil {
 		return 0, nil, err
 	}
 	msgType := header[0]
-	length := int(header[1])<<24 | int(header[2])<<16 | int(header[3])<<8 | int(header[4])
+	length := int(binary.BigEndian.Uint32(header[1:5]))
 	if length < 4 {
 		return 0, nil, fmt.Errorf("server: invalid message length %d", length)
 	}
 	body := make([]byte, length-4)
-	if _, err := readFull(h.conn, body); err != nil {
+	if _, err := io.ReadFull(h.conn, body); err != nil {
 		return 0, nil, err
 	}
 	return msgType, body, nil
@@ -224,7 +301,7 @@ func (h *handler) sendRowDescription(cols []string) error {
 		buf = append(buf, 0xff, 0xff, 0xff, 0xff) // type modifier
 		buf = append(buf, 0, 0)                   // format (text)
 	}
-	setInt32(buf, 1, len(buf)-1)
+	binary.BigEndian.PutUint32(buf[1:], uint32(len(buf)-1))
 	return h.writeRaw(buf)
 }
 
@@ -240,7 +317,7 @@ func (h *handler) sendDataRow(row [][]byte) error {
 			buf = append(buf, val...)
 		}
 	}
-	setInt32(buf, 1, len(buf)-1)
+	binary.BigEndian.PutUint32(buf[1:], uint32(len(buf)-1))
 	return h.writeRaw(buf)
 }
 
@@ -248,7 +325,7 @@ func (h *handler) sendCommandComplete(tag string) error {
 	buf := []byte{'C', 0, 0, 0, 0}
 	buf = append(buf, []byte(tag)...)
 	buf = append(buf, 0)
-	setInt32(buf, 1, len(buf)-1)
+	binary.BigEndian.PutUint32(buf[1:], uint32(len(buf)-1))
 	return h.writeRaw(buf)
 }
 
@@ -258,10 +335,13 @@ func (h *handler) sendReadyForQuery() error {
 
 func (h *handler) sendError(msg string) error {
 	buf := []byte{'E', 0, 0, 0, 0}
+	buf = append(buf, 'S')
+	buf = append(buf, []byte("ERROR")...)
+	buf = append(buf, 0)
 	buf = append(buf, 'M')
 	buf = append(buf, []byte(msg)...)
 	buf = append(buf, 0, 0)
-	setInt32(buf, 1, len(buf)-1)
+	binary.BigEndian.PutUint32(buf[1:], uint32(len(buf)-1))
 	return h.writeRaw(buf)
 }
 
@@ -269,23 +349,4 @@ func (h *handler) sendError(msg string) error {
 func (h *handler) writeRaw(buf []byte) error {
 	_, err := h.conn.Write(buf)
 	return err
-}
-
-func setInt32(buf []byte, offset, val int) {
-	buf[offset] = byte(val >> 24)
-	buf[offset+1] = byte(val >> 16)
-	buf[offset+2] = byte(val >> 8)
-	buf[offset+3] = byte(val)
-}
-
-func readFull(conn net.Conn, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := conn.Read(buf[total:])
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, nil
 }

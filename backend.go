@@ -9,6 +9,9 @@ import (
 )
 
 // Backend is the interface that storage backends must implement.
+// External implementations must use WrapBackend(ExternalBackend) — the
+// flush and restore methods are unexported and only implementable within
+// this package. See ExternalBackend for the public interface.
 // Use the backends sub-package for pre-built implementations (compressed,
 // encrypted, or custom). LocalBackend below is the default file-system backend.
 type Backend interface {
@@ -139,6 +142,11 @@ func (a *externalBackendAdapter) flush(ctx context.Context, d *DB) error {
 	}()
 
 	writeErr := a.inner.Write(ctx, pr)
+	// If Write returned early (error or context cancellation), close the read
+	// end of the pipe so that the goroutine's copyMemToWriter call sees a
+	// broken-pipe error and exits rather than blocking forever waiting for a
+	// consumer.
+	pr.CloseWithError(writeErr)
 	<-done
 
 	if copyErr != nil {

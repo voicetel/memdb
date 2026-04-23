@@ -3,9 +3,11 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -142,9 +144,19 @@ type Node struct {
 	transport    *hraft.NetworkTransport
 	forwarder    *forwarder               // nil when ForwardAddr is empty
 	forwardPeers map[string]string        // nodeID → forwardAddr
-	pool         atomic.Pointer[connPool] // current leader's connection pool
+	pool         atomic.Pointer[ConnPool] // current leader's connection pool
 	seq          atomic.Uint64
 	isLeader     atomic.Bool
+	observerWg   sync.WaitGroup
+	observer     *hraft.Observer        // stored so Shutdown can deregister it
+	observerCh   chan hraft.Observation // stored so Shutdown can close it
+	shutdownOnce sync.Once              // ensures Shutdown is idempotent
+}
+
+// storeCloser is satisfied by fileLogStore and fileStableStore, which both
+// hold resources that must be released on error paths in NewNode.
+type storeCloser interface {
+	Close() error
 }
 
 // NewNode creates and starts a Raft cluster node.
@@ -172,31 +184,96 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	if cfg.DataDir == "" {
 		return nil, fmt.Errorf("raft node: DataDir is required")
 	}
+	// Peers must always be provided — even on restart they are used to validate
+	// the caller's intent, and on first boot they define the cluster membership.
 	if len(cfg.Peers) == 0 {
 		return nil, fmt.Errorf("raft node: Peers must not be empty")
 	}
-	if len(cfg.Peers)%2 == 0 {
-		return nil, fmt.Errorf("raft node: cluster size must be odd (got %d peers) — "+
-			"even-sized clusters have no fault tolerance advantage over the next smaller odd size; "+
-			"use 1, 3, 5, or 7 nodes", len(cfg.Peers))
-	}
-	if len(cfg.Peers) == 1 {
-		l := cfg.Logger
-		if l == nil {
-			l = slog.Default()
-		}
-		l.Warn("memdb raft: single-node cluster has no fault tolerance",
-			"nodeID", cfg.NodeID,
-		)
-	}
-
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("raft node: create data dir: %w", err)
+	}
+
+	// ── stores ───────────────────────────────────────────────────────────────
+	// Open stores before the transport so we can call HasExistingState and
+	// validate the even-peer constraint cheaply (no socket bind) before any
+	// network I/O. Error paths after each open close all previously opened
+	// resources via the storeCloser interface.
+	logStore, err := newLogStore(filepath.Join(cfg.DataDir, "raft-log"))
+	if err != nil {
+		return nil, fmt.Errorf("raft node: log store: %w", err)
+	}
+
+	stableStore, err := newStableStore(filepath.Join(cfg.DataDir, "raft-stable"))
+	if err != nil {
+		if c, ok := logStore.(storeCloser); ok {
+			c.Close()
+		}
+		return nil, fmt.Errorf("raft node: stable store: %w", err)
+	}
+
+	snapStore, err := hraft.NewFileSnapshotStoreWithLogger(
+		filepath.Join(cfg.DataDir, "snapshots"), 3,
+		logging.NewHCLogAdapter(cfg.Logger, "raft.snapshot"),
+	)
+	if err != nil {
+		if c, ok := logStore.(storeCloser); ok {
+			c.Close()
+		}
+		if c, ok := stableStore.(storeCloser); ok {
+			c.Close()
+		}
+		return nil, fmt.Errorf("raft node: snapshot store: %w", err)
+	}
+
+	// ── check existing state & validate peer count ───────────────────────────
+	// HasExistingState only reads already-open store handles — no extra I/O.
+	// We do this before binding the transport so that an even-peer error is
+	// returned without ever touching a socket.
+	hasState, err := hraft.HasExistingState(logStore, stableStore, snapStore)
+	if err != nil {
+		if c, ok := logStore.(storeCloser); ok {
+			c.Close()
+		}
+		if c, ok := stableStore.(storeCloser); ok {
+			c.Close()
+		}
+		return nil, fmt.Errorf("raft node: check state: %w", err)
+	}
+	if !hasState {
+		// Even-sized clusters have no fault-tolerance advantage over the next
+		// smaller odd size. Only enforce this on first boot — a node restarting
+		// into an existing cluster uses whatever membership is already stored.
+		if len(cfg.Peers)%2 == 0 {
+			if c, ok := logStore.(storeCloser); ok {
+				c.Close()
+			}
+			if c, ok := stableStore.(storeCloser); ok {
+				c.Close()
+			}
+			return nil, fmt.Errorf("raft node: cluster size must be odd (got %d peers) — "+
+				"even-sized clusters have no fault tolerance advantage over the next smaller odd size; "+
+				"use 1, 3, 5, or 7 nodes", len(cfg.Peers))
+		}
+		if len(cfg.Peers) == 1 {
+			l := cfg.Logger
+			if l == nil {
+				l = slog.Default()
+			}
+			l.Warn("memdb raft: single-node cluster has no fault tolerance",
+				"nodeID", cfg.NodeID,
+			)
+		}
 	}
 
 	// ── TLS transport ────────────────────────────────────────────────────────
 	stream, err := newTLSStreamLayer(cfg.BindAddr, cfg.AdvertiseAddr, cfg.TLSConfig)
 	if err != nil {
+		if c, ok := logStore.(storeCloser); ok {
+			c.Close()
+		}
+		if c, ok := stableStore.(storeCloser); ok {
+			c.Close()
+		}
 		return nil, err
 	}
 
@@ -206,28 +283,6 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 		Timeout: 10 * time.Second,
 		Logger:  logging.NewHCLogAdapter(cfg.Logger, "raft.transport"),
 	})
-
-	// ── stores ───────────────────────────────────────────────────────────────
-	logStore, err := newLogStore(filepath.Join(cfg.DataDir, "raft-log"))
-	if err != nil {
-		transport.Close()
-		return nil, fmt.Errorf("raft node: log store: %w", err)
-	}
-
-	stableStore, err := newStableStore(filepath.Join(cfg.DataDir, "raft-stable"))
-	if err != nil {
-		transport.Close()
-		return nil, fmt.Errorf("raft node: stable store: %w", err)
-	}
-
-	snapStore, err := hraft.NewFileSnapshotStoreWithLogger(
-		filepath.Join(cfg.DataDir, "snapshots"), 3,
-		logging.NewHCLogAdapter(cfg.Logger, "raft.snapshot"),
-	)
-	if err != nil {
-		transport.Close()
-		return nil, fmt.Errorf("raft node: snapshot store: %w", err)
-	}
 
 	// ── FSM ──────────────────────────────────────────────────────────────────
 	node := &Node{cfg: cfg, transport: transport}
@@ -243,6 +298,9 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 			return db.Restore(data)
 		},
 	)
+	if cfg.OnApplyError != nil {
+		fsm.SetApplyErrorHandler(cfg.OnApplyError)
+	}
 
 	// ── raft config ──────────────────────────────────────────────────────────
 	raftCfg := hraft.DefaultConfig()
@@ -257,16 +315,17 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	r, err := hraft.NewRaft(raftCfg, fsm, logStore, stableStore, snapStore, transport)
 	if err != nil {
 		transport.Close()
+		if c, ok := logStore.(storeCloser); ok {
+			c.Close()
+		}
+		if c, ok := stableStore.(storeCloser); ok {
+			c.Close()
+		}
 		return nil, fmt.Errorf("raft node: new raft: %w", err)
 	}
 	node.raft = r
 
 	// ── bootstrap if no existing state ───────────────────────────────────────
-	hasState, err := hraft.HasExistingState(logStore, stableStore, snapStore)
-	if err != nil {
-		r.Shutdown()
-		return nil, fmt.Errorf("raft node: check state: %w", err)
-	}
 	if !hasState {
 		node.logger().Info("memdb raft: bootstrapping new cluster",
 			"nodeID", cfg.NodeID,
@@ -287,30 +346,28 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	// ── forward peers map ────────────────────────────────────────────────────
 	// Must be built before the observer goroutine starts — the goroutine reads
 	// forwardPeers via poolForLeader and would race with this write otherwise.
-	forwardPeers := make(map[string]string, len(cfg.ForwardPeers))
-	for _, p := range cfg.ForwardPeers {
-		idx := -1
-		for i, c := range p {
-			if c == '=' {
-				idx = i
-				break
-			}
-		}
-		if idx > 0 {
-			forwardPeers[p[:idx]] = p[idx+1:]
-		}
-	}
-	node.forwardPeers = forwardPeers
+	node.forwardPeers = parseKVPairs(cfg.ForwardPeers)
 
 	// ── leader change observation ─────────────────────────────────────────────
 	// Always register the observer so we can maintain the connection pool
 	// regardless of whether the caller supplied an OnLeaderChange callback.
+	//
+	// hashicorp/raft never closes observer channels — DeregisterObserver only
+	// removes the observer from its internal map. We therefore store both the
+	// Observer and the channel so that Shutdown can deregister the observer
+	// and then close the channel, which causes the for-range loop below to exit
+	// and lets observerWg.Wait() return.
 	obs := make(chan hraft.Observation, 8)
-	r.RegisterObserver(hraft.NewObserver(obs, false, func(o *hraft.Observation) bool {
+	observer := hraft.NewObserver(obs, false, func(o *hraft.Observation) bool {
 		_, ok := o.Data.(hraft.LeaderObservation)
 		return ok
-	}))
+	})
+	r.RegisterObserver(observer)
+	node.observer = observer
+	node.observerCh = obs
+	node.observerWg.Add(1)
 	go func() {
+		defer node.observerWg.Done()
 		for o := range obs {
 			lo, ok := o.Data.(hraft.LeaderObservation)
 			if !ok {
@@ -351,10 +408,6 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	return node, nil
 }
 
-// Exec submits a SQL write through Raft consensus. Blocks until the entry
-// is committed on a quorum of nodes (or the apply timeout is reached).
-// If this node is not the leader and ForwardPeers is configured, the write
-// is transparently forwarded to the leader. Otherwise ErrNotLeader is returned.
 // Exec submits a SQL write through Raft consensus. Blocks until the entry
 // is committed on a quorum of nodes (or the apply timeout is reached).
 // If this node is not the leader and ForwardPeers is configured, the write
@@ -404,9 +457,9 @@ func (n *Node) Exec(sql string, args ...any) error {
 	}, n.cfg.ApplyTimeout)
 }
 
-// poolForLeader returns a connPool for the given leader's ForwardAddr, or nil
+// poolForLeader returns a ConnPool for the given leader's ForwardAddr, or nil
 // if ForwardPeers is not configured for that leader ID.
-func (n *Node) poolForLeader(leaderID string) *connPool {
+func (n *Node) poolForLeader(leaderID string) *ConnPool {
 	if leaderID == "" {
 		return nil
 	}
@@ -418,8 +471,10 @@ func (n *Node) poolForLeader(leaderID string) *connPool {
 }
 
 // IsLeader reports whether this node is the current Raft leader.
+// It reads the atomic bool maintained by the observer goroutine, which is
+// faster than calling n.raft.State() (no internal lock contention).
 func (n *Node) IsLeader() bool {
-	return n.raft.State() == hraft.Leader
+	return n.isLeader.Load()
 }
 
 // LeaderAddr returns the Raft address of the current leader, or empty string
@@ -448,16 +503,34 @@ func (n *Node) RemoveServer(nodeID string, timeout time.Duration) error {
 }
 
 // Shutdown gracefully stops this Raft node.
+// It is safe to call Shutdown more than once; subsequent calls are no-ops
+// that return nil.
 func (n *Node) Shutdown() error {
-	if n.forwarder != nil {
-		_ = n.forwarder.close()
-	}
-	// Close and discard the connection pool so idle connections are not leaked.
-	if pool := n.pool.Swap(nil); pool != nil {
-		pool.Close()
-	}
-	f := n.raft.Shutdown()
-	return f.Error()
+	var retErr error
+	n.shutdownOnce.Do(func() {
+		if n.forwarder != nil {
+			_ = n.forwarder.close()
+		}
+		// Close and discard the connection pool so idle connections are not leaked.
+		if pool := n.pool.Swap(nil); pool != nil {
+			pool.Close()
+		}
+		// Deregister the observer and close its channel before calling
+		// r.Shutdown(). hashicorp/raft never closes observer channels itself —
+		// DeregisterObserver only removes the observer from the internal map.
+		// Closing the channel here causes the for-range loop in the observer
+		// goroutine to exit so that observerWg.Wait() below does not deadlock.
+		if n.observer != nil {
+			n.raft.DeregisterObserver(n.observer)
+			close(n.observerCh)
+		}
+		f := n.raft.Shutdown()
+		// Wait for the observer goroutine to finish before returning so callers
+		// know no goroutines are still running after Shutdown returns.
+		n.observerWg.Wait()
+		retErr = f.Error()
+	})
+	return retErr
 }
 
 // Stats returns internal Raft statistics for monitoring.
@@ -466,8 +539,7 @@ func (n *Node) Stats() map[string]string {
 }
 
 // ErrNotLeader is returned when a write is attempted on a non-leader node.
-// The error message includes the current leader's address.
-var ErrNotLeader = fmt.Errorf("raft: not leader")
+var ErrNotLeader = errors.New("raft: not leader")
 
 // parsePeers converts "nodeID=addr" strings into raft.Server entries.
 func parsePeers(peers []string) ([]hraft.Server, error) {
@@ -498,4 +570,24 @@ func parsePeers(peers []string) ([]hraft.Server, error) {
 		return nil, fmt.Errorf("no peers provided")
 	}
 	return servers, nil
+}
+
+// parseKVPairs parses "key=value" strings into a map, splitting on the first
+// '=' character. Entries without '=' or with an empty key are silently skipped.
+// Used to build the forwardPeers map from NodeConfig.ForwardPeers.
+func parseKVPairs(pairs []string) map[string]string {
+	m := make(map[string]string, len(pairs))
+	for _, p := range pairs {
+		idx := -1
+		for i, c := range p {
+			if c == '=' {
+				idx = i
+				break
+			}
+		}
+		if idx > 0 {
+			m[p[:idx]] = p[idx+1:]
+		}
+	}
+	return m
 }

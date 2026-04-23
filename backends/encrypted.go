@@ -11,7 +11,12 @@ import (
 )
 
 // EncryptedBackend wraps any Backend with AES-256-GCM encryption.
-// The nonce is prepended to the ciphertext.
+// The nonce is prepended to the ciphertext; each flush generates a fresh
+// random nonce.
+//
+// WARNING: The Key field contains raw key material. Do not copy this struct
+// by value, print it with %+v, or store it in any log. Use a pointer receiver
+// or pass by pointer to avoid accidental key exposure.
 type EncryptedBackend struct {
 	Inner Backend
 	Key   [32]byte
@@ -29,11 +34,11 @@ func (b *EncryptedBackend) Write(ctx context.Context, r io.Reader) error {
 
 	block, err := aes.NewCipher(b.Key[:])
 	if err != nil {
-		return err
+		return fmt.Errorf("encrypted backend: cipher: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return err
+		return fmt.Errorf("encrypted backend: gcm: %w", err)
 	}
 
 	nonce := make([]byte, gcm.NonceSize())
@@ -59,11 +64,11 @@ func (b *EncryptedBackend) Read(ctx context.Context) (io.ReadCloser, error) {
 
 	block, err := aes.NewCipher(b.Key[:])
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("encrypted backend: cipher: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("encrypted backend: gcm: %w", err)
 	}
 
 	nonceSize := gcm.NonceSize()

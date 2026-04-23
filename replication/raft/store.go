@@ -5,8 +5,10 @@ package raft
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -54,6 +56,13 @@ func newLogStore(path string) (hraft.LogStore, error) {
 	return s, nil
 }
 
+// Close closes the underlying file handle.
+func (s *fileLogStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.f.Close()
+}
+
 // load scans the entire file and rebuilds the in-memory index.
 // All reads use ReadAt so no seek state is mutated.
 func (s *fileLogStore) load() error {
@@ -87,7 +96,10 @@ func (s *fileLogStore) load() error {
 
 		var log hraft.Log
 		if err := json.Unmarshal(data, &log); err != nil {
-			break // corrupt record — stop
+			// Log the offset at which we stopped loading — helps diagnose corruption.
+			slog.Default().Warn("memdb raft: log store truncated at corrupt record",
+				"offset", offset, "error", err)
+			break
 		}
 
 		s.index[log.Index] = offset
@@ -121,15 +133,21 @@ func (s *fileLogStore) LastIndex() (uint64, error) {
 	return s.last, nil
 }
 
+// GetLog retrieves the log entry at idx. The read lock is held across all
+// ReadAt calls so that DeleteRange cannot swap s.f (via rename) between the
+// index lookup and the body read.
 func (s *fileLogStore) GetLog(idx uint64, out *hraft.Log) error {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	offset, ok := s.index[idx]
-	s.mu.RUnlock()
 	if !ok {
 		return hraft.ErrLogNotFound
 	}
 
 	// Read the length prefix using ReadAt — no seek, safe for concurrent use.
+	// ReadAt on *os.File uses pread(2) on Linux and is safe for concurrent use
+	// while the read lock prevents DeleteRange from replacing s.f.
 	var lenBuf [8]byte
 	if _, err := s.f.ReadAt(lenBuf[:], offset); err != nil {
 		return fmt.Errorf("log store: read length at %d: %w", offset, err)
@@ -271,12 +289,24 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 	}
 	tmp.Close()
 
+	// Close the current file before rename so Windows is happy too.
 	if err := s.f.Close(); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
+
 	if err := os.Rename(tmpName, s.path); err != nil {
-		return err
+		// Rename failed. The temp file is still valid; s.f has been closed.
+		// If the original file still exists (rename failed before replacing it),
+		// try to re-open it. Otherwise the store is in an unrecoverable state.
+		os.Remove(tmpName)
+		f, reopenErr := os.OpenFile(s.path, os.O_RDWR, 0o600)
+		if reopenErr != nil {
+			// Both failed — return the original rename error; the store is broken.
+			return fmt.Errorf("log store: rename failed and reopen failed: rename: %v, reopen: %w", err, reopenErr)
+		}
+		s.f = f
+		return fmt.Errorf("log store: rename: %w", err)
 	}
 
 	f, err := os.OpenFile(s.path, os.O_RDWR, 0o600)
@@ -297,6 +327,14 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 // rewritten atomically on every Set/SetUint64. Raft only calls Set/SetUint64
 // for a small number of keys (CurrentTerm, LastVoteTerm, LastVoteCand) so
 // the full-rewrite approach is safe and simple.
+//
+// fileStableStore has no persistent open file handle — reads and writes use
+// os.ReadFile / os.WriteFile (via the atomic temp-file rename in save). Its
+// Close method is therefore a no-op, but it exists so that fileStableStore
+// satisfies the storeCloser interface used in node.go error paths.
+
+// errStableKeyNotFound is the sentinel returned by Get when a key is absent.
+var errStableKeyNotFound = errors.New("stable store: key not found")
 
 type fileStableStore struct {
 	mu   sync.Mutex
@@ -322,31 +360,44 @@ func newStableStore(path string) (hraft.StableStore, error) {
 	return s, nil
 }
 
+// Close is a no-op for fileStableStore; it has no persistent open file handle.
+// It exists so that fileStableStore satisfies the storeCloser interface.
+func (s *fileStableStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return nil
+}
+
 func (s *fileStableStore) save() error {
 	data, err := json.Marshal(s.kv)
 	if err != nil {
 		return err
 	}
 	// Atomic write: temp file in same directory + rename.
+	// Do NOT fall back to a direct write — that would be non-atomic and could
+	// leave the file in a partial state on crash.
 	dir := filepath.Dir(s.path)
 	tmp, err := os.CreateTemp(dir, ".stable-tmp-*")
 	if err != nil {
-		// Fallback: write directly if temp dir unavailable.
-		return os.WriteFile(s.path, data, 0o600)
+		return fmt.Errorf("stable store: create temp: %w", err)
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
-		return err
+		return fmt.Errorf("stable store: write temp: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
-		return err
+		return fmt.Errorf("stable store: sync temp: %w", err)
 	}
 	tmp.Close()
-	return os.Rename(tmpName, s.path)
+	if err := os.Rename(tmpName, s.path); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("stable store: rename: %w", err)
+	}
+	return nil
 }
 
 func (s *fileStableStore) Set(key []byte, val []byte) error {
@@ -361,7 +412,7 @@ func (s *fileStableStore) Get(key []byte) ([]byte, error) {
 	defer s.mu.Unlock()
 	v, ok := s.kv[string(key)]
 	if !ok {
-		return nil, fmt.Errorf("not found")
+		return nil, errStableKeyNotFound
 	}
 	return v, nil
 }

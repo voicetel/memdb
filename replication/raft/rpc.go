@@ -79,15 +79,15 @@ type pooledConn struct {
 	idleSince time.Time
 }
 
-// connPool is a channel-based pool of TLS connections to a single remote
+// ConnPool is a channel-based pool of TLS connections to a single remote
 // address. The buffered channel holds idle connections; a non-blocking receive
 // either gets a warm connection immediately or falls through to a fresh dial.
 //
 // When the leader changes, the old pool is closed (draining the channel and
 // closing every idle connection) and a new pool is created for the new leader.
-// This is safe because connPool itself is immutable after construction — the
+// This is safe because ConnPool itself is immutable after construction — the
 // Node swaps the pointer atomically.
-type connPool struct {
+type ConnPool struct {
 	addr   string
 	tlsCfg *tls.Config
 	idle   chan pooledConn // buffered channel — this IS the pool
@@ -96,11 +96,11 @@ type connPool struct {
 
 // NewConnPool creates a pool for the given address. size is the maximum number
 // of idle connections to keep. Use defaultPoolSize unless testing.
-func NewConnPool(addr string, tlsCfg *tls.Config, size int) *connPool {
+func NewConnPool(addr string, tlsCfg *tls.Config, size int) *ConnPool {
 	if size <= 0 {
 		size = defaultPoolSize
 	}
-	return &connPool{
+	return &ConnPool{
 		addr:   addr,
 		tlsCfg: tlsCfg,
 		idle:   make(chan pooledConn, size),
@@ -115,22 +115,23 @@ func NewConnPool(addr string, tlsCfg *tls.Config, size int) *connPool {
 // TLS is unreliable because TLS close_notify alerts may be buffered. Instead,
 // sendForward detects a dead connection when the write or read fails and
 // discards it rather than returning it to the pool.
-func (p *connPool) Get(timeout time.Duration) (net.Conn, error) {
+func (p *ConnPool) Get(timeout time.Duration) (net.Conn, error) {
 	// Drain connections that have exceeded the idle timeout. A connection
 	// that has sat idle too long may have been closed by the remote end;
 	// discarding it here avoids handing a likely-dead connection to the caller.
+	// The labelled break exits the for loop rather than just the select.
+drainLoop:
 	for {
 		select {
 		case pc := <-p.idle:
 			if time.Since(pc.idleSince) > idleTimeout {
 				_ = pc.conn.Close()
-				continue
+				continue drainLoop
 			}
 			return pc.conn, nil
 		default:
-			// Channel empty — fall through to dial.
+			break drainLoop
 		}
-		break
 	}
 
 	dialer := &net.Dialer{Timeout: timeout}
@@ -143,7 +144,7 @@ func (p *connPool) Get(timeout time.Duration) (net.Conn, error) {
 
 // Put returns conn to the idle channel. If the pool is full or has been
 // closed, the connection is closed immediately rather than leaked.
-func (p *connPool) Put(conn net.Conn) {
+func (p *ConnPool) Put(conn net.Conn) {
 	if p.closed.Load() {
 		_ = conn.Close()
 		return
@@ -159,7 +160,7 @@ func (p *connPool) Put(conn net.Conn) {
 
 // Close drains the idle channel and closes every connection. After Close,
 // any subsequent Put calls will close the connection immediately.
-func (p *connPool) Close() {
+func (p *ConnPool) Close() {
 	p.closed.Store(true)
 	for {
 		select {
@@ -173,7 +174,7 @@ func (p *connPool) Close() {
 
 // IdleCount returns the number of connections currently sitting idle in the
 // pool. Intended for testing and monitoring only.
-func (p *connPool) IdleCount() int {
+func (p *ConnPool) IdleCount() int {
 	return len(p.idle)
 }
 
@@ -186,7 +187,7 @@ func (p *connPool) IdleCount() int {
 // and — if both succeeded — returns the connection to the pool for reuse. On
 // any transport error the connection is discarded rather than pooled, so
 // a broken connection is never handed to the next caller.
-func sendForward(pool *connPool, req ForwardRequest, timeout time.Duration) error {
+func sendForward(pool *ConnPool, req ForwardRequest, timeout time.Duration) error {
 	conn, err := pool.Get(timeout)
 	if err != nil {
 		return err

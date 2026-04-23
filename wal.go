@@ -18,6 +18,18 @@ type WALEntry struct {
 }
 
 // WAL is a simple append-only write-ahead log backed by a flat gob file.
+//
+// Correct usage sequence:
+//  1. OpenWAL — opens or creates the file
+//  2. Replay  — replays all existing entries (call once at startup)
+//  3. Append  — appends entries during normal operation
+//  4. Truncate — clears the log after a successful snapshot
+//  5. Close   — closes the file
+//
+// Replay must be called before Append. The fn passed to Replay must NOT
+// call Append (it is called without the WAL mutex, but re-entering via
+// db.Exec during replay is safe because db.Exec does not go through the
+// WAL path during replay — only the raw db.mem.Exec is called).
 type WAL struct {
 	mu  sync.Mutex
 	f   *os.File

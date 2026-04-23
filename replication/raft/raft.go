@@ -37,9 +37,10 @@ func init() {
 // state machine. All nodes in the cluster apply the same WAL entries in
 // the same order via Raft consensus.
 type FSM struct {
-	execFn      func(sql string, args ...any) error
-	serializeFn func() ([]byte, error)
-	restoreFn   func([]byte) error
+	execFn       func(sql string, args ...any) error
+	serializeFn  func() ([]byte, error)
+	restoreFn    func([]byte) error
+	onApplyError func(error) // optional; called when Apply fails
 }
 
 // NewFSM constructs a Raft FSM from caller-provided functions.
@@ -58,6 +59,13 @@ func NewFSM(
 	}
 }
 
+// SetApplyErrorHandler registers an optional callback that is invoked whenever
+// the FSM's execFn returns an error during Apply. The callback receives the
+// wrapped error that will also be returned as the Raft future response.
+func (f *FSM) SetApplyErrorHandler(fn func(error)) {
+	f.onApplyError = fn
+}
+
 // Apply is called by Raft on every committed log entry on every node.
 func (f *FSM) Apply(log *raft.Log) any {
 	var entry replication.WALEntry
@@ -65,7 +73,11 @@ func (f *FSM) Apply(log *raft.Log) any {
 		return fmt.Errorf("raft fsm: decode: %w", err)
 	}
 	if err := f.execFn(entry.SQL, entry.Args...); err != nil {
-		return fmt.Errorf("raft fsm: exec: %w", err)
+		result := fmt.Errorf("raft fsm: exec: %w", err)
+		if f.onApplyError != nil {
+			f.onApplyError(result)
+		}
+		return result
 	}
 	return nil
 }
@@ -105,12 +117,12 @@ func (s *fsmSnapshot) Release() {}
 
 // Apply encodes a WALEntry and submits it to the Raft cluster.
 // Only the leader may call this. Followers receive the entry via FSM.Apply.
+//
+// No pre-check of r.State() is performed here — hashicorp/raft returns
+// raft.ErrNotLeader from r.Apply if this node is not the leader. A pre-check
+// would introduce a TOCTOU race (leadership can be lost between the check and
+// the actual Apply call).
 func Apply(r *raft.Raft, entry replication.WALEntry, timeout time.Duration) error {
-	if r.State() != raft.Leader {
-		_, leaderID := r.LeaderWithID()
-		return fmt.Errorf("raft: not leader — current leader: %s", leaderID)
-	}
-
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(entry); err != nil {
 		return fmt.Errorf("raft: encode entry: %w", err)
