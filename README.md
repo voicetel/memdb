@@ -4,20 +4,24 @@ A high-performance, embedded Go database library built on SQLite. All reads and 
 
 Think Redis RDB+AOF semantics with full SQL query power — in a single Go import.
 
+**2.26× faster writes than file SQLite. Concurrent reads match file SQLite with `ReadPoolSize > 0`.**
+
 ---
 
 ## Features
 
 - **Full SQL** — joins, indexes, transactions, aggregates via SQLite
+- **2.26× faster writes** — all writes hit memory; no VFS, no page-cache overhead
 - **Sub-millisecond reads** — all queries hit memory, no disk I/O on the hot path
+- **Concurrent reads** — channel-based replica pool (`ReadPoolSize`) matches file SQLite throughput at 4+ goroutines
 - **Configurable durability** — periodic snapshot only, WAL-backed near-zero loss, or fully synchronous
 - **Atomic snapshots** — write-then-rename prevents corrupt state on crash
 - **Pluggable backends** — local disk or any custom `Backend` implementation
 - **Snapshot compression** — zstd compression built in, ~50-70% size reduction on typical schemas
 - **Change notifications** — `OnChange` hook via SQLite update hook for cache invalidation and audit
-- **Replication** — strong-consistency multi-node replication via `hashicorp/raft` over mutual TLS; any node accepts writes and transparently forwards to the leader
+- **Raft replication** — strong-consistency multi-node replication via `hashicorp/raft` over mutual TLS; any node accepts writes and transparently forwards to the leader
 - **Structured logging** — `log/slog` throughout with syslog, JSON, and text handlers; `hclog` bridge routes Raft internals through the same pipeline
-- **PostgreSQL wire protocol** — optional server mode accepts any Postgres client or ORM
+- **PostgreSQL wire protocol** — optional server mode accepts any Postgres client or ORM; SSL negotiation, correct `ErrorResponse` severity field
 - **Pure Go build tag** — swap `mattn/go-sqlite3` for `modernc.org/sqlite` with `-tags purego`
 - **ORM compatible** — exposes `*sql.DB` for use with `sqlx`, `bun`, `ent`, `sqlc`, GORM, and others
 
@@ -195,7 +199,7 @@ type Config struct {
 	// Called on every INSERT, UPDATE, or DELETE against the memory DB.
 	OnChange ChangeHandler
 
-	// Called after each completed flush with timing and size metrics.
+	// Called after each completed flush.
 	OnFlushComplete MetricsHandler
 
 	// Executed once after restore on startup.
@@ -210,7 +214,7 @@ type Config struct {
 	// the Raft FSM calls ExecDirect after consensus. Use this to route all
 	// writes through a raft.Node for cluster replication.
 	// If nil, Exec operates locally (standalone mode).
-	OnExec func(sql string, args []any) error
+	OnExec func(sql string, args ...any) error
 }
 ```
 
@@ -365,14 +369,13 @@ Powered by `sqlite3_update_hook`. Fires synchronously in the calling goroutine b
 cfg.OnFlushComplete = func(m memdb.FlushMetrics) {
 	// Prometheus example
 	flushDuration.Observe(m.Duration.Seconds())
-	flushBytes.Add(float64(m.BytesWritten))
-	flushPageCount.Add(float64(m.PageCount))
-	walEntriesReplayed.Add(float64(m.WALEntriesReplayed))
 	if m.Error != nil {
 		flushErrors.Inc()
 	}
 }
 ```
+
+`FlushMetrics` contains `Duration time.Duration` and `Error error`.
 
 ---
 
@@ -381,7 +384,7 @@ cfg.OnFlushComplete = func(m memdb.FlushMetrics) {
 memdb uses [`log/slog`](https://pkg.go.dev/log/slog) as its single structured
 logging interface. All components — the core DB, WAL, replica pool, Raft node,
 and CLI — write through the same pipeline. Three handler constructors are
-provided in the `logging` sub-package; no external dependencies are required.
+provided in the `logging` sub-package; no new dependencies are required.
 
 ### Handlers
 
@@ -398,11 +401,10 @@ logger := logging.NewTextHandler(os.Stderr, slog.LevelDebug)
 // Structured JSON — good for log aggregators (Datadog, Splunk, Loki)
 logger := logging.NewJSONHandler(os.Stderr, slog.LevelInfo)
 
-// Syslog via /dev/log — recommended for production Linux deployments
+// Syslog via /dev/log — recommended for production Linux deployments.
+// Falls back gracefully if syslogd is unavailable (macOS, containers).
 logger, err := logging.NewSyslogHandler("memdb", slog.LevelInfo)
 if err != nil {
-    // syslog unavailable (e.g. macOS, container without syslogd)
-    // fall back to text or JSON
     logger = logging.NewTextHandler(os.Stderr, slog.LevelInfo)
 }
 ```
@@ -411,10 +413,10 @@ if err != nil {
 
 | `slog` level | When it fires | Syslog priority |
 |---|---|---|
-| `Debug` | Forwarded writes, replica refresh ticks | `LOG_DEBUG` |
+| `Debug` | Forwarded writes | `LOG_DEBUG` |
 | `Info` | Flush complete, WAL replay, restore, leader election, bootstrap | `LOG_INFO` |
 | `Warn` | Single-node cluster warning | `LOG_WARNING` |
-| `Error` | Flush failure, replica refresh error, apply error | `LOG_ERR` |
+| `Error` | Flush failure, replica refresh error, FSM apply error | `LOG_ERR` |
 
 ### Wiring the logger
 
@@ -472,8 +474,8 @@ Level mapping: `hclog.Trace` → `slog.Debug`, `hclog.Debug` → `slog.Debug`,
 memdb uses **Raft consensus** (`hashicorp/raft`) for multi-node replication. All
 nodes are peers — there is no separate leader/follower configuration. Any node
 accepts writes and transparently forwards them to the current leader over a
-dedicated TLS RPC connection. Once the leader commits the entry through Raft,
-every node's FSM applies it locally.
+dedicated TLS RPC connection backed by a channel-based connection pool. Once the
+leader commits the entry through Raft, every node's FSM applies it locally.
 
 ### Cluster sizing
 
@@ -696,7 +698,6 @@ import "github.com/voicetel/memdb/server"
 
 srv := server.New(db, server.Config{
 	ListenAddr: "127.0.0.1:5433",
-	Protocol:   server.ProtocolPostgres,
 	TLSConfig:  tlsCfg,
 	Auth: server.BasicAuth{
 		Username: "memdb",
@@ -821,7 +822,7 @@ make tag VERSION_TAG=v1.2.0
 CGo makes cross-compilation require a cross C toolchain. The recommended approach for CI is Docker with `tonistiigi/xx`:
 
 ```dockerfile
-FROM --platform=$BUILDPLATFORM golang:1.22 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.24 AS builder
 COPY --from=tonistiigi/xx / /
 ARG TARGETPLATFORM
 RUN xx-apt install -y gcc libc6-dev
@@ -841,12 +842,13 @@ For cross-compilation without Docker, use the `-tags purego` build tag to elimin
 └───────┬──────────────────────────────┬────────────────────────┘
         │ writes (OnExec set)          │ reads (ReadPoolSize > 0)
         ▼                              ▼
-  ┌───────────┐              ┌─────────────────────────────────┐
-  │ OnExec()  │              │       replicaPool (×N)          │
-  │ node.Exec │              │  sqlite3_serialize/deserialize  │
-  └─────┬─────┘              │  N independent :memory: DBs     │
-        │                    │  refreshed every 1 ms (default) │
-        │ IsLeader?          └─────────────────────────────────┘
+  ┌───────────┐              ┌──────────────────────────────────┐
+  │ OnExec()  │              │        replicaPool (×N)          │
+  │ node.Exec │              │  channel-based exclusive checkout│
+  └─────┬─────┘              │  sqlite3_serialize/deserialize   │
+        │                    │  N independent :memory: DBs      │
+        │ IsLeader?          │  refreshed every 1 ms (default)  │
+        │                    └──────────────────────────────────┘
         ├─ Yes ──────────────────────────────────────┐
         │                                            │
         │  No: dial leader ForwardAddr (TLS)         │
@@ -1014,7 +1016,7 @@ go test -bench='^BenchmarkCompare_ConcurrentRead$' -benchtime=5s -cpu=1,4,8 .
 | Atomic snapshots | ✅ | ❌ | ✅ | ✅ | ✅ RDB | ✅ |
 | Pluggable backends | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Change notifications | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
-| Replication | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ Raft |
+| Replication | ✅ Raft | ❌ | ❌ | ❌ | ✅ | ✅ Raft |
 | Postgres wire | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Pure Go option | ✅ | ✅ | ✅ | ✅ | N/A | ❌ |
 
@@ -1030,9 +1032,9 @@ go test -bench='^BenchmarkCompare_ConcurrentRead$' -benchtime=5s -cpu=1,4,8 .
 - Multi-service shared state on the same host (Unix socket)
 - Test infrastructure replacing go-sqlmock or dockertest
 - Read replicas for a primary relational database
+- Any workload where writes are 2× faster than file SQLite matters
 
 **Bad fit:**
-- Financial transactions or audit logs requiring strict durability
 - Datasets that do not fit in RAM
 - Multi-process write-heavy workloads without the replication layer
 - Serverless or ephemeral container environments without persistent volume mounts
@@ -1043,18 +1045,20 @@ go test -bench='^BenchmarkCompare_ConcurrentRead$' -benchtime=5s -cpu=1,4,8 .
 
 ```
 memdb/
-├── memdb.go              # Public API: Open, Exec, Query, Flush, Close
-├── backend.go            # Backend interface + LocalBackend
-├── backup.go             # SQLite Online Backup API (cgo)
+├── memdb.go              # Public API: Open, Exec, Query, Flush, Close, ExecDirect
+├── backend.go            # Backend interface + LocalBackend + WrapBackend adapter
+├── backup.go             # SQLite Online Backup API; Serialize/Restore (cgo)
 ├── backup_purego.go      # Backup stubs for purego build
-├── replica.go            # Read replica pool via serialize/deserialize (cgo)
+├── replica.go            # Channel-based read replica pool (cgo)
 ├── replica_purego.go     # Replica stubs for purego build
 ├── driver.go             # mattn driver registration + raw conn access (cgo)
 ├── driver_purego.go      # modernc driver registration (purego)
+├── driver_shared.go      # fnv32 hash shared between cgo and purego builds
 ├── config.go             # Config struct, defaults, validation
 ├── errors.go             # Sentinel errors
 ├── wal.go                # Write-ahead log: append, replay, truncate
 ├── memdb_test.go         # Unit and integration tests
+├── memdb_extra_test.go   # Additional unit tests
 ├── memdb_bench_test.go   # Throughput benchmarks
 ├── memdb_compare_test.go # memdb vs file SQLite comparison benchmarks
 ├── logging/
@@ -1063,16 +1067,16 @@ memdb/
 │   ├── syslog_stub.go    # NewSyslogHandler stub (Windows/Plan9)
 │   └── hclog.go          # NewHCLogAdapter — hclog.Logger → *slog.Logger bridge
 ├── server/
-│   ├── server.go         # PostgreSQL wire protocol server
-│   └── handler.go        # Simple Query, DML dispatch, wire helpers
+│   ├── server.go         # PostgreSQL wire protocol server (TLS, BasicAuth, Unix socket)
+│   └── handler.go        # Simple Query, DML dispatch, SSL negotiation, wire helpers
 ├── replication/
 │   ├── replication.go    # WALEntry type (shared between packages)
 │   └── raft/
 │       ├── raft.go       # FSM: Apply, Snapshot, Restore; gob type registry
 │       ├── node.go       # Node: NewNode, Exec, forward, AddVoter, Shutdown
 │       ├── tls.go        # tlsStreamLayer — TLS StreamLayer for hashicorp/raft
-│       ├── forwarder.go  # Write-forwarding RPC server (leader side)
-│       ├── rpc.go        # ForwardRequest/Response wire protocol; channel-based connPool
+│       ├── forwarder.go  # Write-forwarding RPC server (leader side, WaitGroup tracked)
+│       ├── rpc.go        # ForwardRequest/Response wire protocol; channel-based ConnPool
 │       └── store.go      # Crash-safe fileLogStore + fileStableStore
 ├── backends/
 │   ├── local.go          # Atomic local file backend
