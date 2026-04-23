@@ -229,17 +229,23 @@ which is identical across backends — the gap collapses to noise.
 
 ### Concurrent read (parallelism=4, 500-row dataset)
 
-| Backend | ns/op | vs `memdb` (pool) |
+Baseline (1.00×) is `memdb/pool` — the fastest backend in this table.
+Every other row shows that backend's `ns/op ÷ baseline ns/op`, so larger
+numbers mean slower, matching the convention used in the preceding
+comparison tables.
+
+| Backend | ns/op | vs `memdb/pool` |
 |---|---:|---:|
-| `memdb` (single-conn) | 5 500 | 2.71× slower |
 | `memdb/pool` (`ReadPoolSize=4`) | **2 032** | **1.00×** |
 | `file/sync=off` | 2 478 | 1.22× |
 | `file/sync=normal` | 2 453 | 1.21× |
 | `file/sync=full` | 2 479 | 1.22× |
+| `memdb` (single-conn) | 5 500 | 2.71× |
 
 With the replica pool `memdb` is **~22 % faster than file SQLite** on
-concurrent reads, and **2.71× faster than memdb without the pool**. Turning
-on `ReadPoolSize` is the single biggest read-throughput lever available.
+concurrent reads, and **2.71× faster than `memdb` without the pool**.
+Turning on `ReadPoolSize` is the single biggest read-throughput lever
+available.
 
 ---
 
