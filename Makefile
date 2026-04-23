@@ -399,6 +399,49 @@ pprof-wal: dirs ## Capture CPU/heap profiles of DurabilityWAL writes
 		$(GO) test -v -timeout 60s -run "TestPProf_Writes_WAL$$" .
 	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_writes_wal.*$(NC)"
 
+.PHONY: pprof-server
+pprof-server: dirs ## Capture CPU/heap/mutex/block profiles of the PostgreSQL wire-protocol server under sustained client load
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	@echo -e "$(BLUE)Capturing server pprof profiles into $(COVERAGE_DIR)/pprof...$(NC)"
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 120s -run "TestPProf_Server_" ./server/...
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_server_*$(NC)"
+
+.PHONY: pprof-server-select
+pprof-server-select: dirs ## Narrow SELECT workload (~10 rows/query, 16 clients)
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 60s -run "TestPProf_Server_Select$$" ./server/...
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_server_select.*$(NC)"
+
+.PHONY: pprof-server-select-wide
+pprof-server-select-wide: dirs ## Wide SELECT workload (500 rows/query, amplifies per-row allocation cost)
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 60s -run "TestPProf_Server_Select_Wide$$" ./server/...
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_server_select_wide.*$(NC)"
+
+.PHONY: pprof-server-insert
+pprof-server-insert: dirs ## Concurrent INSERT DML through the simple-query protocol
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 60s -run "TestPProf_Server_Insert$$" ./server/...
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_server_insert.*$(NC)"
+
+.PHONY: pprof-server-mixed
+pprof-server-mixed: dirs ## Mixed SELECT/INSERT with mutex and block sampling enabled
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 60s -run "TestPProf_Server_Mixed$$" ./server/...
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_server_mixed.*$(NC)"
+
+.PHONY: pprof-server-connect
+pprof-server-connect: dirs ## Rapid connect/query/disconnect cycle (short-lived-connection overhead)
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 60s -run "TestPProf_Server_Connect$$" ./server/...
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_server_connect.*$(NC)"
+
 .PHONY: pprof-view
 pprof-view: ## Open the last captured CPU profile in the pprof web UI (PROF=<path>)
 	@if [ -z "$(PROF)" ]; then \
@@ -652,7 +695,7 @@ help: ## Show this help message
 	@echo "  bench-stat         Run benchmarks then analyse with benchstat"
 	@echo "  bench-pprof        Benchmarks with CPU/mem/mutex/block profile capture"
 	@echo ""
-	@echo -e "$(MAGENTA)Profiling (pprof):$(NC)"
+	@echo -e "$(MAGENTA)Profiling (pprof — core memdb):$(NC)"
 	@echo "  pprof              Run all pprof-capturing tests"
 	@echo "  pprof-writes       Pure-write workload profile"
 	@echo "  pprof-reads        Concurrent read workload profile (replica pool)"
@@ -660,6 +703,14 @@ help: ## Show this help message
 	@echo "  pprof-flush        Flush path profile at 50k rows"
 	@echo "  pprof-wal          DurabilityWAL writes profile"
 	@echo "  pprof-view         Open a profile in the pprof web UI (PROF=<path>)"
+	@echo ""
+	@echo -e "$(MAGENTA)Profiling (pprof — Postgres wire server):$(NC)"
+	@echo "  pprof-server             Run all server pprof scenarios"
+	@echo "  pprof-server-select      Narrow SELECT (~10 rows/query, 16 clients)"
+	@echo "  pprof-server-select-wide Wide SELECT (500 rows/query, 8 clients)"
+	@echo "  pprof-server-insert      Concurrent INSERT DML"
+	@echo "  pprof-server-mixed       Mixed SELECT/INSERT + mutex/block sampling"
+	@echo "  pprof-server-connect     Rapid connect/query/disconnect cycles"
 	@echo ""
 	@echo -e "$(CYAN)Replication & Profiling Tests:$(NC)"
 	@echo "  test-replication-integrity  3-node end-to-end Raft integrity tests"
