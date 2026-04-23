@@ -92,9 +92,33 @@ type Config struct {
 
 	// ReplicaRefreshInterval controls how often the background goroutine
 	// re-serializes the writer and deserializes into every replica.
-	// Shorter intervals mean fresher reads but more CPU overhead.
+	// Shorter intervals mean fresher reads but more CPU overhead —
+	// sqlite3_deserialize copies the entire database into each replica on
+	// every tick.
+	//
+	// Empirical guidance (from BenchmarkReplicaRefreshInterval on a
+	// 1 000-row dataset with 8 concurrent readers, measured on a
+	// 20-thread x86_64 box):
+	//
+	//	refresh=250µs   ~83 µs/write   34 KB/op   (refresh dominates CPU)
+	//	refresh=1ms     ~75 µs/write   30 KB/op   (still 8× slower than 100ms)
+	//	refresh=5ms     ~72 µs/write   26 KB/op   (marginal improvement)
+	//	refresh=25ms    ~35 µs/write   14 KB/op   (knee of the curve)
+	//	refresh=100ms   ~10 µs/write   3.5 KB/op  (writes at full speed)
+	//
+	// The CPU cost scales with database size because the entire serialised
+	// image is memmoved into every replica per tick. On larger datasets
+	// the knee shifts further right — a 100 MB database at refresh=1ms
+	// would saturate a core just copying bytes.
+	//
 	// Only used when ReadPoolSize > 0.
-	// Default: 1ms.
+	//
+	// Default: 50 ms. This keeps the read-staleness window small enough
+	// for typical "eventual consistency" expectations while costing writes
+	// almost nothing. Callers who need lower staleness at the cost of
+	// write throughput can set this explicitly; values below 5 ms emit a
+	// warning at Open time because they were observed to dominate CPU in
+	// pprof traces.
 	ReplicaRefreshInterval time.Duration
 
 	// Called when a background flush fails.
@@ -157,7 +181,24 @@ func (c *Config) applyDefaults() {
 		c.ReadPoolSize = 0
 	}
 	if c.ReadPoolSize > 0 && c.ReplicaRefreshInterval <= 0 {
-		c.ReplicaRefreshInterval = time.Millisecond
+		// 50 ms balances read staleness against writer CPU cost. See the
+		// BenchmarkReplicaRefreshInterval sweep and the pprof analysis in
+		// the field doc above for the empirical justification. Operators
+		// who need lower staleness must set this explicitly and accept
+		// the write-throughput trade-off it implies.
+		c.ReplicaRefreshInterval = 50 * time.Millisecond
+	}
+	if c.ReadPoolSize > 0 && c.ReplicaRefreshInterval > 0 && c.ReplicaRefreshInterval < 5*time.Millisecond {
+		logger := c.Logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("memdb: ReplicaRefreshInterval below 5ms was observed in pprof "+
+			"to dominate CPU via sqlite3_deserialize memmoves on every tick; "+
+			"consider 25ms–100ms unless sub-5ms read staleness is a hard requirement",
+			"interval", c.ReplicaRefreshInterval,
+			"readPoolSize", c.ReadPoolSize,
+		)
 	}
 	if c.Backend == nil && c.FilePath != "" {
 		c.Backend = &LocalBackend{Path: c.FilePath}
