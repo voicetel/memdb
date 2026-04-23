@@ -19,6 +19,7 @@ Think Redis RDB+AOF semantics with full SQL query power — in a single Go impor
 - **Pluggable backends** — local disk or any custom `Backend` implementation
 - **Snapshot compression** — zstd compression built in, ~50-70% size reduction on typical schemas
 - **Change notifications** — `OnChange` hook via SQLite update hook for cache invalidation and audit
+- **Panic-safe callbacks** — `OnChange`, `OnFlushError`, `OnFlushComplete`, and background goroutines recover panics so a misbehaving callback cannot crash the process.
 - **Raft replication** — strong-consistency multi-node replication via `hashicorp/raft` over mutual TLS; any node accepts writes and transparently forwards to the leader
 - **Structured logging** — `log/slog` throughout with syslog, JSON, and text handlers; `hclog` bridge routes Raft internals through the same pipeline
 - **PostgreSQL wire protocol** — optional server mode accepts any Postgres client or ORM; SSL negotiation, correct `ErrorResponse` severity field
@@ -173,6 +174,10 @@ type Config struct {
 	// Pages to copy per backup step. -1 = all at once.
 	// Tune for large DBs to reduce latency spikes. Default: -1.
 	BackupStepPages int
+
+	// Set true to disable SQLite foreign-key enforcement.
+	// The zero value (false) means enforcement is ON.
+	DisableForeignKeys bool
 
 	// Number of independent in-memory read replicas to maintain.
 	// When > 0, Query and QueryRow are load-balanced across replicas,
@@ -799,6 +804,10 @@ srv := server.New(db, server.Config{
 })
 ```
 
+`Config.Logger` accepts a `*slog.Logger` for structured logging from the server, including panics recovered from connection handlers (logged at `ERROR` level).
+
+`BasicAuth` uses constant-time comparison (`crypto/subtle.ConstantTimeCompare`) to prevent timing attacks.
+
 ---
 
 ## Profiling (pprof)
@@ -1200,6 +1209,15 @@ see the failure at `Exec` time rather than losing the entry silently.
 Records with a corrupt header, truncated body, or unknown binary version
 tag cause `Replay` to stop at that record and return every prior valid
 entry — matching the behaviour expected after an unclean shutdown.
+
+### Snapshot integrity
+
+Snapshots include a 40-byte integrity header: the 4-byte magic `"MDBK"`, a
+1-byte version tag, and a SHA-256 checksum of the payload. On load the
+checksum is verified; a mismatch returns `ErrSnapshotCorrupt`. Legacy
+snapshots written without the header are accepted with a warning and are
+upgraded (header prepended) on the next flush. Corrupt snapshots are never
+silently accepted.
 
 ### Lifecycle
 
