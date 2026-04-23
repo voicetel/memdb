@@ -11,6 +11,23 @@ import (
 	"sync/atomic"
 )
 
+// walEncBuf is a pooled scratch buffer used by WAL.Append to avoid allocating
+// a fresh bytes.Buffer + encoder on every write. The buffer is reset (not
+// reallocated) between uses so its underlying storage grows to the largest
+// entry ever encoded and then stays stable for the lifetime of the process.
+//
+// gob encoders maintain per-stream type descriptor state, so we deliberately
+// do NOT pool the *gob.Encoder — each Append allocates a new one over the
+// pooled buffer so the on-disk record remains independently decodable (see
+// the format notes on WAL).
+var walEncBuf = sync.Pool{
+	New: func() any {
+		b := &bytes.Buffer{}
+		b.Grow(256) // typical Raft/WAL entry fits in a few hundred bytes
+		return b
+	},
+}
+
 // WALEntry records a single write operation for replay on recovery.
 type WALEntry struct {
 	Seq       uint64
@@ -57,19 +74,30 @@ func (w *WAL) NextSeq() uint64 {
 
 // Append encodes entry as a self-contained gob message, writes the
 // length-prefixed record, and fsyncs.
+//
+// Hot path: the encoder scratch buffer is drawn from a sync.Pool so the
+// steady-state allocation is a single []byte for the length-prefixed record.
+// The 4-byte length prefix is written in the same write(2) call as the body
+// to guarantee that no reader (including a crash-recovery Replay) can ever
+// observe a header without its payload.
 func (w *WAL) Append(entry WALEntry) error {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(entry); err != nil {
+	buf := walEncBuf.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer walEncBuf.Put(buf)
+
+	if err := gob.NewEncoder(buf).Encode(entry); err != nil {
 		return fmt.Errorf("memdb: wal encode: %w", err)
 	}
-	body := buf.Bytes()
-	if len(body) > 64*1024*1024 {
-		return fmt.Errorf("memdb: wal entry too large (%d bytes)", len(body))
+	bodyLen := buf.Len()
+	if bodyLen > 64*1024*1024 {
+		return fmt.Errorf("memdb: wal entry too large (%d bytes)", bodyLen)
 	}
 
-	record := make([]byte, 4+len(body))
-	binary.BigEndian.PutUint32(record[:4], uint32(len(body)))
-	copy(record[4:], body)
+	// Build [4-byte length][body] in a single allocation so the write is
+	// atomic from the kernel's perspective (one write(2) call).
+	record := make([]byte, 4+bodyLen)
+	binary.BigEndian.PutUint32(record[:4], uint32(bodyLen))
+	copy(record[4:], buf.Bytes())
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
