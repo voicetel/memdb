@@ -1233,6 +1233,111 @@ go test -bench='^BenchmarkCompare_ConcurrentRead$' -benchtime=5s -cpu=1,4,8 .
 
 ---
 
+## Tuning
+
+The two knobs most directly controlling concurrent-read scaling —
+`Config.ReadPoolSize` and `Config.ReplicaRefreshInterval` — trade off read
+throughput against memory cost, refresh CPU, and read staleness. The
+`memdb/tuning` sub-package turns the v1.4 benchmark sweep (see
+[BENCHMARKS.md](./BENCHMARKS.md)) into a closed-form recommender so you do
+not have to rediscover the knee of the curve on your own hardware.
+
+### Model
+
+Given your workload characteristics:
+
+```
+N         = ReadPoolSize (replicas)
+S         = database size in bytes
+T         = refresh interval (seconds)
+P         = GOMAXPROCS
+M_max     = memory budget for replicas (bytes)
+tau_max   = staleness tolerance (seconds)
+f_write   = expected fraction of refresh ticks that do work
+```
+
+The recommender maximises `min(N, P)` subject to:
+
+```
+N × S                           ≤ M_max             (memory budget)
+f_write × N × S / bw_deserial   ≤ 1 core            (refresh CPU)
+T                               ∈ [5ms, 500ms]      (staleness band)
+N                               ≤ P                 (diminishing returns)
+```
+
+Expected throughput follows `speedup ≈ α_read × min(N, P)` where
+`α_read ≈ 0.65` on the reference run, matching the measured 2.71× at 4
+replicas.
+
+### Usage
+
+```go
+import (
+    "time"
+    "github.com/voicetel/memdb"
+    "github.com/voicetel/memdb/tuning"
+)
+
+rec := tuning.Recommend(tuning.Workload{
+    DatabaseSize:       50 << 20,           // 50 MiB in-memory DB
+    MemoryBudget:       512 << 20,          // 512 MiB for the replica pool
+    StalenessTolerance: 100 * time.Millisecond,
+    Workload:           tuning.WorkloadReadHeavy,
+})
+
+log.Printf("memdb tuning: %s", rec.Rationale)
+
+db, err := memdb.Open(memdb.Config{
+    FilePath:               "/var/lib/app/data.db",
+    ReadPoolSize:           rec.ReadPoolSize,
+    ReplicaRefreshInterval: rec.ReplicaRefreshInterval,
+    // ... other fields
+})
+```
+
+The returned `Recommendation` includes:
+
+| Field | Meaning |
+|---|---|
+| `ReadPoolSize` | drops into `Config.ReadPoolSize` |
+| `ReplicaRefreshInterval` | drops into `Config.ReplicaRefreshInterval` |
+| `EstimatedReplicaBytes` | memory the pool will consume (`N × DatabaseSize`) |
+| `EstimatedRefreshCPU` | expected fraction of one core the refresh loop will burn |
+| `EstimatedReadSpeedup` | multiplier vs the single-connection baseline |
+| `Rationale` | one-line human-readable explanation of the binding constraint |
+
+`Recommend` never fails. Invalid or zero inputs (e.g. `MemoryBudget <
+DatabaseSize`, or `DatabaseSize == 0`) collapse to the safe
+`ReadPoolSize=0` fallback with a `Rationale` explaining why — drop the
+struct straight into `memdb.Config` and you get the single-connection
+default without a broken pool configuration.
+
+### Workload hints
+
+| Hint | Meaning | Effect |
+|---|---|---|
+| `WorkloadReadHeavy` | reads dominate, writes infrequent | aggressive N, refresh fast-path common |
+| `WorkloadBalanced` / `WorkloadUnknown` | roughly 50/50 | default recommendation |
+| `WorkloadWriteHeavy` | writes dominate | N halved to leave CPU headroom — every tick does real work |
+
+### Example output (read-heavy, 10 MiB DB, 200 MiB budget, 4 cores)
+
+```
+ReadPoolSize=4; ReplicaRefreshInterval=50ms; workload=read-heavy;
+est-mem=40.0MiB; est-refresh-cpu=0.1%; est-read-speedup=2.60x
+```
+
+### When to recalibrate
+
+The tuning constants (`BWDeserialize`, `AlphaRead`, floor/ceiling/default
+intervals) are calibrated against the v1.4.0 reference run. If you re-run
+`make bench` on different hardware and the headline numbers shift
+materially, update the constants in `tuning/tuning.go` — every constant
+has a doc comment citing its source so the audit trail stays clear. The
+`TestRecommend_Calibration_*` tests guard against silent drift.
+
+---
+
 ## Good Fit / Bad Fit
 
 **Good fit:**
