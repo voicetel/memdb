@@ -42,7 +42,11 @@ func registerDriver(cfg Config) string {
 	if cfg.OnChange != nil {
 		hookID = fmt.Sprintf(",hookid=%d", hookCounter.Add(1))
 	}
-	key := fmt.Sprintf("cache=%d,busy=%d%s", cfg.CacheSize, cfg.BusyTimeout, hookID)
+	fkPart := ",fk=1"
+	if cfg.DisableForeignKeys {
+		fkPart = ",fk=0"
+	}
+	key := fmt.Sprintf("cache=%d,busy=%d%s%s", cfg.CacheSize, cfg.BusyTimeout, fkPart, hookID)
 
 	if name, ok := registeredDrivers.Load(key); ok {
 		return name.(string)
@@ -73,6 +77,14 @@ func registerDriver(cfg Config) string {
 				"PRAGMA synchronous=NORMAL",
 				fmt.Sprintf("PRAGMA busy_timeout=%d", cfg.BusyTimeout),
 			}
+			// SQLite disables foreign-key enforcement by default. Enable
+			// it unconditionally unless the caller explicitly opted out via
+			// Config.DisableForeignKeys. Applications that declare FK
+			// constraints almost certainly want them enforced; the silent
+			// default-off behaviour is a well-known SQLite footgun.
+			if !cfg.DisableForeignKeys {
+				pragmas = append(pragmas, "PRAGMA foreign_keys=ON")
+			}
 			for _, p := range pragmas {
 				if _, err := conn.Exec(p, nil); err != nil {
 					return fmt.Errorf("memdb: pragma %q: %w", p, err)
@@ -80,10 +92,19 @@ func registerDriver(cfg Config) string {
 			}
 			if onChangeFn != nil {
 				conn.RegisterUpdateHook(func(op int, _ string, table string, rowid int64) {
-					onChangeFn(ChangeEvent{
-						Op:    opName(op),
-						Table: table,
-						RowID: rowid,
+					// safeDo ensures a panicking OnChange callback does not
+					// propagate into the SQLite update-hook call frame (which
+					// runs on whatever goroutine called Exec) and crash the
+					// process. The error handler is nil here because OnChange
+					// is fire-and-forget and has no error return; the panic is
+					// logged via slog.Default() since the driver registration
+					// happens once and does not have access to a DB instance.
+					safeDo(nil, nil, func() {
+						onChangeFn(ChangeEvent{
+							Op:    opName(op),
+							Table: table,
+							RowID: rowid,
+						})
 					})
 				})
 			}

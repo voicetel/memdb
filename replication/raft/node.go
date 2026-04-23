@@ -369,29 +369,56 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 		for {
 			select {
 			case o := <-obs:
-				lo, ok := o.Data.(hraft.LeaderObservation)
-				if !ok {
-					continue
-				}
-				isLeader := string(lo.LeaderID) == cfg.NodeID
-				node.isLeader.Store(isLeader)
+				// Recover from any panic inside the observation handler so
+				// a misbehaving OnLeaderChange callback or an unexpected nil
+				// dereference does not bring down the entire Raft node.
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							node.logger().Error("memdb raft: panic in observer goroutine",
+								"panic", r,
+								"nodeID", cfg.NodeID,
+							)
+						}
+					}()
 
-				node.logger().Info("memdb raft: leadership changed",
-					"nodeID", cfg.NodeID,
-					"isLeader", isLeader,
-					"leaderID", string(lo.LeaderID),
-				)
+					lo, ok := o.Data.(hraft.LeaderObservation)
+					if !ok {
+						return
+					}
+					isLeader := string(lo.LeaderID) == cfg.NodeID
+					node.isLeader.Store(isLeader)
 
-				// Swap the connection pool to point at the new leader's
-				// ForwardAddr. Close the old pool so its idle connections are
-				// not handed to callers targeting the previous leader.
-				if old := node.pool.Swap(node.poolForLeader(string(lo.LeaderID))); old != nil {
-					old.Close()
-				}
+					node.logger().Info("memdb raft: leadership changed",
+						"nodeID", cfg.NodeID,
+						"isLeader", isLeader,
+						"leaderID", string(lo.LeaderID),
+					)
 
-				if cfg.OnLeaderChange != nil {
-					cfg.OnLeaderChange(isLeader)
-				}
+					// Swap the connection pool to point at the new leader's
+					// ForwardAddr. Close the old pool so its idle connections are
+					// not handed to callers targeting the previous leader.
+					if old := node.pool.Swap(node.poolForLeader(string(lo.LeaderID))); old != nil {
+						old.Close()
+					}
+
+					if cfg.OnLeaderChange != nil {
+						// Wrap in another recover so a panicking OnLeaderChange
+						// callback does not suppress the pool-swap that
+						// happened above.
+						func() {
+							defer func() {
+								if r := recover(); r != nil {
+									node.logger().Error("memdb raft: panic in OnLeaderChange",
+										"panic", r,
+										"nodeID", cfg.NodeID,
+									)
+								}
+							}()
+							cfg.OnLeaderChange(isLeader)
+						}()
+					}
+				}()
 			case <-node.observerDone:
 				return
 			}

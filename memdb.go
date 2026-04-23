@@ -433,7 +433,7 @@ func (d *DB) flushUnchecked(ctx context.Context) error {
 	}
 
 	if d.cfg.OnFlushComplete != nil {
-		d.cfg.OnFlushComplete(FlushMetrics{
+		safeCallback(d.logger(), d.cfg.OnFlushError, d.cfg.OnFlushComplete, FlushMetrics{
 			Duration: time.Since(start),
 			Error:    err,
 		})
@@ -588,7 +588,9 @@ func (d *DB) replicaRefreshLoop() {
 			if err := d.replica.refresh(ctx, d); err != nil {
 				d.logger().Error("memdb: replica refresh failed", "error", err)
 				if d.cfg.OnFlushError != nil {
-					d.cfg.OnFlushError(fmt.Errorf("memdb: replica refresh: %w", err))
+					safeDo(d.logger(), nil, func() {
+						d.cfg.OnFlushError(fmt.Errorf("memdb: replica refresh: %w", err))
+					})
 				}
 			}
 			close(done)
@@ -615,13 +617,13 @@ func (d *DB) flushLoop() {
 				// Shouldn't happen — flushLoop only starts when FlushInterval > 0.
 				timeout = time.Second
 			}
-			func() {
+			safeDo(d.logger(), d.cfg.OnFlushError, func() {
 				ctx, cancel := context.WithTimeout(context.Background(), timeout)
 				defer cancel()
 				if err := d.Flush(ctx); err != nil && d.cfg.OnFlushError != nil {
 					d.cfg.OnFlushError(err)
 				}
-			}()
+			})
 		case <-d.stop:
 			return
 		}

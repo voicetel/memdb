@@ -56,6 +56,25 @@ type Config struct {
 	// Path to the SQLite file on disk. Required unless a custom Backend is set.
 	FilePath string
 
+	// DisableForeignKeys opts out of SQLite foreign-key constraint
+	// enforcement. By default memdb runs PRAGMA foreign_keys=ON on every
+	// new connection so that INSERT/UPDATE/DELETE operations that would
+	// violate a declared FK constraint are rejected with an error rather
+	// than silently accepted (SQLite's built-in default is OFF, which
+	// surprises most applications that declare FK constraints).
+	//
+	// Set DisableForeignKeys = true only when you deliberately need
+	// SQLite's default FK-off behaviour — for example to bulk-load data
+	// without constraint checking, or to work with a legacy schema that
+	// relies on unenforced foreign keys.
+	//
+	// Using an inverted name ("Disable…") lets the zero value of the
+	// Config struct mean "enforce foreign keys", which is the safe
+	// default without requiring a pointer or sentinel.
+	//
+	// Default: false (foreign-key enforcement is ON).
+	DisableForeignKeys bool
+
 	// How often the background goroutine flushes memory to disk.
 	// Default: 30s. Set to 0 to disable background flushing.
 	FlushInterval time.Duration
@@ -180,6 +199,9 @@ func (c *Config) validate() error {
 }
 
 func (c *Config) applyDefaults() {
+	// DisableForeignKeys: zero value false = FK enforcement ON, which is
+	// the correct default. No sentinel needed — the inverted name means
+	// the zero value is already the safe behaviour.
 	if c.FlushInterval == 0 {
 		c.FlushInterval = defaultFlushInterval
 	}

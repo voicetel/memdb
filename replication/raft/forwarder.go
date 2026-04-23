@@ -45,6 +45,18 @@ func (f *forwarder) serve() {
 		f.wg.Add(1)
 		go func() {
 			defer f.wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					// A panicking handler must not crash the forwarder or
+					// the Raft node. Log and close the connection so the
+					// follower gets a clean EOF and retries.
+					conn.Close()
+					f.node.logger().Error("forwarder: handler panic recovered",
+						"panic", r,
+						"remote", conn.RemoteAddr(),
+					)
+				}
+			}()
 			f.handleConn(conn)
 		}()
 	}

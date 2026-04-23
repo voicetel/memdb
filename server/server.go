@@ -1,8 +1,10 @@
 package server
 
 import (
+	"crypto/subtle"
 	"crypto/tls"
 	"errors"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -23,6 +25,18 @@ type Config struct {
 
 	// Auth is optional. If nil, no authentication is required.
 	Auth Authenticator
+
+	// Logger is used for structured log output from the server (connection
+	// errors, recovered panics). If nil, slog.Default() is used.
+	Logger *slog.Logger
+}
+
+// logger returns the configured logger or slog.Default().
+func (c Config) logger() *slog.Logger {
+	if c.Logger != nil {
+		return c.Logger
+	}
+	return slog.Default()
 }
 
 // Authenticator validates a username/password pair.
@@ -31,13 +45,29 @@ type Authenticator interface {
 }
 
 // BasicAuth is a simple static credential authenticator.
+//
+// Username and Password are compared in constant time via
+// crypto/subtle.ConstantTimeCompare so that an attacker cannot use
+// response-timing differences to recover the credentials one character at
+// a time. Go's native == on strings short-circuits at the first differing
+// byte, which is measurable over a network.
 type BasicAuth struct {
 	Username string
 	Password string
 }
 
+// Authenticate returns true when both username and password match the
+// configured values. Both comparisons run in constant time relative to
+// the lengths of the inputs, and the boolean results are AND'ed with a
+// bitwise-and (not &&) so the second comparison is always evaluated
+// regardless of the first result. Length mismatch between the inputs and
+// the configured values short-circuits to false but does not leak the
+// configured length — ConstantTimeCompare returns 0 on any length
+// mismatch without revealing which side was longer.
 func (a BasicAuth) Authenticate(username, password string) bool {
-	return username == a.Username && password == a.Password
+	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(a.Username))
+	passOK := subtle.ConstantTimeCompare([]byte(password), []byte(a.Password))
+	return userOK&passOK == 1
 }
 
 // Server is a PostgreSQL wire-protocol server backed by a memdb.DB.
@@ -97,6 +127,19 @@ func (s *Server) ListenAndServe() error {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					// A panicking handler must not crash the server process.
+					// Log the panic and close the connection so the client
+					// gets a clean EOF rather than a half-written response.
+					// Other connections are unaffected.
+					conn.Close()
+					s.cfg.logger().Error("memdb server: handler panic recovered",
+						"panic", r,
+						"remote", conn.RemoteAddr(),
+					)
+				}
+			}()
 			newHandler(s.db, s.cfg, conn).serve()
 		}()
 	}
