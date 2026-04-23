@@ -85,8 +85,28 @@ type Config struct {
 	// Reads may observe data that is at most ReplicaRefreshInterval stale.
 	// Writes (Exec, Begin, BeginTx) always go to the single writer connection.
 	//
+	// Enabling the pool is the single biggest read-throughput lever memdb
+	// exposes: BenchmarkCompare_ConcurrentRead measured 2.71× more
+	// throughput on a 4-replica pool vs the single-connection default,
+	// and the pool is ~22% faster than file-backed SQLite on concurrent
+	// reads (see BENCHMARKS.md). The cost is N × DatabaseSize memory and
+	// up to ReplicaRefreshInterval of read staleness.
+	//
 	// Recommended values: 0 (default) to runtime.GOMAXPROCS(0).
 	// Setting this above GOMAXPROCS yields diminishing returns.
+	//
+	// For a closed-form recommendation based on DB size, memory budget,
+	// staleness tolerance, and workload mix, use the memdb/tuning package:
+	//
+	//	rec := tuning.Recommend(tuning.Workload{
+	//	    DatabaseSize:       50 << 20,
+	//	    MemoryBudget:       512 << 20,
+	//	    StalenessTolerance: 100 * time.Millisecond,
+	//	    Workload:           tuning.WorkloadReadHeavy,
+	//	})
+	//	cfg.ReadPoolSize = rec.ReadPoolSize
+	//	cfg.ReplicaRefreshInterval = rec.ReplicaRefreshInterval
+	//
 	// Default: 0 (disabled — all operations share one connection).
 	ReadPoolSize int
 
