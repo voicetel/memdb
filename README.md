@@ -192,8 +192,21 @@ type Config struct {
 	// fresher reads but copy the entire database into every replica on
 	// every tick — the cost scales with database size × ReadPoolSize.
 	//
-	// Empirical sweep (1 000-row dataset, 8 concurrent readers,
-	// BenchmarkReplicaRefreshInterval on a 20-thread x86_64 box):
+	// Write-generation short-circuit: each refresh tick first checks a
+	// monotonic write counter that bumps on every successful Exec /
+	// ExecContext / execDirect and on every Begin / BeginTx. When the
+	// counter has not advanced since the last successful refresh, the
+	// tick returns immediately without serialising or deserialising
+	// anything — so a read-only workload imposes no per-tick CPU cost
+	// regardless of how short this interval is. Measured in pprof:
+	// read-only throughput went from 519k to 727k ops/s (+40%) once
+	// the short-circuit was in place, and replicaRefreshLoop dropped
+	// below the top-10 CPU sampling threshold for that workload.
+	//
+	// Empirical sweep (1 000-row dataset, 8 concurrent readers with a
+	// continuously active writer, BenchmarkReplicaRefreshInterval on a
+	// 20-thread x86_64 box — the writer-active case that the
+	// short-circuit cannot help):
 	//
 	//   refresh=250µs  ~83 µs/write  34 KB/op   refresh dominates CPU
 	//   refresh=1ms    ~75 µs/write  30 KB/op   8× slower writes than 100ms
@@ -203,7 +216,8 @@ type Config struct {
 	//
 	// Only used when ReadPoolSize > 0. Default: 50ms. Values below 5ms
 	// emit a warning at Open time because pprof traces attribute the
-	// majority of CPU to the refresh loop at those intervals.
+	// majority of CPU to the refresh loop at those intervals when the
+	// writer is active.
 	ReplicaRefreshInterval time.Duration
 
 	// Called when a background flush fails.
@@ -1064,9 +1078,15 @@ gain because both backends serve hot pages from RAM; the difference is the VFS a
 cost alone. For bulk operations and range scans the bottleneck shifts to SQLite's B-tree and
 cursor machinery, which is identical for both backends, so the gap narrows to **~2–7%**.
 
-`memdb + WAL` appends a gob-encoded entry and calls `fsync` after every `Exec`, adding
-~1.6 µs per write. Even so, it remains **1.57× faster** than `file/sync=off` on INSERT —
-you get near-zero data loss durability while still beating an unprotected file database.
+`memdb + WAL` appends a binary-encoded entry and calls `fsync` after every `Exec`. Since
+the v1.4 sprint the WAL hot path uses a hand-rolled binary wire format in place of
+`encoding/gob`, which previously accounted for ~25% of total CPU under `DurabilityWAL`
+in pprof traces. `BenchmarkWAL_Append` now measures **539 ns/op, 128 B/op, 1 alloc/op**
+(down from 2809 ns/op, 1602 B/op, 20 allocs/op). End-to-end WAL-durability insert
+throughput in `TestPProf_Writes_WAL` went from 135k to 190k writes/s (+41%). Even with
+the per-write `fsync` included, `DurabilityWAL` remains faster than `file/sync=off` on
+INSERT — you get near-zero data loss durability while still beating an unprotected
+file database.
 
 The `synchronous` pragma barely matters on fast NVMe storage (`off` vs `full` is only 5%).
 On spinning disk or network-attached storage the gap would be many milliseconds per commit,
@@ -1121,10 +1141,44 @@ most workloads; avoid flushing more frequently than every few seconds on a hot w
 | WAL replay — 1,000 entries | ~1,026 µs | 11,191 |
 | WAL replay — 10,000 entries | ~11,290 µs | 110,199 |
 
-WAL append costs ~1.3 µs including `fsync`, making `DurabilityWAL` practical for most
-workloads. Replay is perfectly linear (10× entries = ~10× time). The 11 allocs/entry cost
-is intrinsic to `gob` decoding `[]any` and is a one-time startup expense — even a 10,000
-entry WAL replays in ~11 ms.
+WAL append costs ~540 ns including `fsync` on a warm buffer (benchmarked on a 20-thread
+x86_64 box; dominated by the `write(2)` + `fsync` syscall pair, not the encoder itself),
+making `DurabilityWAL` practical for most workloads. Replay is perfectly linear (10×
+entries = ~10× time). A 10,000-entry WAL replays in ~9 ms.
+
+## WAL on-disk format
+
+The WAL file is a simple append-only sequence of length-prefixed records:
+
+```
+[4-byte big-endian length][record body]
+```
+
+The record body is one of:
+
+1. **Binary v1** (current, preferred) — begins with the 4-byte magic `"MDBW"`
+   followed by a 1-byte version tag. The rest is a purpose-built binary
+   encoding of `WALEntry` (`uint64 seq`, `int64 timestamp`, length-prefixed SQL
+   string, length-prefixed tagged argument list). Replaces the previous
+   `encoding/gob` encoding — measured at ~25% of total CPU in pprof traces
+   before the change, now below 1%.
+
+2. **Legacy gob** — the format used by memdb versions prior to v1.4. A record
+   that does not begin with the binary magic is decoded as gob so existing
+   on-disk WAL files continue to replay correctly after an in-place upgrade.
+   Mixed-format files (legacy records followed by binary records appended
+   after the upgrade) are supported.
+
+Supported argument types in the binary format: `nil`, all signed integers
+(widened to `int64` on decode), all unsigned integers (widened to `uint64`),
+`float32`/`float64` (widened to `float64`), `bool`, `string`, `[]byte`, and
+`time.Time` (stored as `UnixNano` and decoded in UTC). Arguments of any
+other Go type are rejected with `memdb.ErrWALUnsupportedArgType` so callers
+see the failure at `Exec` time rather than losing the entry silently.
+
+Records with a corrupt header, truncated body, or unknown binary version
+tag cause `Replay` to stop at that record and return every prior valid
+entry — matching the behaviour expected after an unclean shutdown.
 
 ### Lifecycle
 
