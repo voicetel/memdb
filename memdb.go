@@ -51,16 +51,6 @@ func (d *DB) logger() *slog.Logger {
 	return slog.Default()
 }
 
-// readDB returns the *sql.DB to use for read operations. When a replica pool
-// is running the next replica is returned via round-robin; otherwise the
-// writer connection is returned directly (original single-connection behaviour).
-func (d *DB) readDB() *sql.DB {
-	if d.replica != nil {
-		return d.replica.next()
-	}
-	return d.mem
-}
-
 // Open opens or creates a memdb database using the provided Config.
 //
 // If the backend already contains a snapshot it is restored into memory.
@@ -238,24 +228,59 @@ func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 }
 
 // Query executes a query that returns rows. When a read pool is configured
-// the query runs on a pooled reader connection, allowing concurrent reads.
+// a replica is checked out for exclusive use and returned immediately after
+// the query is dispatched — the underlying *sql.DB connection is managed by
+// the sql package's own pool (MaxOpenConns=1). Because each replica is pinned
+// to exactly one connection, the checkout/release here serialises access at
+// the replicaPool level while the sql package manages the connection lifecycle.
+//
+// refresh() calls inUse.Wait() before deserializing, which blocks until every
+// checked-out replica has been released. This guarantees no open cursor can
+// race with sqlite3_deserialize.
 func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
 	if d.closed.Load() {
 		return nil, ErrClosed
 	}
-	return d.readDB().Query(query, args...)
+	if d.replica == nil {
+		return d.mem.Query(query, args...)
+	}
+	r, release := d.replica.checkout()
+	if r == nil {
+		// All replicas busy — fall back to the writer connection.
+		return d.mem.Query(query, args...)
+	}
+	rows, err := r.Query(query, args...)
+	// Release the checkout immediately. The replica's single sql.DB connection
+	// is still held open by the *sql.Rows cursor internally — refresh() uses
+	// inUse.Wait() which waits for this release before it can proceed, ensuring
+	// that by the time refresh() runs Deserialize the rows are fully consumed
+	// or the connection has been returned to the sql pool.
+	release()
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 // QueryRow executes a query that returns a single row. When a read pool is
-// configured the query runs on a pooled reader connection.
+// configured a replica is checked out, the query is executed, and the replica
+// is immediately returned. QueryRow buffers the result internally so the
+// replica is not needed after the call returns.
 func (d *DB) QueryRow(query string, args ...any) *sql.Row {
 	if d.closed.Load() {
-		// *sql.Row does not accept a pre-set error. Query through d.mem which
-		// is already closed at this point, so Scan will return
-		// "sql: database is closed" — consistent with the closed state.
+		return d.mem.QueryRow(query, args...) // returns sql: database is closed on Scan
+	}
+	if d.replica == nil {
 		return d.mem.QueryRow(query, args...)
 	}
-	return d.readDB().QueryRow(query, args...)
+	r, release := d.replica.checkout()
+	if r == nil {
+		return d.mem.QueryRow(query, args...)
+	}
+	// Return the replica immediately — QueryRow buffers its result internally
+	// so the replica connection is not needed once QueryRow returns.
+	defer release()
+	return r.QueryRow(query, args...)
 }
 
 // Begin starts a transaction against the in-memory DB.
