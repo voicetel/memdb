@@ -7,19 +7,29 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 var registeredDrivers sync.Map // key: string fingerprint → registered driver name
 
+var hookCounter atomic.Uint64
+
 // registerDriver registers a named sqlite3 driver with pragmas applied via
 // ConnectHook. Each unique combination of CacheSize, BusyTimeout, and OnChange
-// presence gets its own registered driver name, avoiding sql.Register panics
-// on duplicate names across multiple Open calls.
+// gets its own registered driver name, avoiding sql.Register panics on
+// duplicate names across multiple Open calls.
+//
+// Configs without OnChange share a driver when pragmas match. Configs with
+// OnChange always get a fresh driver registration (the atomic hookid makes the
+// key unique) so two callers with different hooks never share a registration.
 func registerDriver(cfg Config) string {
-	hasHook := cfg.OnChange != nil
-	key := fmt.Sprintf("cache=%d,busy=%d,hook=%v", cfg.CacheSize, cfg.BusyTimeout, hasHook)
+	var hookID string
+	if cfg.OnChange != nil {
+		hookID = fmt.Sprintf(",hookid=%d", hookCounter.Add(1))
+	}
+	key := fmt.Sprintf("cache=%d,busy=%d%s", cfg.CacheSize, cfg.BusyTimeout, hookID)
 
 	if name, ok := registeredDrivers.Load(key); ok {
 		return name.(string)
@@ -73,16 +83,6 @@ func opName(op int) string {
 	default:
 		return "UNKNOWN"
 	}
-}
-
-// fnv32 is a simple FNV-1a string hash used for driver name generation.
-func fnv32(s string) uint32 {
-	var h uint32 = 2166136261
-	for i := 0; i < len(s); i++ {
-		h ^= uint32(s[i])
-		h *= 16777619
-	}
-	return h
 }
 
 // withRawConn acquires a connection from the pool and exposes the underlying

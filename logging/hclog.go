@@ -59,7 +59,9 @@ func (a *hclogAdapter) Error(msg string, args ...any) {
 	a.log.Error(msg, a.withArgs(args)...)
 }
 
-func (a *hclogAdapter) IsTrace() bool { return a.log.Enabled(context.Background(), slog.LevelDebug) }
+// IsTrace always returns false — slog has no Trace level. Trace messages
+// are silently dropped (they are extremely verbose internal debug output).
+func (a *hclogAdapter) IsTrace() bool { return false }
 func (a *hclogAdapter) IsDebug() bool { return a.log.Enabled(context.Background(), slog.LevelDebug) }
 func (a *hclogAdapter) IsInfo() bool  { return a.log.Enabled(context.Background(), slog.LevelInfo) }
 func (a *hclogAdapter) IsWarn() bool  { return a.log.Enabled(context.Background(), slog.LevelWarn) }
@@ -81,7 +83,9 @@ func (a *hclogAdapter) Named(name string) hclog.Logger {
 	if a.name != "" {
 		n = a.name + "." + name
 	}
-	return &hclogAdapter{log: a.log.With("component", n), name: n, args: a.args}
+	// Do not add another "component" key — it was already set at construction.
+	// Simply update the name for ImpliedArgs/Name() purposes.
+	return &hclogAdapter{log: a.log, name: n, args: a.args}
 }
 
 func (a *hclogAdapter) ResetNamed(name string) hclog.Logger {
@@ -112,15 +116,10 @@ func (a *hclogAdapter) StandardWriter(opts *hclog.StandardLoggerOptions) io.Writ
 	return &logWriter{log: a.log}
 }
 
-// withArgs merges the adapter's stored implied args with call-site args.
+// withArgs returns the call-site args. The adapter's implied args are already
+// baked into a.log via slog.Logger.With(), so they do not need to be prepended.
 func (a *hclogAdapter) withArgs(args []any) []any {
-	if len(a.args) == 0 {
-		return args
-	}
-	merged := make([]any, 0, len(a.args)+len(args))
-	merged = append(merged, a.args...)
-	merged = append(merged, args...)
-	return merged
+	return args
 }
 
 // hclogToSlog converts an hclog.Level to the nearest slog.Level.

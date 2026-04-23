@@ -5,7 +5,10 @@ package raft
 import (
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
+	"sync"
+	"sync/atomic"
 )
 
 // forwarder listens for incoming ForwardRequests from follower nodes and
@@ -13,6 +16,8 @@ import (
 type forwarder struct {
 	ln   net.Listener
 	node *Node
+	wg   sync.WaitGroup
+	done atomic.Bool
 }
 
 // newForwarder creates a TLS listener on addr and starts accepting connections.
@@ -30,10 +35,19 @@ func (f *forwarder) serve() {
 	for {
 		conn, err := f.ln.Accept()
 		if err != nil {
-			// Listener closed — stop accepting.
+			// Distinguish an intentional close from a transient/unexpected error.
+			// After close() sets done and closes the listener, Accept returns an
+			// error — that is expected and should not be logged.
+			if !f.done.Load() {
+				slog.Default().Warn("forwarder: accept error", "error", err)
+			}
 			return
 		}
-		go f.handleConn(conn)
+		f.wg.Add(1)
+		go func() {
+			defer f.wg.Done()
+			f.handleConn(conn)
+		}()
 	}
 }
 
@@ -61,5 +75,13 @@ func (f *forwarder) handleConn(conn net.Conn) {
 }
 
 func (f *forwarder) close() error {
-	return f.ln.Close()
+	// Signal serve() that this close is intentional before closing the
+	// listener so that the Accept error is not logged as unexpected.
+	f.done.Store(true)
+	err := f.ln.Close()
+	// Wait for all in-flight handleConn goroutines to complete so that
+	// callers (e.g. Node.Shutdown) can be sure no goroutines are still
+	// running after close returns.
+	f.wg.Wait()
+	return err
 }

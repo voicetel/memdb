@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"log/syslog"
+	"strings"
 )
 
 // NewSyslogHandler returns a *slog.Logger that writes to the local syslog
@@ -45,18 +46,32 @@ func (h *syslogHandler) Enabled(_ context.Context, level slog.Level) bool {
 }
 
 func (h *syslogHandler) Handle(_ context.Context, r slog.Record) error {
-	// Build the message string: "msg key=val key=val ..."
-	msg := r.Message
+	var sb strings.Builder
+	sb.WriteString(r.Message)
+
+	prefix := ""
+	if h.group != "" {
+		prefix = h.group + "."
+	}
+
+	// Pre-attached attrs (from WithAttrs) come first.
+	for _, a := range h.attrs {
+		sb.WriteString(" ")
+		sb.WriteString(prefix + a.Key)
+		sb.WriteString("=")
+		fmt.Fprintf(&sb, "%v", a.Value.Any())
+	}
+
+	// Call-site attrs come after.
 	r.Attrs(func(a slog.Attr) bool {
-		msg += " " + a.Key + "=" + fmt.Sprintf("%v", a.Value.Any())
+		sb.WriteString(" ")
+		sb.WriteString(prefix + a.Key)
+		sb.WriteString("=")
+		fmt.Fprintf(&sb, "%v", a.Value.Any())
 		return true
 	})
-	for _, a := range h.attrs {
-		msg += " " + a.Key + "=" + fmt.Sprintf("%v", a.Value.Any())
-	}
-	if h.group != "" {
-		msg = h.group + ": " + msg
-	}
+
+	msg := sb.String()
 
 	switch {
 	case r.Level >= slog.LevelError:

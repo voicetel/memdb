@@ -94,16 +94,11 @@ func Open(cfg Config) (*DB, error) {
 		stop: make(chan struct{}),
 	}
 
-	// Check whether a snapshot exists so we can log after a successful restore.
-	// restore() performs the same check internally; errors are surfaced there.
-	snapshotExists, _ := cfg.Backend.Exists(context.Background())
-
+	// restore() checks Exists internally and is a no-op when no snapshot
+	// exists. Errors are surfaced by restore() itself.
 	if err := db.restore(); err != nil {
 		mem.Close()
 		return nil, err
-	}
-	if snapshotExists {
-		db.logger().Info("memdb: restored from snapshot", "backend", fmt.Sprintf("%T", cfg.Backend))
 	}
 
 	if cfg.Durability == DurabilityWAL && cfg.FilePath != "" {
@@ -178,8 +173,11 @@ func (d *DB) execDirect(query string, args ...any) error {
 			SQL:       query,
 			Args:      args,
 		}
-		if walErr := d.wal.Append(entry); walErr != nil && d.cfg.OnFlushError != nil {
-			d.cfg.OnFlushError(fmt.Errorf("%w: wal: %v", ErrFlushFailed, walErr))
+		if walErr := d.wal.Append(entry); walErr != nil {
+			if d.cfg.OnFlushError != nil {
+				d.cfg.OnFlushError(fmt.Errorf("%w: wal: %v", ErrFlushFailed, walErr))
+			}
+			return fmt.Errorf("%w: wal append: %v", ErrFlushFailed, walErr)
 		}
 	}
 	return nil
@@ -229,8 +227,11 @@ func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 			SQL:       query,
 			Args:      args,
 		}
-		if walErr := d.wal.Append(entry); walErr != nil && d.cfg.OnFlushError != nil {
-			d.cfg.OnFlushError(fmt.Errorf("%w: wal: %v", ErrFlushFailed, walErr))
+		if walErr := d.wal.Append(entry); walErr != nil {
+			if d.cfg.OnFlushError != nil {
+				d.cfg.OnFlushError(fmt.Errorf("%w: wal: %v", ErrFlushFailed, walErr))
+			}
+			return nil, fmt.Errorf("%w: wal append: %v", ErrFlushFailed, walErr)
 		}
 	}
 	return result, nil
@@ -248,6 +249,12 @@ func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
 // QueryRow executes a query that returns a single row. When a read pool is
 // configured the query runs on a pooled reader connection.
 func (d *DB) QueryRow(query string, args ...any) *sql.Row {
+	if d.closed.Load() {
+		// *sql.Row does not accept a pre-set error. Query through d.mem which
+		// is already closed at this point, so Scan will return
+		// "sql: database is closed" — consistent with the closed state.
+		return d.mem.QueryRow(query, args...)
+	}
 	return d.readDB().QueryRow(query, args...)
 }
 
@@ -275,15 +282,13 @@ func (d *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) 
 	return d.mem.BeginTx(ctx, opts)
 }
 
-// Flush copies the current in-memory state to the backend.
-// Safe to call concurrently — serialised internally.
-func (d *DB) Flush(ctx context.Context) error {
+// flushUnchecked performs a flush without checking d.closed. It is called
+// from Close() after d.closed has already been set to true, so the normal
+// Flush guard must be bypassed. All background goroutines have exited by the
+// time this is called, so no concurrent writes can occur.
+func (d *DB) flushUnchecked(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
-	if d.closed.Load() {
-		return ErrClosed
-	}
 
 	start := time.Now()
 	err := d.cfg.Backend.flush(ctx, d)
@@ -316,6 +321,15 @@ func (d *DB) Flush(ctx context.Context) error {
 	return err
 }
 
+// Flush copies the current in-memory state to the backend.
+// Safe to call concurrently — serialised internally.
+func (d *DB) Flush(ctx context.Context) error {
+	if d.closed.Load() {
+		return ErrClosed
+	}
+	return d.flushUnchecked(ctx)
+}
+
 // Close flushes to the backend, stops the background goroutine, and closes
 // the in-memory DB. Subsequent calls are no-ops.
 func (d *DB) Close() error {
@@ -323,12 +337,12 @@ func (d *DB) Close() error {
 	d.stopOnce.Do(func() {
 		close(d.stop)
 		d.wg.Wait()
+		d.closed.Store(true) // mark closed before teardown; all goroutines have exited
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		closeErr = d.Flush(ctx)
+		closeErr = d.flushUnchecked(ctx)
 
-		d.closed.Store(true) // mark closed before tearing down resources
 		if d.replica != nil {
 			d.replica.close()
 		}
@@ -383,9 +397,12 @@ func (d *DB) flushLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			// Use half the flush interval as the per-flush timeout, floored at
+			// 1s so the timeout is always shorter than the interval for any
+			// interval >= 2s and avoids a 0 timeout for very short intervals.
 			timeout := d.cfg.FlushInterval / 2
-			if timeout < 5*time.Second {
-				timeout = 5 * time.Second
+			if timeout < time.Second {
+				timeout = time.Second
 			}
 			func() {
 				ctx, cancel := context.WithTimeout(context.Background(), timeout)

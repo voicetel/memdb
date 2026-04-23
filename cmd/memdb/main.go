@@ -93,6 +93,7 @@ func runServe(file, addr string, flush time.Duration) {
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(quit)
 	go func() {
 		<-quit
 		srv.Stop()
@@ -100,7 +101,7 @@ func runServe(file, addr string, flush time.Duration) {
 
 	slog.Info("memdb listening", "addr", addr, "file", file, "flush", flush)
 	if err := srv.ListenAndServe(); err != nil {
-		slog.Info("server stopped", "error", err)
+		slog.Error("server stopped unexpectedly", "error", err)
 	}
 }
 

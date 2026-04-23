@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	modernc "modernc.org/sqlite"
@@ -25,18 +26,15 @@ func registerDriver(cfg Config) string {
 		return actual.(string)
 	}
 
+	// Note: the modernc/purego driver does not support connect hooks.
+	// CacheSize, BusyTimeout, and OnChange are not applied in purego builds.
+	if cfg.OnChange != nil {
+		// Cannot register an update hook with modernc — log warning via slog.
+		slog.Default().Warn("memdb: OnChange is not supported in purego builds and will be ignored")
+	}
+
 	sql.Register(name, &modernc.Driver{})
 	return name
-}
-
-// fnv32 is a simple FNV-1a string hash used for driver name generation.
-func fnv32(s string) uint32 {
-	var h uint32 = 2166136261
-	for i := 0; i < len(s); i++ {
-		h ^= uint32(s[i])
-		h *= 16777619
-	}
-	return h
 }
 
 // withRawConn for the modernc driver.

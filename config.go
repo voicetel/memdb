@@ -38,11 +38,8 @@ type ChangeEvent struct {
 
 // FlushMetrics is passed to OnFlushComplete after each flush.
 type FlushMetrics struct {
-	Duration           time.Duration
-	PageCount          int
-	BytesWritten       int64
-	WALEntriesReplayed int
-	Error              error
+	Duration time.Duration
+	Error    error
 }
 
 // FlushErrorHandler is called when an async background flush fails.

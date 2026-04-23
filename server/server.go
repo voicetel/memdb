@@ -2,7 +2,6 @@ package server
 
 import (
 	"crypto/tls"
-	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -43,8 +42,10 @@ func (a BasicAuth) Authenticate(username, password string) bool {
 type Server struct {
 	db       *memdb.DB
 	cfg      Config
+	mu       sync.Mutex // protects listener
 	listener net.Listener
 	wg       sync.WaitGroup
+	stopOnce sync.Once
 	quit     chan struct{}
 }
 
@@ -63,7 +64,9 @@ func (s *Server) ListenAndServe() error {
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
 	s.listener = l
+	s.mu.Unlock()
 
 	for {
 		conn, err := l.Accept()
@@ -73,7 +76,9 @@ func (s *Server) ListenAndServe() error {
 		default:
 		}
 		if err != nil {
-			return fmt.Errorf("server: accept: %w", err)
+			// Transient errors (EMFILE, ENFILE) should not kill the server.
+			// Only return if the listener itself was closed (indicated by quit).
+			continue
 		}
 		s.wg.Add(1)
 		go func() {
@@ -85,10 +90,14 @@ func (s *Server) ListenAndServe() error {
 
 // Stop gracefully shuts down the server.
 func (s *Server) Stop() {
-	close(s.quit)
-	if s.listener != nil {
-		s.listener.Close()
-	}
+	s.stopOnce.Do(func() {
+		close(s.quit)
+		s.mu.Lock()
+		if s.listener != nil {
+			s.listener.Close()
+		}
+		s.mu.Unlock()
+	})
 	s.wg.Wait()
 }
 
