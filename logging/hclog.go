@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"strings"
 
 	hclog "github.com/hashicorp/go-hclog"
 )
@@ -71,10 +72,13 @@ func (a *hclogAdapter) ImpliedArgs() []any { return a.args }
 func (a *hclogAdapter) Name() string       { return a.name }
 
 func (a *hclogAdapter) With(args ...any) hclog.Logger {
+	newArgs := make([]any, 0, len(a.args)+len(args))
+	newArgs = append(newArgs, a.args...)
+	newArgs = append(newArgs, args...)
 	return &hclogAdapter{
 		log:  a.log.With(args...),
 		name: a.name,
-		args: append(a.args, args...),
+		args: newArgs,
 	}
 }
 
@@ -140,6 +144,10 @@ func hclogToSlog(level hclog.Level) slog.Level {
 type logWriter struct{ log *slog.Logger }
 
 func (w *logWriter) Write(p []byte) (int, error) {
-	w.log.Info(string(p))
+	// Trim trailing newline and spaces so structured output is clean.
+	msg := strings.TrimRight(string(p), " \t\r\n")
+	if msg != "" {
+		w.log.Info(msg)
+	}
 	return len(p), nil
 }

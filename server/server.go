@@ -2,9 +2,11 @@ package server
 
 import (
 	"crypto/tls"
+	"errors"
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/voicetel/memdb"
 )
@@ -70,15 +72,27 @@ func (s *Server) ListenAndServe() error {
 
 	for {
 		conn, err := l.Accept()
+		if err != nil {
+			// Listener deliberately closed via Stop.
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			select {
+			case <-s.quit:
+				return nil
+			default:
+			}
+			// Transient errors (EMFILE, ENFILE, etc.) should not kill the
+			// server — but returning immediately can produce a tight busy
+			// loop. Back off briefly before retrying.
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		select {
 		case <-s.quit:
+			conn.Close()
 			return nil
 		default:
-		}
-		if err != nil {
-			// Transient errors (EMFILE, ENFILE) should not kill the server.
-			// Only return if the listener itself was closed (indicated by quit).
-			continue
 		}
 		s.wg.Add(1)
 		go func() {

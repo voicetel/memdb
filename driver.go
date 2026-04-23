@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 
@@ -16,6 +17,8 @@ var registeredDrivers sync.Map // key: string fingerprint → registered driver 
 
 var hookCounter atomic.Uint64
 
+var registeredDriverCount atomic.Uint64
+
 // registerDriver registers a named sqlite3 driver with pragmas applied via
 // ConnectHook. Each unique combination of CacheSize, BusyTimeout, and OnChange
 // gets its own registered driver name, avoiding sql.Register panics on
@@ -24,6 +27,18 @@ var hookCounter atomic.Uint64
 // Configs without OnChange share a driver when pragmas match. Configs with
 // OnChange always get a fresh driver registration (the atomic hookid makes the
 // key unique) so two callers with different hooks never share a registration.
+//
+// Limitation: when cfg.OnChange is set, each call registers a new driver
+// (the hookid counter ensures uniqueness so that concurrent Opens with
+// different OnChange functions don't share a hook). These registrations
+// are never reclaimed because database/sql provides no API to unregister a
+// driver. Applications that open and close many DBs with OnChange will
+// accumulate unbounded driver registrations in database/sql's global
+// registry. For such workloads, either use the same OnChange function
+// across all Opens (which would still allocate a new driver per call here
+// because the function pointer is not used in the key — see hookID above —
+// so the practical mitigation is to construct and reuse a single *DB), or
+// avoid OnChange entirely.
 func registerDriver(cfg Config) string {
 	var hookID string
 	if cfg.OnChange != nil {
@@ -39,6 +54,15 @@ func registerDriver(cfg Config) string {
 	actual, loaded := registeredDrivers.LoadOrStore(key, name)
 	if loaded {
 		return actual.(string)
+	}
+
+	count := registeredDriverCount.Add(1)
+	if count > 100 && count%100 == 1 {
+		slog.Default().Warn("memdb: high sqlite3 driver registration count — "+
+			"OnChange-bearing configs are not deduplicated across Open calls and the "+
+			"database/sql global driver registry grows unboundedly",
+			"count", count,
+		)
 	}
 
 	onChangeFn := cfg.OnChange

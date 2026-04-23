@@ -3,6 +3,7 @@
 package memdb
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 )
@@ -19,7 +20,7 @@ func newReplicaPool(_ *DB, _ int, _ string) (*replicaPool, error) {
 	return nil, fmt.Errorf("memdb: ReadPoolSize > 0 is not supported in purego builds")
 }
 
-func (p *replicaPool) refresh(_ *DB) error {
+func (p *replicaPool) refresh(_ context.Context, _ *DB) error {
 	return fmt.Errorf("memdb: replicaPool.refresh not supported in purego builds")
 }
 

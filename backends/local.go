@@ -46,6 +46,11 @@ func (b *LocalBackend) Write(ctx context.Context, r io.Reader) error {
 		os.Remove(tmpName)
 		return fmt.Errorf("local backend: rename: %w", err)
 	}
+	// fsync the parent directory so the rename is durable.
+	if dir, err := os.Open(filepath.Dir(b.Path)); err == nil {
+		_ = dir.Sync()
+		dir.Close()
+	}
 	return nil
 }
 
