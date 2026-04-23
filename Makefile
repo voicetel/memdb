@@ -289,6 +289,26 @@ test-replica: dirs ## Run read replica pool tests
 	$(GO) test -race -v -timeout $(TEST_TIMEOUT) -run "TestReplica" ./...
 	@echo -e "$(GREEN)✓ Replica pool tests passed$(NC)"
 
+.PHONY: test-replication-integrity
+test-replication-integrity: dirs ## Run end-to-end replication integrity tests (3-node cluster, convergence, failover)
+	@echo -e "$(CYAN)Running replication integrity tests...$(NC)"
+	$(GO) test -race -v -timeout $(TEST_TIMEOUT_LONG) -run "TestReplication_" ./replication/raft/...
+	@echo -e "$(GREEN)✓ Replication integrity tests passed$(NC)"
+
+.PHONY: test-replication-soak
+test-replication-soak: dirs ## Run the high-volume replication soak test with race detector
+	@echo -e "$(CYAN)Running replication soak test (HighVolume_NoCorruption, 10k-entry Snapshot)...$(NC)"
+	$(GO) test -race -v -timeout $(TEST_TIMEOUT_LONG) \
+		-run "TestReplication_HighVolume_NoCorruption|TestReplication_Snapshot_RestoresCleanly" \
+		./replication/raft/...
+	@echo -e "$(GREEN)✓ Replication soak test passed$(NC)"
+
+.PHONY: test-profiling
+test-profiling: dirs ## Run the profiling package tests (HTTP pprof server + capture helpers)
+	@echo -e "$(CYAN)Running profiling tests...$(NC)"
+	$(GO) test -race -v -timeout $(TEST_TIMEOUT) ./profiling/...
+	@echo -e "$(GREEN)✓ Profiling tests passed$(NC)"
+
 # ============================================================================
 # COMPREHENSIVE SUITES
 # ============================================================================
@@ -325,6 +345,69 @@ bench: dirs ## Run all benchmarks (5s per bench, memory stats)
 	$(GO) test -bench=. -benchmem -benchtime=5s -run=^$$ ./... | tee $(BENCH_FILE)
 	@echo -e "$(GREEN)✓ Benchmark results saved to: $(BENCH_FILE)$(NC)"
 
+# ============================================================================
+# PROFILING
+# ============================================================================
+#
+# The pprof-capturing tests live in memdb_pprof_test.go and are gated behind
+# the MEMDB_PPROF environment variable so the default `go test ./...` run does
+# not write profile artefacts. Output files are written to MEMDB_PPROF_DIR if
+# set, otherwise to a per-test t.TempDir. After a run, analyse the resulting
+# profiles with `go tool pprof -http=: <file>`.
+
+.PHONY: pprof
+pprof: dirs ## Run all pprof-capturing tests (writes CPU/heap/mutex/block profiles to PPROF_DIR)
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	@echo -e "$(BLUE)Capturing pprof profiles into $(COVERAGE_DIR)/pprof...$(NC)"
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 300s -run "TestPProf_" .
+	@echo -e "$(GREEN)✓ Profiles written to $(COVERAGE_DIR)/pprof/$(NC)"
+	@ls -1 $(COVERAGE_DIR)/pprof/ 2>/dev/null || true
+
+.PHONY: pprof-writes
+pprof-writes: dirs ## Capture CPU/heap profiles of a pure-write workload
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 60s -run "TestPProf_Writes$$" .
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_writes.*$(NC)"
+
+.PHONY: pprof-reads
+pprof-reads: dirs ## Capture CPU/mutex/block profiles of a concurrent read workload (replica pool)
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 60s -run "TestPProf_Reads_Replicas$$" .
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_reads.*$(NC)"
+
+.PHONY: pprof-mixed
+pprof-mixed: dirs ## Capture CPU/heap profiles of a mixed read/write workload
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 60s -run "TestPProf_MixedReadWrite$$" .
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_mixed.*$(NC)"
+
+.PHONY: pprof-flush
+pprof-flush: dirs ## Capture CPU/heap profiles of the flush path at 50k rows
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 120s -run "TestPProf_Flush$$" .
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_flush.*$(NC)"
+
+.PHONY: pprof-wal
+pprof-wal: dirs ## Capture CPU/heap profiles of DurabilityWAL writes
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 60s -run "TestPProf_Writes_WAL$$" .
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_writes_wal.*$(NC)"
+
+.PHONY: pprof-view
+pprof-view: ## Open the last captured CPU profile in the pprof web UI (PROF=<path>)
+	@if [ -z "$(PROF)" ]; then \
+		echo -e "$(YELLOW)PROF not set — defaulting to $(COVERAGE_DIR)/pprof/pprof_writes.cpu.prof$(NC)"; \
+		$(GO) tool pprof -http=: $(COVERAGE_DIR)/pprof/pprof_writes.cpu.prof; \
+	else \
+		$(GO) tool pprof -http=: $(PROF); \
+	fi
+
 .PHONY: bench-core
 bench-core: dirs ## Run core memdb benchmarks only (Exec, Query, Flush, WAL, lifecycle)
 	@echo -e "$(BLUE)Running core benchmarks...$(NC)"
@@ -358,7 +441,7 @@ bench-flush: dirs ## Run flush benchmarks at varying table sizes
 	@echo -e "$(GREEN)✓ Flush benchmark results: $(BENCH_FILE)$(NC)"
 
 .PHONY: bench-stat
-bench-stat: bench ## Run benchmarks then summarise with benchstat (requires: go install golang.org/x/perf/cmd/benchstat@latest)
+bench-stat: bench  ## Run benchmarks then summarise with benchstat (requires: go install golang.org/x/perf/cmd/benchstat@latest)
 	@echo -e "$(BLUE)Analysing benchmark results...$(NC)"
 	@if command -v benchstat >/dev/null 2>&1; then \
 		benchstat $(BENCH_FILE); \
@@ -366,6 +449,18 @@ bench-stat: bench ## Run benchmarks then summarise with benchstat (requires: go 
 		echo -e "$(YELLOW)benchstat not found. Run: go install golang.org/x/perf/cmd/benchstat@latest$(NC)"; \
 		cat $(BENCH_FILE); \
 	fi
+
+.PHONY: bench-pprof
+bench-pprof: dirs ## Run all benchmarks with CPU+mem profile capture (writes to $(COVERAGE_DIR)/pprof)
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	@echo -e "$(BLUE)Running benchmarks with pprof capture...$(NC)"
+	$(GO) test -bench=. -benchmem -benchtime=3s -run=^$$ \
+		-cpuprofile=$(COVERAGE_DIR)/pprof/bench.cpu.prof \
+		-memprofile=$(COVERAGE_DIR)/pprof/bench.mem.prof \
+		-mutexprofile=$(COVERAGE_DIR)/pprof/bench.mutex.prof \
+		-blockprofile=$(COVERAGE_DIR)/pprof/bench.block.prof \
+		. | tee $(BENCH_FILE)
+	@echo -e "$(GREEN)✓ Benchmark + pprof results in $(COVERAGE_DIR)/pprof/$(NC)"
 
 # ============================================================================
 # CODE QUALITY
@@ -555,6 +650,21 @@ help: ## Show this help message
 	@echo "  bench-wal          WAL append and replay"
 	@echo "  bench-flush        Flush at 100 / 1 000 / 10 000 rows"
 	@echo "  bench-stat         Run benchmarks then analyse with benchstat"
+	@echo "  bench-pprof        Benchmarks with CPU/mem/mutex/block profile capture"
+	@echo ""
+	@echo -e "$(MAGENTA)Profiling (pprof):$(NC)"
+	@echo "  pprof              Run all pprof-capturing tests"
+	@echo "  pprof-writes       Pure-write workload profile"
+	@echo "  pprof-reads        Concurrent read workload profile (replica pool)"
+	@echo "  pprof-mixed        Mixed read/write workload profile"
+	@echo "  pprof-flush        Flush path profile at 50k rows"
+	@echo "  pprof-wal          DurabilityWAL writes profile"
+	@echo "  pprof-view         Open a profile in the pprof web UI (PROF=<path>)"
+	@echo ""
+	@echo -e "$(CYAN)Replication & Profiling Tests:$(NC)"
+	@echo "  test-replication-integrity  3-node end-to-end Raft integrity tests"
+	@echo "  test-replication-soak       High-volume soak + snapshot integrity"
+	@echo "  test-profiling              profiling package unit tests"
 	@echo ""
 	@echo -e "$(YELLOW)Code Quality:$(NC)"
 	@echo "  fmt                Format all source files"
