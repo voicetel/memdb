@@ -169,6 +169,19 @@ func (s *fileLogStore) StoreLog(log *hraft.Log) error {
 }
 
 func (s *fileLogStore) StoreLogs(logs []*hraft.Log) error {
+	if err := s.appendLocked(logs); err != nil {
+		return err
+	}
+	// fsync outside the lock. If fsync fails, later GetLog calls may read
+	// data that hasn't been durably persisted — but they will still get the
+	// correct bytes because WriteAt already wrote them to the page cache.
+	return s.f.Sync()
+}
+
+// appendLocked appends logs to the file and updates the in-memory index
+// under the write lock. It does NOT fsync — the caller must do that after
+// releasing the lock so that a slow fsync doesn't block concurrent reads.
+func (s *fileLogStore) appendLocked(logs []*hraft.Log) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -206,8 +219,7 @@ func (s *fileLogStore) StoreLogs(logs []*hraft.Log) error {
 		}
 		s.hasData = true
 	}
-	// fsync once after all records are written.
-	return s.f.Sync()
+	return nil
 }
 
 // DeleteRange removes log entries with indices in [min, max].
@@ -309,6 +321,12 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 		return fmt.Errorf("log store: rename: %w", err)
 	}
 
+	// fsync the parent directory so the rename is durable across a crash.
+	if dir, err := os.Open(filepath.Dir(s.path)); err == nil {
+		_ = dir.Sync()
+		dir.Close()
+	}
+
 	f, err := os.OpenFile(s.path, os.O_RDWR, 0o600)
 	if err != nil {
 		return err
@@ -353,8 +371,14 @@ func newStableStore(path string) (hraft.StableStore, error) {
 	}
 	if len(data) > 0 {
 		if err := json.Unmarshal(data, &s.kv); err != nil {
-			// Corrupt file — start fresh. Raft will re-issue an election.
-			s.kv = make(map[string][]byte)
+			// A corrupt stable store would silently reset CurrentTerm /
+			// LastVoteTerm / LastVoteCand, allowing this node to vote again
+			// in a term it already voted in — violating Raft's election
+			// safety invariant. Refuse to start; the operator must either
+			// repair the file or rebuild this node from a snapshot.
+			return nil, fmt.Errorf("stable store: corrupt state at %s: %w — "+
+				"refusing to start to preserve Raft safety invariants; "+
+				"the file must be repaired or the node rebuilt from a snapshot", path, err)
 		}
 	}
 	return s, nil
@@ -396,6 +420,11 @@ func (s *fileStableStore) save() error {
 	if err := os.Rename(tmpName, s.path); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("stable store: rename: %w", err)
+	}
+	// fsync the parent directory so the rename is durable across a crash.
+	if dir, err := os.Open(filepath.Dir(s.path)); err == nil {
+		_ = dir.Sync()
+		dir.Close()
 	}
 	return nil
 }

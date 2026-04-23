@@ -165,9 +165,9 @@ func (d *DB) execDirect(query string, args ...any) error {
 		}
 		if walErr := d.wal.Append(entry); walErr != nil {
 			if d.cfg.OnFlushError != nil {
-				d.cfg.OnFlushError(fmt.Errorf("%w: wal: %v", ErrFlushFailed, walErr))
+				d.cfg.OnFlushError(fmt.Errorf("%w: wal: %w", ErrFlushFailed, walErr))
 			}
-			return fmt.Errorf("%w: wal append: %v", ErrFlushFailed, walErr)
+			return fmt.Errorf("%w: wal append: %w", ErrFlushFailed, walErr)
 		}
 	}
 	return nil
@@ -219,9 +219,9 @@ func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 		}
 		if walErr := d.wal.Append(entry); walErr != nil {
 			if d.cfg.OnFlushError != nil {
-				d.cfg.OnFlushError(fmt.Errorf("%w: wal: %v", ErrFlushFailed, walErr))
+				d.cfg.OnFlushError(fmt.Errorf("%w: wal: %w", ErrFlushFailed, walErr))
 			}
-			return nil, fmt.Errorf("%w: wal append: %v", ErrFlushFailed, walErr)
+			return nil, fmt.Errorf("%w: wal append: %w", ErrFlushFailed, walErr)
 		}
 	}
 	return result, nil
@@ -237,6 +237,14 @@ func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 // refresh() calls inUse.Wait() before deserializing, which blocks until every
 // checked-out replica has been released. This guarantees no open cursor can
 // race with sqlite3_deserialize.
+//
+// release() is called immediately after r.Query returns even though the
+// caller still holds an open *sql.Rows. The actual mutual-exclusion guarantee
+// against refresh's Deserialize comes from MaxOpenConns=1 on the replica:
+// refresh acquires the replica's sole connection via withRawConn, which
+// blocks until the *sql.Rows cursor is closed. To prevent a leaked *sql.Rows
+// from blocking refresh forever, refresh runs under a context that is
+// cancelled when the parent DB is shutting down (see replicaRefreshLoop).
 func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
 	if d.closed.Load() {
 		return nil, ErrClosed
@@ -246,15 +254,10 @@ func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
 	}
 	r, release := d.replica.checkout()
 	if r == nil {
-		// All replicas busy — fall back to the writer connection.
+		// All replicas busy or refresh in progress — fall back to the writer.
 		return d.mem.Query(query, args...)
 	}
 	rows, err := r.Query(query, args...)
-	// Release the checkout immediately. The replica's single sql.DB connection
-	// is still held open by the *sql.Rows cursor internally — refresh() uses
-	// inUse.Wait() which waits for this release before it can proceed, ensuring
-	// that by the time refresh() runs Deserialize the rows are fully consumed
-	// or the connection has been returned to the sql pool.
 	release()
 	if err != nil {
 		return nil, err
@@ -318,7 +321,7 @@ func (d *DB) flushUnchecked(ctx context.Context) error {
 	start := time.Now()
 	err := d.cfg.Backend.flush(ctx, d)
 	if err != nil {
-		err = fmt.Errorf("%w: %v", ErrFlushFailed, err)
+		err = fmt.Errorf("%w: %w", ErrFlushFailed, err)
 	}
 
 	if d.wal != nil && err == nil {
@@ -360,9 +363,18 @@ func (d *DB) Flush(ctx context.Context) error {
 func (d *DB) Close() error {
 	var closeErr error
 	d.stopOnce.Do(func() {
+		// Mark closed first so new Exec/Query/etc. callers fail immediately
+		// with ErrClosed instead of racing teardown.
+		//
+		// In-flight Exec/Query calls that already passed the closed.Load()
+		// check may still execute against d.mem before Close() proceeds to
+		// tear it down. This is a narrow window — the caller sees
+		// sql.ErrConnDone from the closed connection rather than ErrClosed.
+		// Tracking in-flight ops with a WaitGroup would close this window
+		// entirely at the cost of hot-path atomic contention.
+		d.closed.Store(true)
 		close(d.stop)
 		d.wg.Wait()
-		d.closed.Store(true) // mark closed before teardown; all goroutines have exited
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -384,7 +396,7 @@ func (d *DB) Close() error {
 func (d *DB) restore() error {
 	exists, err := d.cfg.Backend.Exists(context.Background())
 	if err != nil {
-		return fmt.Errorf("%w: exists check: %v", ErrRestoreFailed, err)
+		return fmt.Errorf("%w: exists check: %w", ErrRestoreFailed, err)
 	}
 	if !exists {
 		return nil
@@ -402,12 +414,26 @@ func (d *DB) replicaRefreshLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			if err := d.replica.refresh(d); err != nil {
+			// Build a context that is cancelled if the DB is shutting down,
+			// so refresh can be interrupted mid-Serialize/Deserialize if a
+			// leaked *sql.Rows is holding a replica's only connection.
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				select {
+				case <-d.stop:
+					cancel()
+				case <-done:
+				}
+			}()
+			if err := d.replica.refresh(ctx, d); err != nil {
 				d.logger().Error("memdb: replica refresh failed", "error", err)
 				if d.cfg.OnFlushError != nil {
 					d.cfg.OnFlushError(fmt.Errorf("memdb: replica refresh: %w", err))
 				}
 			}
+			close(done)
+			cancel()
 		case <-d.stop:
 			return
 		}
@@ -422,11 +448,12 @@ func (d *DB) flushLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			// Use half the flush interval as the per-flush timeout, floored at
-			// 1s so the timeout is always shorter than the interval for any
-			// interval >= 2s and avoids a 0 timeout for very short intervals.
+			// Cap the per-flush timeout at half the interval so timeouts are
+			// always shorter than the tick. The mutex in Flush prevents
+			// overlap; this timeout is about giving up on a stuck backend.
 			timeout := d.cfg.FlushInterval / 2
-			if timeout < time.Second {
+			if timeout <= 0 {
+				// Shouldn't happen — flushLoop only starts when FlushInterval > 0.
 				timeout = time.Second
 			}
 			func() {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -145,12 +146,11 @@ type Node struct {
 	forwarder    *forwarder               // nil when ForwardAddr is empty
 	forwardPeers map[string]string        // nodeID → forwardAddr
 	pool         atomic.Pointer[ConnPool] // current leader's connection pool
-	seq          atomic.Uint64
 	isLeader     atomic.Bool
 	observerWg   sync.WaitGroup
-	observer     *hraft.Observer        // stored so Shutdown can deregister it
-	observerCh   chan hraft.Observation // stored so Shutdown can close it
-	shutdownOnce sync.Once              // ensures Shutdown is idempotent
+	observer     *hraft.Observer // stored so Shutdown can deregister it
+	observerDone chan struct{}   // closed by Shutdown to signal observer goroutine to exit
+	shutdownOnce sync.Once       // ensures Shutdown is idempotent
 }
 
 // storeCloser is satisfied by fileLogStore and fileStableStore, which both
@@ -353,10 +353,10 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	// regardless of whether the caller supplied an OnLeaderChange callback.
 	//
 	// hashicorp/raft never closes observer channels — DeregisterObserver only
-	// removes the observer from its internal map. We therefore store both the
-	// Observer and the channel so that Shutdown can deregister the observer
-	// and then close the channel, which causes the for-range loop below to exit
-	// and lets observerWg.Wait() return.
+	// removes the observer from its internal map. Closing the observer channel
+	// ourselves is unsafe because hashicorp/raft may be mid-send and would
+	// panic on a closed channel. Instead, we signal the goroutine via a
+	// dedicated observerDone channel that it selects on, and never close obs.
 	obs := make(chan hraft.Observation, 8)
 	observer := hraft.NewObserver(obs, false, func(o *hraft.Observation) bool {
 		_, ok := o.Data.(hraft.LeaderObservation)
@@ -364,33 +364,38 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	})
 	r.RegisterObserver(observer)
 	node.observer = observer
-	node.observerCh = obs
+	node.observerDone = make(chan struct{})
 	node.observerWg.Add(1)
 	go func() {
 		defer node.observerWg.Done()
-		for o := range obs {
-			lo, ok := o.Data.(hraft.LeaderObservation)
-			if !ok {
-				continue
-			}
-			isLeader := string(lo.LeaderID) == cfg.NodeID
-			node.isLeader.Store(isLeader)
+		for {
+			select {
+			case o := <-obs:
+				lo, ok := o.Data.(hraft.LeaderObservation)
+				if !ok {
+					continue
+				}
+				isLeader := string(lo.LeaderID) == cfg.NodeID
+				node.isLeader.Store(isLeader)
 
-			node.logger().Info("memdb raft: leadership changed",
-				"nodeID", cfg.NodeID,
-				"isLeader", isLeader,
-				"leaderID", string(lo.LeaderID),
-			)
+				node.logger().Info("memdb raft: leadership changed",
+					"nodeID", cfg.NodeID,
+					"isLeader", isLeader,
+					"leaderID", string(lo.LeaderID),
+				)
 
-			// Swap the connection pool to point at the new leader's
-			// ForwardAddr. Close the old pool so its idle connections are
-			// not handed to callers targeting the previous leader.
-			if old := node.pool.Swap(node.poolForLeader(string(lo.LeaderID))); old != nil {
-				old.Close()
-			}
+				// Swap the connection pool to point at the new leader's
+				// ForwardAddr. Close the old pool so its idle connections are
+				// not handed to callers targeting the previous leader.
+				if old := node.pool.Swap(node.poolForLeader(string(lo.LeaderID))); old != nil {
+					old.Close()
+				}
 
-			if cfg.OnLeaderChange != nil {
-				cfg.OnLeaderChange(isLeader)
+				if cfg.OnLeaderChange != nil {
+					cfg.OnLeaderChange(isLeader)
+				}
+			case <-node.observerDone:
+				return
 			}
 		}
 	}()
@@ -417,7 +422,11 @@ func (n *Node) Exec(sql string, args ...any) error {
 	// If we are the leader, apply directly through Raft.
 	if n.raft.State() == hraft.Leader {
 		entry := replication.WALEntry{
-			Seq:       n.seq.Add(1),
+			// Seq is left zero. The Raft log index provides ordering across
+			// leadership changes; a per-Node counter could not do so and
+			// would restart at 0 after each restart or new leader. The
+			// field is retained only for gob-encoding compatibility with
+			// existing WAL/snapshot files.
 			Timestamp: time.Now().UnixNano(),
 			SQL:       sql,
 			Args:      args,
@@ -515,19 +524,19 @@ func (n *Node) Shutdown() error {
 		if pool := n.pool.Swap(nil); pool != nil {
 			pool.Close()
 		}
-		// Deregister the observer and close its channel before calling
-		// r.Shutdown(). hashicorp/raft never closes observer channels itself —
-		// DeregisterObserver only removes the observer from the internal map.
-		// Closing the channel here causes the for-range loop in the observer
-		// goroutine to exit so that observerWg.Wait() below does not deadlock.
+		// Deregister the observer FIRST so hashicorp/raft stops sending
+		// observations into obs. Then signal the observer goroutine to exit
+		// via the dedicated observerDone channel. We deliberately do NOT
+		// close obs — hashicorp/raft may still hold a reference and closing
+		// it would cause a panic on a concurrent send.
 		if n.observer != nil {
 			n.raft.DeregisterObserver(n.observer)
-			close(n.observerCh)
+			close(n.observerDone)
 		}
-		f := n.raft.Shutdown()
-		// Wait for the observer goroutine to finish before returning so callers
-		// know no goroutines are still running after Shutdown returns.
+		// Wait for the observer goroutine to finish before tearing down raft
+		// so it cannot observe a half-shutdown state.
 		n.observerWg.Wait()
+		f := n.raft.Shutdown()
 		retErr = f.Error()
 	})
 	return retErr
@@ -545,14 +554,10 @@ var ErrNotLeader = errors.New("raft: not leader")
 func parsePeers(peers []string) ([]hraft.Server, error) {
 	servers := make([]hraft.Server, 0, len(peers))
 	for _, p := range peers {
-		// Split on the first '=' only.
-		idx := -1
-		for i, c := range p {
-			if c == '=' {
-				idx = i
-				break
-			}
-		}
+		// Split on the first '=' only. strings.IndexByte is a single
+		// memchr() on the underlying bytes — faster and clearer than a
+		// rune-range loop, and safe here because '=' is a plain ASCII byte.
+		idx := strings.IndexByte(p, '=')
 		if idx < 0 {
 			return nil, fmt.Errorf("invalid peer %q: expected nodeID=addr", p)
 		}
@@ -578,13 +583,7 @@ func parsePeers(peers []string) ([]hraft.Server, error) {
 func parseKVPairs(pairs []string) map[string]string {
 	m := make(map[string]string, len(pairs))
 	for _, p := range pairs {
-		idx := -1
-		for i, c := range p {
-			if c == '=' {
-				idx = i
-				break
-			}
-		}
+		idx := strings.IndexByte(p, '=')
 		if idx > 0 {
 			m[p[:idx]] = p[idx+1:]
 		}

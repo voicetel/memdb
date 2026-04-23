@@ -4,11 +4,12 @@ package raft
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // forwarder listens for incoming ForwardRequests from follower nodes and
@@ -39,7 +40,7 @@ func (f *forwarder) serve() {
 			// After close() sets done and closes the listener, Accept returns an
 			// error — that is expected and should not be logged.
 			if !f.done.Load() {
-				slog.Default().Warn("forwarder: accept error", "error", err)
+				f.node.logger().Warn("forwarder: accept error", "error", err)
 			}
 			return
 		}
@@ -54,9 +55,17 @@ func (f *forwarder) serve() {
 func (f *forwarder) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	// Set an overall deadline for receiving the request. If the peer sends
+	// nothing within this window, the connection is torn down so the
+	// goroutine cannot leak waiting for a length-prefix that never arrives.
+	const requestTimeout = 30 * time.Second
+	if err := conn.SetDeadline(time.Now().Add(requestTimeout)); err != nil {
+		return
+	}
+
 	var req ForwardRequest
 	if err := readMsg(conn, &req); err != nil {
-		// Malformed request — close silently.
+		// Malformed request or timeout — close silently.
 		return
 	}
 
@@ -68,6 +77,12 @@ func (f *forwarder) handleConn(conn net.Conn) {
 	resp := ForwardResponse{}
 	if err != nil {
 		resp.ErrMsg = err.Error()
+		// Set a sentinel code for known error types so the caller of
+		// sendForward can reconstitute a typed error and use errors.Is
+		// for retry logic (rather than matching on the message string).
+		if errors.Is(err, ErrNotLeader) {
+			resp.ErrCode = "ErrNotLeader"
+		}
 	}
 
 	// Best-effort response write — ignore errors (connection may have closed).

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -75,6 +76,15 @@ func main() {
 }
 
 func runServe(file, addr string, flush time.Duration) {
+	// If using a Unix socket, remove any stale socket file from a previous run.
+	if strings.HasPrefix(addr, "unix://") {
+		path := strings.TrimPrefix(addr, "unix://")
+		if fi, err := os.Stat(path); err == nil && fi.Mode()&os.ModeSocket != 0 {
+			// Existing socket — likely stale from a previous crash.
+			os.Remove(path)
+		}
+	}
+
 	db, err := memdb.Open(memdb.Config{
 		FilePath:      file,
 		FlushInterval: flush,
@@ -170,6 +180,11 @@ func copyFileAtomic(src, dst string) error {
 	if err := os.Rename(tmpName, dst); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("rename: %w", err)
+	}
+	// fsync the parent directory so the rename is durable.
+	if dir, err := os.Open(filepath.Dir(dst)); err == nil {
+		_ = dir.Sync()
+		dir.Close()
 	}
 	return nil
 }

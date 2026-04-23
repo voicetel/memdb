@@ -21,6 +21,7 @@ func extraTestConfig(t *testing.T) memdb.Config {
 	return memdb.Config{
 		FilePath:      filepath.Join(t.TempDir(), "extra-test.db"),
 		FlushInterval: -1,
+		Logger:        silentLogger(),
 		InitSchema: func(db *memdb.DB) error {
 			_, err := db.Exec(`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`)
 			return err
@@ -56,6 +57,7 @@ func TestOpen_InitSchemaError(t *testing.T) {
 	cfg := memdb.Config{
 		FilePath:      filepath.Join(t.TempDir(), "schema-err.db"),
 		FlushInterval: -1,
+		Logger:        silentLogger(),
 		InitSchema: func(_ *memdb.DB) error {
 			return sentinel
 		},
@@ -232,6 +234,7 @@ func TestDurabilityWAL_ExecAppendsToWAL(t *testing.T) {
 		FilePath:      dbPath,
 		FlushInterval: -1,
 		Durability:    memdb.DurabilityWAL,
+		Logger:        silentLogger(),
 		InitSchema: func(db *memdb.DB) error {
 			_, err := db.Exec(`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`)
 			return err
@@ -278,6 +281,7 @@ func TestDurabilityWAL_RestoreIncludesWALReplay(t *testing.T) {
 		FilePath:      dbPath,
 		FlushInterval: -1,
 		Durability:    memdb.DurabilityWAL,
+		Logger:        silentLogger(),
 		InitSchema: func(db *memdb.DB) error {
 			_, err := db.Exec(`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`)
 			return err
@@ -341,8 +345,8 @@ func TestDurabilitySync_Works(t *testing.T) {
 
 func TestConfig_Defaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "defaults.db")
-	// Open with only FilePath set — applyDefaults fills in the rest.
-	db, err := memdb.Open(memdb.Config{FilePath: path})
+	// Open with only FilePath set (plus a silent logger) — applyDefaults fills in the rest.
+	db, err := memdb.Open(memdb.Config{FilePath: path, Logger: silentLogger()})
 	if err != nil {
 		t.Fatalf("Open with default config: %v", err)
 	}
@@ -493,8 +497,13 @@ func TestWAL_Replay_Empty(t *testing.T) {
 func TestWAL_Replay_CorruptEntry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "corrupt.wal")
 
-	// Write garbage bytes that are not valid gob data.
-	if err := os.WriteFile(path, []byte("this is not valid gob data!!!"), 0o600); err != nil {
+	// Write garbage bytes that are not a valid length-prefixed record.
+	// The current WAL format treats the first 4 bytes as a big-endian length
+	// prefix. For garbage input, the "length" will either exceed the 64 MB
+	// sanity cap or point past EOF — in both cases the replay stops silently
+	// at that point rather than returning an error, preserving any valid
+	// records that preceded the corruption.
+	if err := os.WriteFile(path, []byte("this is not valid wal data!!!"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -504,9 +513,19 @@ func TestWAL_Replay_CorruptEntry(t *testing.T) {
 	}
 	defer w.Close()
 
-	err = w.Replay(func(_ memdb.WALEntry) error { return nil })
-	if err == nil {
-		t.Error("expected an error replaying a corrupt WAL, got nil")
+	// Replay is tolerant of a corrupt tail — it returns nil and simply
+	// skips the garbage. No entries are delivered to the callback because
+	// the garbage cannot be parsed as a valid record.
+	var delivered int
+	err = w.Replay(func(_ memdb.WALEntry) error {
+		delivered++
+		return nil
+	})
+	if err != nil {
+		t.Errorf("expected nil error (corrupt tail is tolerated), got: %v", err)
+	}
+	if delivered != 0 {
+		t.Errorf("expected 0 entries delivered from garbage input, got %d", delivered)
 	}
 }
 
@@ -523,6 +542,7 @@ func TestWrapBackend_FlushAndRestore(t *testing.T) {
 		return memdb.Config{
 			Backend:       backend,
 			FlushInterval: -1,
+			Logger:        silentLogger(),
 			InitSchema: func(db *memdb.DB) error {
 				_, err := db.Exec(`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`)
 				return err

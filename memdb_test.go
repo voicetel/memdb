@@ -3,6 +3,8 @@ package memdb_test
 import (
 	"context"
 	"database/sql"
+	"io"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -11,6 +13,13 @@ import (
 
 	"github.com/voicetel/memdb"
 )
+
+// silentLogger returns a *slog.Logger that discards all output. Used in tests
+// so that INFO-level flush/restore/WAL-replay events do not pollute test
+// output with lines like "INFO memdb: flushed to backend ...".
+func silentLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError + 1}))
+}
 
 func TestReplicaPool_ReadsConverge(t *testing.T) {
 	cfg := testConfig(t)
@@ -148,6 +157,7 @@ func testConfig(t *testing.T) memdb.Config {
 	return memdb.Config{
 		FilePath:      f.Name(),
 		FlushInterval: -1, // disable background flush in tests
+		Logger:        silentLogger(),
 		InitSchema: func(db *memdb.DB) error {
 			_, err := db.Exec(`
 				CREATE TABLE IF NOT EXISTS kv (

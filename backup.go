@@ -28,13 +28,13 @@ func copyMemToWriter(ctx context.Context, d *DB, w io.Writer, stepPages int) err
 	if err != nil {
 		return err
 	}
-	defer fileDB.Close()
 
 	if err := withRawConn(ctx, d.mem, func(memConn *sqlite3.SQLiteConn) error {
 		return withRawConn(ctx, fileDB, func(fileConn *sqlite3.SQLiteConn) error {
 			return copyDB(ctx, memConn, fileConn, stepPages)
 		})
 	}); err != nil {
+		fileDB.Close()
 		return err
 	}
 	fileDB.Close()

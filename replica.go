@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
 )
@@ -38,7 +39,32 @@ import (
 type replicaPool struct {
 	idle       chan *sql.DB   // buffered channel of idle replicas
 	inUse      sync.WaitGroup // counts replicas currently checked out
+	refreshing atomic.Bool    // true while refresh() is draining/waiting
+	closed     atomic.Bool    // true after close() has been called
 	driverName string
+}
+
+// releaser is the per-checkout state used to return a replica to the pool
+// exactly once. Using a small struct with an atomic flag avoids the three
+// allocations (sync.Once + outer closure + inner closure) that the previous
+// implementation incurred on every read.
+type releaser struct {
+	pool *replicaPool
+	r    *sql.DB
+	done atomic.Bool
+}
+
+func (rl *releaser) release() {
+	if !rl.done.CompareAndSwap(false, true) {
+		return
+	}
+	if rl.pool.closed.Load() {
+		_ = rl.r.Close()
+		rl.pool.inUse.Done()
+		return
+	}
+	rl.pool.idle <- rl.r
+	rl.pool.inUse.Done()
 }
 
 // newReplicaPool creates n replica databases, seeds each with the current
@@ -64,8 +90,10 @@ func newReplicaPool(d *DB, n int, driverName string) (*replicaPool, error) {
 
 	// Seed all replicas with the writer's current state before the pool goes
 	// live. refresh() drains and refills the channel, so this is safe even
-	// though the replicas were just placed there above.
-	if err := p.refresh(d); err != nil {
+	// though the replicas were just placed there above. The initial seed is
+	// a one-shot during Open and cannot be interrupted, so context.Background
+	// is appropriate here.
+	if err := p.refresh(context.Background(), d); err != nil {
 		p.close()
 		return nil, err
 	}
@@ -77,9 +105,16 @@ func newReplicaPool(d *DB, n int, driverName string) (*replicaPool, error) {
 // The caller must call the returned release function when done — this
 // returns the replica to the channel and decrements inUse.
 //
-// If the channel is empty (all replicas busy), returns (nil, nil) and the
-// caller should fall back to the writer connection.
+// If the channel is empty (all replicas busy), or if a refresh is in progress,
+// returns (nil, nil) and the caller should fall back to the writer connection.
+// Yielding to refresh prevents read-load starvation: without this guard, a
+// hot read path can repeatedly hand released replicas back to checkouts and
+// keep the channel empty enough that refresh's blocking <-p.idle never
+// completes.
 func (p *replicaPool) checkout() (*sql.DB, func()) {
+	if p.refreshing.Load() {
+		return nil, nil
+	}
 	var r *sql.DB
 	select {
 	case r = <-p.idle:
@@ -87,14 +122,8 @@ func (p *replicaPool) checkout() (*sql.DB, func()) {
 		return nil, nil
 	}
 	p.inUse.Add(1)
-	once := sync.Once{}
-	release := func() {
-		once.Do(func() {
-			p.idle <- r
-			p.inUse.Done()
-		})
-	}
-	return r, release
+	rl := &releaser{pool: p, r: r}
+	return r, rl.release
 }
 
 // refresh serializes the writer's current state and deserializes it into every
@@ -110,7 +139,19 @@ func (p *replicaPool) checkout() (*sql.DB, func()) {
 // and normal reads resume. The blackout window is: channel drain latency
 // (nanoseconds per replica) + inUse.Wait() (zero when no reads are in flight)
 // + deserialize latency (in-process memcpy, microseconds).
-func (p *replicaPool) refresh(d *DB) error {
+//
+// ctx is threaded into the underlying withRawConn calls so a cancellation
+// (typically because the parent DB is shutting down) interrupts a refresh
+// that is otherwise blocked waiting on a leaked *sql.Rows holding a
+// replica's single connection (MaxOpenConns=1).
+func (p *replicaPool) refresh(ctx context.Context, d *DB) error {
+	// Signal checkout() to fall back to the writer for the duration of the
+	// refresh, so released replicas land in the idle channel where this
+	// goroutine can drain them rather than being immediately handed back
+	// out to another reader.
+	p.refreshing.Store(true)
+	defer p.refreshing.Store(false)
+
 	n := cap(p.idle)
 
 	// Step 1 — Drain: collect every idle replica from the channel.
@@ -130,7 +171,7 @@ func (p *replicaPool) refresh(d *DB) error {
 	// All replicas are now idle and no cursor is open on any of them. The
 	// writer is single-connection (MaxOpenConns=1) so no write is in flight.
 	var data []byte
-	if err := withRawConn(context.Background(), d.mem, func(conn *sqlite3.SQLiteConn) error {
+	if err := withRawConn(ctx, d.mem, func(conn *sqlite3.SQLiteConn) error {
 		var err error
 		data, err = conn.Serialize("main")
 		return err
@@ -147,7 +188,7 @@ func (p *replicaPool) refresh(d *DB) error {
 	// Step 4 — Deserialize into each replica and return it to the channel
 	// immediately after it is updated so reads can resume as quickly as possible.
 	for i, r := range replicas {
-		if err := withRawConn(context.Background(), r, func(conn *sqlite3.SQLiteConn) error {
+		if err := withRawConn(ctx, r, func(conn *sqlite3.SQLiteConn) error {
 			return conn.Deserialize(data, "main")
 		}); err != nil {
 			// Deserialize failed on replica i. Return all remaining replicas
@@ -165,10 +206,10 @@ func (p *replicaPool) refresh(d *DB) error {
 }
 
 // close drains the idle channel and closes every idle replica connection.
-// Replicas currently checked out by callers are not closed here — those
-// callers' release functions will return them to a now-closed channel, where
-// the Put's default case will close them.
+// Replicas currently checked out by callers are closed when their release()
+// runs, because the closed flag is set first.
 func (p *replicaPool) close() {
+	p.closed.Store(true)
 	for {
 		select {
 		case r := <-p.idle:

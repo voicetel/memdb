@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +24,14 @@ type ForwardRequest struct {
 // ForwardResponse is sent from the leader back to the follower.
 type ForwardResponse struct {
 	ErrMsg string // empty means success
+
+	// ErrCode is an optional sentinel identifier that lets the caller
+	// reconstruct a typed Go error on the follower side. Known values:
+	//   "ErrNotLeader" — the forwarded request was sent to a node that is
+	//                    no longer the leader.
+	// An empty ErrCode with a non-empty ErrMsg means "some other error";
+	// callers should treat it as a generic failure.
+	ErrCode string
 }
 
 // ── wire helpers ──────────────────────────────────────────────────────────────
@@ -70,6 +79,12 @@ const (
 	// idleTimeout is how long a pooled connection may sit idle before it is
 	// considered stale and discarded rather than reused.
 	idleTimeout = 30 * time.Second
+
+	// dialTimeout bounds the TCP+TLS handshake portion of Get separately
+	// from the overall apply timeout. Without this, a caller that supplies
+	// a 10s apply timeout would spend up to 10s on the dial alone, leaving
+	// no time for the actual Raft round-trip on the leader.
+	dialTimeout = 2 * time.Second
 )
 
 // pooledConn wraps a net.Conn with the time it was returned to the pool so
@@ -111,11 +126,22 @@ func NewConnPool(addr string, tlsCfg *tls.Config, size int) *ConnPool {
 // idle channel first; if the channel is empty or the connection has been idle
 // longer than idleTimeout it dials a new TLS connection.
 //
+// The timeout argument is the overall deadline budget for the caller. The
+// dial itself is capped at min(timeout, dialTimeout) so that the handshake
+// does not consume the entire budget when the peer is slow or unreachable —
+// leaving time for the actual request/response round-trip.
+//
 // Liveness is not probed at checkout — attempting a zero-deadline read over
 // TLS is unreliable because TLS close_notify alerts may be buffered. Instead,
 // sendForward detects a dead connection when the write or read fails and
 // discards it rather than returning it to the pool.
 func (p *ConnPool) Get(timeout time.Duration) (net.Conn, error) {
+	// Reject early if the pool has been closed — avoids dialing a fresh
+	// connection that would be immediately closed by Put.
+	if p.closed.Load() {
+		return nil, fmt.Errorf("rpc: pool is closed")
+	}
+
 	// Drain connections that have exceeded the idle timeout. A connection
 	// that has sat idle too long may have been closed by the remote end;
 	// discarding it here avoids handing a likely-dead connection to the caller.
@@ -134,7 +160,17 @@ drainLoop:
 		}
 	}
 
-	dialer := &net.Dialer{Timeout: timeout}
+	// Cap the dial portion so that the handshake cannot consume the entire
+	// caller budget. If the caller's budget is smaller than dialTimeout,
+	// honour that instead.
+	d := dialTimeout
+	if timeout > 0 && timeout < d {
+		d = timeout
+	}
+	if d <= 0 {
+		return nil, fmt.Errorf("rpc: deadline exceeded before dial")
+	}
+	dialer := &net.Dialer{Timeout: d}
 	conn, err := tls.DialWithDialer(dialer, "tcp", p.addr, p.tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("rpc: dial %s: %w", p.addr, err)
@@ -218,7 +254,14 @@ func sendForward(pool *ConnPool, req ForwardRequest, timeout time.Duration) erro
 	pool.Put(conn)
 
 	if resp.ErrMsg != "" {
-		return fmt.Errorf("%s", resp.ErrMsg)
+		// Translate known sentinel codes back into typed errors so callers
+		// on the follower side can use errors.Is(err, ErrNotLeader) to
+		// drive retry logic without string-matching.
+		switch resp.ErrCode {
+		case "ErrNotLeader":
+			return fmt.Errorf("%w: forwarded: %s", ErrNotLeader, resp.ErrMsg)
+		}
+		return errors.New(resp.ErrMsg)
 	}
 	return nil
 }
