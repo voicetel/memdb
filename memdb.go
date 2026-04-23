@@ -30,6 +30,7 @@ import (
 // exclusively through OnExec — the local database is only written by the
 // Raft FSM via ExecLocal after consensus is reached. Transactions (Begin,
 // BeginTx, WithTx) are not supported in this mode because they cannot
+// span consensus rounds.
 type DB struct {
 	mem      *sql.DB // single writer connection (also used for Flush/WAL)
 	cfg      Config
@@ -91,7 +92,10 @@ func Open(cfg Config) (*DB, error) {
 		return nil, err
 	}
 
-	if cfg.Durability == DurabilityWAL && cfg.FilePath != "" {
+	// DurabilityWAL and DurabilitySync both rely on an on-disk WAL so that
+	// writes can be recovered after a crash. DurabilitySync additionally
+	// forces a full backend flush after every write (see writeDurability).
+	if (cfg.Durability == DurabilityWAL || cfg.Durability == DurabilitySync) && cfg.FilePath != "" {
 		walPath := cfg.FilePath + ".wal"
 		db.wal, err = OpenWAL(walPath)
 		if err != nil {
@@ -146,17 +150,31 @@ func (d *DB) DB() *sql.DB {
 	return d.mem
 }
 
-// execDirect writes SQL directly to the local in-memory database, bypassing
-// the OnExec hook. Used by the Raft FSM to apply committed log entries on
-// every node without re-entering the replication path.
-func (d *DB) execDirect(query string, args ...any) error {
-	if d.closed.Load() {
-		return ErrClosed
+// writeDurability applies the durability-mode side effects of a successful
+// write (WAL append, synchronous backend flush) after the SQL has already
+// been executed against the in-memory DB.
+//
+// Durability matrix:
+//
+//	DurabilityNone — no side effect; writes are durable only after the
+//	                 next periodic Flush completes.
+//	DurabilityWAL  — append-only WAL entry with fsync; near-zero data-loss
+//	                 window. The WAL is replayed on restart to recover
+//	                 any writes made since the last snapshot.
+//	DurabilitySync — WAL append AS ABOVE, plus a synchronous full flush to
+//	                 the backend before returning. Equivalent to a regular
+//	                 file-backed SQLite with synchronous=FULL: every write
+//	                 is fully persisted before the caller sees success.
+//	                 This is by far the slowest mode — use only when
+//	                 zero-loss durability is required.
+//
+// ctx scopes both the WAL append (which is effectively synchronous already)
+// and the optional backend flush so a caller-supplied deadline is honoured.
+func (d *DB) writeDurability(ctx context.Context, query string, args []any) error {
+	if d.cfg.Durability == DurabilityNone {
+		return nil
 	}
-	if _, err := d.mem.Exec(query, args...); err != nil {
-		return err
-	}
-	if d.cfg.Durability == DurabilityWAL && d.wal != nil {
+	if d.wal != nil {
 		entry := WALEntry{
 			Seq:       d.wal.NextSeq(),
 			Timestamp: time.Now().UnixNano(),
@@ -170,7 +188,28 @@ func (d *DB) execDirect(query string, args ...any) error {
 			return fmt.Errorf("%w: wal append: %w", ErrFlushFailed, walErr)
 		}
 	}
+	if d.cfg.Durability == DurabilitySync {
+		// Full synchronous flush to the backend. flushUnchecked serialises
+		// with background flushes via d.mu so there is no risk of two
+		// overlapping backend writes.
+		if err := d.flushUnchecked(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// execDirect writes SQL directly to the local in-memory database, bypassing
+// the OnExec hook. Used by the Raft FSM to apply committed log entries on
+// every node without re-entering the replication path.
+func (d *DB) execDirect(query string, args ...any) error {
+	if d.closed.Load() {
+		return ErrClosed
+	}
+	if _, err := d.mem.Exec(query, args...); err != nil {
+		return err
+	}
+	return d.writeDurability(context.Background(), query, args)
 }
 
 // ExecDirect writes SQL directly to the local in-memory database, bypassing
@@ -188,8 +227,19 @@ func (d *DB) ExecDirect(query string, args ...any) error {
 // the entry is committed. Writing locally here would cause split-brain
 // on non-leader nodes.
 func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
+	return d.ExecContext(context.Background(), query, args...)
+}
+
+// ExecContext is the context-aware variant of Exec. The context scopes the
+// Raft consensus round trip (when OnExec is set) and the synchronous backend
+// flush performed under DurabilitySync so callers can bound the worst-case
+// latency of a write.
+func (d *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	if d.closed.Load() {
 		return nil, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// When OnExec is set the write must go through Raft consensus first.
@@ -206,23 +256,12 @@ func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 	}
 
 	// Standalone (no replication): write locally.
-	result, err := d.mem.Exec(query, args...)
+	result, err := d.mem.ExecContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
-	if d.cfg.Durability == DurabilityWAL && d.wal != nil {
-		entry := WALEntry{
-			Seq:       d.wal.NextSeq(),
-			Timestamp: time.Now().UnixNano(),
-			SQL:       query,
-			Args:      args,
-		}
-		if walErr := d.wal.Append(entry); walErr != nil {
-			if d.cfg.OnFlushError != nil {
-				d.cfg.OnFlushError(fmt.Errorf("%w: wal: %w", ErrFlushFailed, walErr))
-			}
-			return nil, fmt.Errorf("%w: wal append: %w", ErrFlushFailed, walErr)
-		}
+	if err := d.writeDurability(ctx, query, args); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
@@ -246,18 +285,27 @@ func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 // from blocking refresh forever, refresh runs under a context that is
 // cancelled when the parent DB is shutting down (see replicaRefreshLoop).
 func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
+	return d.QueryContext(context.Background(), query, args...)
+}
+
+// QueryContext is the context-aware variant of Query. The context is threaded
+// into the underlying *sql.DB call so a cancellation aborts the query mid-flight.
+func (d *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	if d.closed.Load() {
 		return nil, ErrClosed
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if d.replica == nil {
-		return d.mem.Query(query, args...)
+		return d.mem.QueryContext(ctx, query, args...)
 	}
 	r, release := d.replica.checkout()
 	if r == nil {
 		// All replicas busy or refresh in progress — fall back to the writer.
-		return d.mem.Query(query, args...)
+		return d.mem.QueryContext(ctx, query, args...)
 	}
-	rows, err := r.Query(query, args...)
+	rows, err := r.QueryContext(ctx, query, args...)
 	release()
 	if err != nil {
 		return nil, err
@@ -270,20 +318,28 @@ func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
 // is immediately returned. QueryRow buffers the result internally so the
 // replica is not needed after the call returns.
 func (d *DB) QueryRow(query string, args ...any) *sql.Row {
+	return d.QueryRowContext(context.Background(), query, args...)
+}
+
+// QueryRowContext is the context-aware variant of QueryRow. The context is
+// threaded into the underlying *sql.DB call so a cancellation aborts the
+// query mid-flight. A cancelled context surfaces as an error on the returned
+// *sql.Row's Scan call, matching database/sql semantics.
+func (d *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
 	if d.closed.Load() {
-		return d.mem.QueryRow(query, args...) // returns sql: database is closed on Scan
+		return d.mem.QueryRowContext(ctx, query, args...) // returns sql: database is closed on Scan
 	}
 	if d.replica == nil {
-		return d.mem.QueryRow(query, args...)
+		return d.mem.QueryRowContext(ctx, query, args...)
 	}
 	r, release := d.replica.checkout()
 	if r == nil {
-		return d.mem.QueryRow(query, args...)
+		return d.mem.QueryRowContext(ctx, query, args...)
 	}
 	// Return the replica immediately — QueryRow buffers its result internally
 	// so the replica connection is not needed once QueryRow returns.
 	defer release()
-	return r.QueryRow(query, args...)
+	return r.QueryRowContext(ctx, query, args...)
 }
 
 // Begin starts a transaction against the in-memory DB.
