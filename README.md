@@ -930,13 +930,10 @@ make bench-compare      # memdb vs file SQLite comparison
 make bench-concurrency  # concurrent reads at -cpu=1,4,8
 make bench-pprof        # benchmarks with CPU/mem/mutex/block pprof capture
 
-# Profiling
+# Profiling — see the Profiling (pprof) section above for the full list
+# of per-scenario capture targets (pprof-writes / pprof-reads /
+# pprof-mixed / pprof-flush / pprof-wal) and the pprof-view entry point.
 make pprof              # capture all pprof scenarios → ./coverage/pprof
-make pprof-writes       # single-writer INSERT workload
-make pprof-reads        # concurrent replica-pool reads
-make pprof-mixed        # mixed read/write workload
-make pprof-flush        # flush path at 50k rows
-make pprof-wal          # DurabilityWAL writes
 make pprof-view PROF=<file>  # open a profile in the pprof web UI
 
 # Code quality
