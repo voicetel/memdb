@@ -38,15 +38,23 @@ func newTestNodeWithForward(
 	t.Helper()
 	db := &mockDB{}
 	cfg := memraft.NodeConfig{
-		NodeID:           nodeID,
-		BindAddr:         raftAddr,
-		ForwardAddr:      fwdAddr,
-		Peers:            peers,
-		ForwardPeers:     fwdPeers,
-		DataDir:          t.TempDir(),
-		TLSConfig:        tlsCfg,
-		HeartbeatTimeout: 500 * time.Millisecond,
-		ElectionTimeout:  500 * time.Millisecond,
+		NodeID:       nodeID,
+		BindAddr:     raftAddr,
+		ForwardAddr:  fwdAddr,
+		Peers:        peers,
+		ForwardPeers: fwdPeers,
+		DataDir:      t.TempDir(),
+		TLSConfig:    tlsCfg,
+		// 1500ms heartbeat/election timeouts are intentionally generous for
+		// the test environment. With -race (~5–10× slowdown) and many
+		// parallel 3-node clusters in the same test binary sharing a
+		// GOMAXPROCS-bound goroutine pool, a heartbeat goroutine can
+		// occasionally miss a 500ms deadline under CPU starvation and
+		// trigger a spurious re-election that flakes waitForLeader /
+		// waitForReplication. Production callers supply their own values
+		// via NodeConfig and are not affected.
+		HeartbeatTimeout: 1500 * time.Millisecond,
+		ElectionTimeout:  1500 * time.Millisecond,
 		CommitTimeout:    10 * time.Millisecond,
 		ApplyTimeout:     10 * time.Second,
 	}
@@ -181,13 +189,15 @@ func newTestNode(t *testing.T, nodeID string, tlsCfg *tls.Config, peers []string
 	}
 
 	cfg := memraft.NodeConfig{
-		NodeID:           nodeID,
-		BindAddr:         addr,
-		Peers:            peerList,
-		DataDir:          t.TempDir(),
-		TLSConfig:        tlsCfg,
-		HeartbeatTimeout: 500 * time.Millisecond,
-		ElectionTimeout:  500 * time.Millisecond,
+		NodeID:    nodeID,
+		BindAddr:  addr,
+		Peers:     peerList,
+		DataDir:   t.TempDir(),
+		TLSConfig: tlsCfg,
+		// See newTestNodeWithForward for the rationale behind 1500ms —
+		// -race plus parallel test execution makes 500ms unreliable.
+		HeartbeatTimeout: 1500 * time.Millisecond,
+		ElectionTimeout:  1500 * time.Millisecond,
 		CommitTimeout:    10 * time.Millisecond,
 		ApplyTimeout:     10 * time.Second,
 	}
