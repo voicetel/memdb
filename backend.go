@@ -83,9 +83,8 @@ func (b *LocalBackend) restore(ctx context.Context, d *DB) error {
 	return copyReaderToMem(ctx, d, f, d.cfg.BackupStepPages)
 }
 
-// copyMemToWriter and copyReaderToMem are build-tag-specific helpers
-// declared in backup.go (cgo) / backup_purego.go (purego).
-// Signatures:
+// copyMemToWriter and copyReaderToMem are declared in backup.go alongside
+// the rest of the SQLite Online Backup API plumbing. Signatures:
 //
 //	func copyMemToWriter(ctx context.Context, d *DB, w io.Writer, stepPages int) error
 //	func copyReaderToMem(ctx context.Context, d *DB, r io.Reader, stepPages int) error
