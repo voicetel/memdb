@@ -67,17 +67,45 @@ func (f *FSM) SetApplyErrorHandler(fn func(error)) {
 }
 
 // Apply is called by Raft on every committed log entry on every node.
-func (f *FSM) Apply(log *raft.Log) any {
+//
+// Panic recovery: if execFn or onApplyError panics, the panic is caught,
+// logged, and returned as an error value. Returning an error from Apply is
+// safe — hashicorp/raft records it as the future response and continues
+// processing subsequent log entries. Letting the panic escape would
+// terminate the goroutine that drives the FSM and permanently wedge the
+// node, which is far worse than a failed apply.
+func (f *FSM) Apply(log *raft.Log) (result any) {
+	defer func() {
+		if r := recover(); r != nil {
+			var err error
+			if e, ok := r.(error); ok {
+				err = fmt.Errorf("raft fsm: panic in Apply: %w", e)
+			} else {
+				err = fmt.Errorf("raft fsm: panic in Apply: %v", r)
+			}
+			if f.onApplyError != nil {
+				func() {
+					defer func() { _ = recover() }() // guard against panicking onApplyError
+					f.onApplyError(err)
+				}()
+			}
+			result = err
+		}
+	}()
+
 	var entry replication.WALEntry
 	if err := gob.NewDecoder(bytes.NewReader(log.Data)).Decode(&entry); err != nil {
 		return fmt.Errorf("raft fsm: decode: %w", err)
 	}
 	if err := f.execFn(entry.SQL, entry.Args...); err != nil {
-		result := fmt.Errorf("raft fsm: exec: %w", err)
+		applyErr := fmt.Errorf("raft fsm: exec: %w", err)
 		if f.onApplyError != nil {
-			f.onApplyError(result)
+			func() {
+				defer func() { _ = recover() }() // guard against panicking onApplyError
+				f.onApplyError(applyErr)
+			}()
 		}
-		return result
+		return applyErr
 	}
 	return nil
 }

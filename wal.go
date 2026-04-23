@@ -275,12 +275,12 @@ func (w *WAL) Close() error {
 
 // ─── binary encoder ──────────────────────────────────────────────────────────
 
-// ErrWALUnsupportedArgType is returned by Append when a WALEntry's Args
-// slice contains a value of a type the binary encoder cannot serialise.
-// The caller (Exec / execDirect / Raft FSM) should surface this back to
-// the application so the offending write is rejected cleanly instead of
-// being written in a format that cannot be replayed.
-var ErrWALUnsupportedArgType = errors.New("memdb: wal: unsupported arg type")
+// ErrWALUnsupportedArgType is declared in errors.go alongside the rest of
+// the package's sentinel errors. It is returned by Append when a WALEntry's
+// Args slice contains a value of a type the binary encoder cannot
+// serialise; the caller (Exec / execDirect / Raft FSM) should surface this
+// back to the application so the offending write is rejected cleanly
+// instead of being written in a format that cannot be replayed.
 
 // walEncodeBinary appends the binary v1 representation of entry to dst and
 // returns the resulting slice. dst may be nil or a reused buffer from the
