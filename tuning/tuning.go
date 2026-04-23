@@ -109,13 +109,18 @@ const (
 	// sqlite3_deserialize on reference hardware, in bytes per second.
 	//
 	// Derivation: BenchmarkFlush/rows=10000 copies a ~4 MiB image in
-	// ~527 µs wall time (see coverage/bench.txt, v1.4.0). The flush path
-	// uses the backup API which is strictly slower than sqlite3_deserialize,
-	// so we take the flush bandwidth (~7.6 GiB/s) as a conservative floor
-	// and document it here. A separate microbench would pin this tighter,
-	// but for recommendation purposes a conservative estimate biases us
-	// toward recommending FEWER replicas / LONGER intervals — the
-	// safe direction.
+	// ~527 µs wall time (coverage/bench.txt, v1.4.0). Starting in v1.5.0
+	// the flush path includes an in-memory SHA-256 pass over the full
+	// payload (snapshotWriter), so the v1.5.0 flush timing (~1452 µs) is
+	// no longer a clean proxy for sqlite3_deserialize bandwidth. We
+	// deliberately keep the v1.4.0-derived value here because it reflects
+	// the actual backup-API throughput without checksum overhead, and
+	// using the v1.5.0 flush time would artificially lower the estimate
+	// (biasing toward unnecessarily few replicas / long intervals).
+	// The flush path uses the backup API which is strictly slower than
+	// sqlite3_deserialize, so ~7.6 GiB/s as a conservative floor is still
+	// correct. If you replace the driver or measure sqlite3_deserialize
+	// directly, update this constant accordingly.
 	//
 	// If you update this, note that memory bandwidth on target hardware
 	// is the ultimate ceiling (commodity DDR4/5 at 25-50 GB/s peak,
@@ -128,10 +133,11 @@ const (
 	// concurrency.
 	//
 	// Derivation: BenchmarkCompare_ConcurrentRead on 4 goroutines shows
-	// pool=4 at 2032 ns/op vs single-conn at 5500 ns/op — a 2.71×
-	// speedup on 4 replicas, giving alpha = 2.71/4 = 0.6775. Rounded
-	// conservatively to 0.65 to account for the diminishing-returns
-	// curve past GOMAXPROCS/2 that pprof shows but the microbench
+	// pool=4 at 2051 ns/op vs single-conn at 5631 ns/op — a 2.74×
+	// speedup on 4 replicas, giving alpha = 2.74/4 = 0.685 (v1.5.0
+	// reference run; v1.4.0 measured 2.71/4 = 0.677, consistent).
+	// Rounded conservatively to 0.65 to account for the diminishing-
+	// returns curve past GOMAXPROCS/2 that pprof shows but the microbench
 	// does not fully exercise at parallelism=4.
 	AlphaRead = 0.65
 

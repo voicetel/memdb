@@ -25,13 +25,20 @@ type handler struct {
 	startupUser string // username from startup packet
 }
 
+// writeBufSize is the bufio.Writer buffer size for each client connection.
+// 32 KB covers a ~500-row result set (~25 KB) in a single flush, eliminating
+// the ~6 implicit mid-response Flush calls (each a write(2) syscall) that the
+// previous 4 KB buffer triggered on wide SELECT workloads. Narrow queries and
+// DML responses are well under 4 KB and see no change.
+const writeBufSize = 32 * 1024
+
 func newHandler(db *memdb.DB, cfg Config, conn net.Conn) *handler {
 	return &handler{
 		db:   db,
 		cfg:  cfg,
 		conn: conn,
 		bufR: bufio.NewReaderSize(conn, 4096),
-		bufW: bufio.NewWriterSize(conn, 4096),
+		bufW: bufio.NewWriterSize(conn, writeBufSize),
 	}
 }
 
