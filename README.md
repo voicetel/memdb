@@ -4,16 +4,16 @@ A high-performance, embedded Go database library built on SQLite. All reads and 
 
 Think Redis RDB+AOF semantics with full SQL query power — in a single Go import.
 
-**2.26× faster writes than file SQLite. Concurrent reads match file SQLite with `ReadPoolSize > 0`.**
+**1.88× faster writes than file SQLite. ~22% faster concurrent reads than file SQLite with `ReadPoolSize > 0`.** See [BENCHMARKS.md](./BENCHMARKS.md) for the current v1.4.0 report.
 
 ---
 
 ## Features
 
 - **Full SQL** — joins, indexes, transactions, aggregates via SQLite
-- **2.26× faster writes** — all writes hit memory; no VFS, no page-cache overhead
+- **1.88× faster writes** — all writes hit memory; no VFS, no page-cache overhead
 - **Sub-millisecond reads** — all queries hit memory, no disk I/O on the hot path
-- **Concurrent reads** — channel-based replica pool (`ReadPoolSize`) matches file SQLite throughput at 4+ goroutines
+- **Concurrent reads** — channel-based replica pool (`ReadPoolSize`) is ~22% faster than file SQLite at 4 goroutines (and 2.71× faster than memdb without the pool)
 - **Configurable durability** — periodic snapshot only, WAL-backed near-zero loss, or fully synchronous
 - **Atomic snapshots** — write-then-rename prevents corrupt state on crash
 - **Pluggable backends** — local disk or any custom `Backend` implementation
@@ -198,21 +198,27 @@ type Config struct {
 	// counter has not advanced since the last successful refresh, the
 	// tick returns immediately without serialising or deserialising
 	// anything — so a read-only workload imposes no per-tick CPU cost
-	// regardless of how short this interval is. Measured in pprof:
-	// read-only throughput went from 519k to 727k ops/s (+40%) once
-	// the short-circuit was in place, and replicaRefreshLoop dropped
-	// below the top-10 CPU sampling threshold for that workload.
+	// regardless of how short this interval is. Measured in pprof on
+	// the v1.4.0 reference run, two successive optimisations took
+	// read-only throughput from 519k → 727k → 812k ops/s (+56% total):
+	// first the write-generation short-circuit in replicaPool.refresh
+	// (+40%), then the fast-path tick in replicaRefreshLoop that skips
+	// the per-tick goroutine/channel/context allocation when the
+	// short-circuit fires (+16% on top). replicaRefreshLoop now drops
+	// below the top-10 CPU sampling threshold entirely for read-only
+	// workloads. See BENCHMARKS.md for the full before/after profiles.
 	//
 	// Empirical sweep (1 000-row dataset, 8 concurrent readers with a
 	// continuously active writer, BenchmarkReplicaRefreshInterval on a
 	// 20-thread x86_64 box — the writer-active case that the
-	// short-circuit cannot help):
+	// short-circuit cannot help; v1.4.0 reference run, see
+	// BENCHMARKS.md):
 	//
-	//   refresh=250µs  ~83 µs/write  34 KB/op   refresh dominates CPU
-	//   refresh=1ms    ~75 µs/write  30 KB/op   8× slower writes than 100ms
-	//   refresh=5ms    ~72 µs/write  26 KB/op   marginal improvement
-	//   refresh=25ms   ~35 µs/write  14 KB/op   knee of the curve
-	//   refresh=100ms  ~10 µs/write  3.5 KB/op  writes at full speed
+	//   refresh=250µs  ~90 µs/write  34 KB/op  (refresh dominates CPU)
+	//   refresh=1ms    ~84 µs/write  29 KB/op  (previous default — 8× slower than 100ms)
+	//   refresh=5ms    ~79 µs/write  27 KB/op  (marginal improvement)
+	//   refresh=25ms   ~53 µs/write  20 KB/op  (knee of the curve)
+	//   refresh=100ms  ~11 µs/write  3.8 KB/op (writes at full speed)
 	//
 	// Only used when ReadPoolSize > 0. Default: 50ms. Values below 5ms
 	// emit a warning at Open time because pprof traces attribute the
@@ -1006,7 +1012,7 @@ For cross-compilation without Docker, use the `-tags purego` build tag to elimin
   │ node.Exec │              │  channel-based exclusive checkout│
   └─────┬─────┘              │  sqlite3_serialize/deserialize   │
         │                    │  N independent :memory: DBs      │
-        │ IsLeader?          │  refreshed every 1 ms (default)  │
+        │ IsLeader?          │  refreshed every 50 ms (default) │
         │                    └──────────────────────────────────┘
         ├─ Yes ──────────────────────────────────────┐
         │                                            │
@@ -1067,36 +1073,39 @@ For cross-compilation without Docker, use the `-tags purego` build tag to elimin
 The section below is a short summary of the most frequently-cited
 microbenchmarks for quick reference.
 
-Benchmarks run on a 12th Gen Intel Core i7-1280P, Linux, Go 1.24, `github.com/mattn/go-sqlite3`.
-All file-SQLite numbers use WAL journal mode and `cache_size=-64000` (64 MB), identical to memdb's
-in-memory configuration. Run with `-benchtime=5s -benchmem`.
+Benchmarks run on a 12th Gen Intel Core i7-1280P (20 threads), Linux, Go 1.24,
+`github.com/mattn/go-sqlite3`. All file-SQLite numbers use WAL journal mode and
+`cache_size=-64000` (64 MB), identical to memdb's in-memory configuration. Run
+with `-benchtime=3s -benchmem`. Numbers below are from the v1.4.0 reference run
+— see [BENCHMARKS.md](./BENCHMARKS.md) for the full table and the raw
+`coverage/bench.txt` output.
 
 ### Single-goroutine throughput vs file SQLite
 
 | Operation | memdb | memdb + WAL | file/sync=off | file/sync=full | vs file/off |
 |---|---|---|---|---|---|
-| INSERT | **3,627 ns** | 5,224 ns | 8,190 ns | 8,641 ns | **2.26× faster** |
-| UPDATE | **3,206 ns** | — | 4,697 ns | 4,703 ns | **1.46× faster** |
-| QueryRow | **4,029 ns** | — | 4,903 ns | 4,969 ns | **1.22× faster** |
-| RangeScan (100 rows) | **42,590 ns** | — | 44,164 ns | 43,850 ns | **1.04× faster** |
-| BatchInsert (50 rows/tx) | **186,175 ns** | — | 199,449 ns | 200,630 ns | **1.07× faster** |
+| INSERT | **4,376 ns** | 5,171 ns | 8,237 ns | 8,286 ns | **1.88× faster** |
+| UPDATE | **3,190 ns** | — | 4,388 ns | 4,445 ns | **1.38× faster** |
+| QueryRow | **3,585 ns** | — | 4,378 ns | 4,359 ns | **1.22× faster** |
+| RangeScan (100 rows) | **38,256 ns** | — | 38,970 ns | 39,598 ns | **1.02× faster** |
+| BatchInsert (50 rows/tx) | **156,303 ns** | — | 166,413 ns | 167,173 ns | **1.06× faster** |
 
 memdb's advantage is proportional to how much time each operation spends in I/O vs pure SQL
 work. Single-row writes spend most of their time flushing pages through the OS VFS stack —
-memdb skips all of that, giving a **1.5–2.3× edge**. Point reads see a smaller **~1.2×**
+memdb skips all of that, giving a **1.4–1.9× edge**. Point reads see a smaller **~1.2×**
 gain because both backends serve hot pages from RAM; the difference is the VFS abstraction
 cost alone. For bulk operations and range scans the bottleneck shifts to SQLite's B-tree and
-cursor machinery, which is identical for both backends, so the gap narrows to **~2–7%**.
+cursor machinery, which is identical for both backends, so the gap narrows to **~2–6%**.
 
 `memdb + WAL` appends a binary-encoded entry and calls `fsync` after every `Exec`. Since
 the v1.4 sprint the WAL hot path uses a hand-rolled binary wire format in place of
 `encoding/gob`, which previously accounted for ~25% of total CPU under `DurabilityWAL`
-in pprof traces. `BenchmarkWAL_Append` now measures **539 ns/op, 128 B/op, 1 alloc/op**
-(down from 2809 ns/op, 1602 B/op, 20 allocs/op). End-to-end WAL-durability insert
-throughput in `TestPProf_Writes_WAL` went from 135k to 190k writes/s (+41%). Even with
-the per-write `fsync` included, `DurabilityWAL` remains faster than `file/sync=off` on
-INSERT — you get near-zero data loss durability while still beating an unprotected
-file database.
+in pprof traces. `BenchmarkWAL_Append` now measures **~622 ns/op, 128 B/op, 1 alloc/op**
+(down from 2,809 ns/op, 1,602 B/op, 20 allocs/op). End-to-end WAL-durability insert
+throughput in `TestPProf_Writes_WAL` went from 135k to 209k writes/s (+55%). Even with
+the per-write `fsync` included, `DurabilityWAL` (5,171 ns/op) remains **1.59× faster than
+`file/sync=off`** (8,237 ns/op) on INSERT — you get near-zero data loss durability while
+still beating an unprotected file database.
 
 The `synchronous` pragma barely matters on fast NVMe storage (`off` vs `full` is only 5%).
 On spinning disk or network-attached storage the gap would be many milliseconds per commit,
@@ -1114,31 +1123,36 @@ until all checked-out replicas are returned before calling `sqlite3_deserialize`
 eliminating the open-cursor race. Reads may be at most one interval stale; writes and
 transactions always use the writer connection.
 
-| | 1 goroutine | 4 goroutines | 8 goroutines |
-|---|---|---|---|
-| memdb (default, 1 connection) | 4,759 ns | 5,958 ns | 6,073 ns |
-| **memdb + ReadPoolSize=4** | 4,825 ns | **2,630 ns** | 3,603 ns |
-| file SQLite (4 connections, WAL) | 5,193 ns | 2,592 ns | 3,038 ns |
+From `BenchmarkCompare_ConcurrentRead` at parallelism=4:
+
+| Backend | ns/op | vs `memdb/pool` |
+|---|---:|---:|
+| **memdb + ReadPoolSize=4** | **2,032** | **1.00×** |
+| file SQLite (sync=off, WAL) | 2,478 | 1.22× |
+| file SQLite (sync=normal, WAL) | 2,453 | 1.21× |
+| file SQLite (sync=full, WAL) | 2,479 | 1.22× |
+| memdb (default, 1 connection) | 5,500 | 2.71× |
 
 Without the pool, memdb serialises all readers through one connection and degrades under
-concurrency while file SQLite fans out across 4 independent connections. With
-`ReadPoolSize=4` and the channel-based pool, memdb **matches file SQLite at 4 goroutines**
-(2,630 ns vs 2,592 ns) — essentially tied — while retaining the full 2.26× write speed
-advantage that file SQLite can never match. At 8 goroutines, goroutines that cannot
-immediately check out a replica fall back to the writer connection; increasing `ReadPoolSize`
-to match the goroutine count recovers the throughput.
+concurrency while file SQLite fans out across independent connections. With
+`ReadPoolSize=4` and the channel-based pool, memdb is **~22% faster than file SQLite at
+4 goroutines** (2,032 ns vs 2,478 ns) and **2.71× faster than memdb without the pool**,
+while retaining the full 1.88× write-speed advantage over file SQLite. At higher goroutine
+counts, any goroutine that cannot immediately check out a replica falls back to the writer
+connection; raise `ReadPoolSize` to match the goroutine count to recover the throughput.
+See the [Tuning](#tuning) section for a closed-form recommender.
 
 ### Flush cost vs table size
 
 | Rows | Flush latency | Allocs |
 |---|---|---|
-| 100 | ~87 µs | 75 |
-| 1,000 | ~121 µs | 75 |
-| 10,000 | ~513 µs | 75 |
+| 100 | ~93 µs | 85 |
+| 1,000 | ~125 µs | 85 |
+| 10,000 | ~527 µs | 85 |
 
-There is an ~87 µs fixed overhead per flush regardless of data volume (SQLite Online Backup
+There is an ~93 µs fixed overhead per flush regardless of data volume (SQLite Online Backup
 API initialisation). Flush time then scales sub-linearly with page count — 100× more rows
-takes only ~6× longer. Allocations are flat because the `database/sql` connection machinery
+takes only ~5.7× longer. Allocations are flat because the `database/sql` connection machinery
 dominates, not the data being flushed. The default 30 s flush interval is appropriate for
 most workloads; avoid flushing more frequently than every few seconds on a hot write path.
 
@@ -1146,15 +1160,16 @@ most workloads; avoid flushing more frequently than every few seconds on a hot w
 
 | Operation | Latency | Allocs |
 |---|---|---|
-| WAL append (gob encode + fsync) | ~1,263 ns | 1 |
-| WAL replay — 100 entries | ~125 µs | 1,288 |
-| WAL replay — 1,000 entries | ~1,026 µs | 11,191 |
-| WAL replay — 10,000 entries | ~11,290 µs | 110,199 |
+| WAL append (binary encode + fsync) | ~622 ns | 1 |
+| WAL replay — 100 entries | ~86 µs | 609 |
+| WAL replay — 1,000 entries | ~852 µs | 6,012 |
+| WAL replay — 10,000 entries | ~9,175 µs | 60,022 |
 
-WAL append costs ~540 ns including `fsync` on a warm buffer (benchmarked on a 20-thread
-x86_64 box; dominated by the `write(2)` + `fsync` syscall pair, not the encoder itself),
-making `DurabilityWAL` practical for most workloads. Replay is perfectly linear (10×
-entries = ~10× time). A 10,000-entry WAL replays in ~9 ms.
+WAL append costs ~622 ns including `fsync` on a warm buffer (benchmarked on a 20-thread
+x86_64 box; dominated by the `write(2)` + `fsync` syscall pair, not the encoder itself —
+see the WAL on-disk format section below for the binary v1 layout that replaced
+`encoding/gob`), making `DurabilityWAL` practical for most workloads. Replay is perfectly
+linear (10× entries = ~10× time). A 10,000-entry WAL replays in ~9 ms.
 
 ## WAL on-disk format
 
@@ -1194,8 +1209,8 @@ entry — matching the behaviour expected after an unclean shutdown.
 
 | Operation | Latency |
 |---|---|
-| Open (fresh, no snapshot) | ~63 µs |
-| Open + restore (1,000-row snapshot) | ~137 µs |
+| Open (fresh, no snapshot) | ~76 µs |
+| Open + restore (1,000-row snapshot) | ~153 µs |
 
 Open cost covers driver registration, pragma application via the connect hook, and
 `InitSchema` execution. Restore adds a full SQLite backup-API round-trip (file → temp →

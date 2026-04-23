@@ -355,13 +355,19 @@ func BenchmarkConcurrentReadWrite(b *testing.B) {
 // sub-benchmark names make it easy to spot the knee in the curve and pick
 // a safe default for a given deployment's dataset size.
 //
-// Representative run (1000-row dataset, 8 concurrent readers):
+// Representative run (1000-row dataset, 8 concurrent readers; v1.4.0
+// reference numbers in BENCHMARKS.md):
 //
-//	refresh=250µs   — readers starved, writers slowest (refresh dominates)
-//	refresh=1ms     — current default; measurable impact on writes
-//	refresh=5ms     — knee point on small DBs
-//	refresh=25ms    — writes nearly unimpeded, reads still <25ms stale
-//	refresh=100ms   — writes at full speed, reads at most 100ms stale
+//	refresh=250µs   — ~90 µs/write; readers starved, refresh dominates CPU
+//	refresh=1ms     — ~84 µs/write; previous default (raised to 50ms in v1.4)
+//	refresh=5ms     — ~79 µs/write; floor below which Open emits a warning
+//	refresh=25ms    — ~53 µs/write; knee of the curve on small DBs
+//	refresh=100ms   — ~11 µs/write; writes at full speed, reads ≤100ms stale
+//
+// The current package default is 50ms — between the 25ms and 100ms rows
+// above — chosen as the balance between read staleness and writer CPU
+// cost; see Config.ReplicaRefreshInterval and BENCHMARKS.md for the full
+// sweep and pprof-derived justification.
 //
 // Use with:
 //

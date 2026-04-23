@@ -118,13 +118,13 @@ type Config struct {
 	//
 	// Empirical guidance (from BenchmarkReplicaRefreshInterval on a
 	// 1 000-row dataset with 8 concurrent readers, measured on a
-	// 20-thread x86_64 box):
+	// 20-thread x86_64 box; v1.4.0 reference run, see BENCHMARKS.md):
 	//
-	//	refresh=250µs   ~83 µs/write   34 KB/op   (refresh dominates CPU)
-	//	refresh=1ms     ~75 µs/write   30 KB/op   (still 8× slower than 100ms)
-	//	refresh=5ms     ~72 µs/write   26 KB/op   (marginal improvement)
-	//	refresh=25ms    ~35 µs/write   14 KB/op   (knee of the curve)
-	//	refresh=100ms   ~10 µs/write   3.5 KB/op  (writes at full speed)
+	//	refresh=250µs   ~90 µs/write   34 KB/op   (refresh dominates CPU)
+	//	refresh=1ms     ~84 µs/write   29 KB/op   (previous default — 8× slower than 100ms)
+	//	refresh=5ms     ~79 µs/write   27 KB/op   (marginal improvement)
+	//	refresh=25ms    ~53 µs/write   20 KB/op   (knee of the curve)
+	//	refresh=100ms   ~11 µs/write   3.8 KB/op  (writes at full speed)
 	//
 	// The CPU cost scales with database size because the entire serialised
 	// image is memmoved into every replica per tick. On larger datasets

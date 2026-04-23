@@ -2,8 +2,11 @@
 /memdb
 /build/
 
-# Coverage reports
+# Coverage reports (repo root and nested under any sub-package — the
+# pprof capture tests in server/, replication/, etc. may write to a
+# local coverage/ directory when run from their own package directory).
 /coverage/
+**/coverage/
 coverage.out
 coverage.html
 
