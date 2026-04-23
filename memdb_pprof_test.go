@@ -311,6 +311,37 @@ func TestPProf_MixedReadWrite(t *testing.T) {
 	cfg.ReadPoolSize = runtime.GOMAXPROCS(0)
 	cfg.ReplicaRefreshInterval = 2 * time.Millisecond
 
+	runMixedPProf(t, cfg, dir, "pprof_mixed")
+}
+
+// TestPProf_MixedReadWrite_DefaultRefresh is the apples-to-apples comparison
+// of the mixed workload using the package's production ReplicaRefreshInterval
+// default (currently 50 ms) instead of the aggressive 2 ms value that
+// TestPProf_MixedReadWrite uses.
+//
+// Motivation: the first round of pprof analysis attributed ~43% of CPU in
+// the 2 ms mixed profile to replicaRefreshLoop. This variant demonstrates
+// the cost of the default — which BenchmarkReplicaRefreshInterval showed
+// recovers nearly all of the writer throughput — so operators can compare
+// the two profiles side by side and understand the refresh-interval knob.
+func TestPProf_MixedReadWrite_DefaultRefresh(t *testing.T) {
+	dir := pprofOutputDir(t)
+
+	cfg := pprofConfig(t)
+	cfg.ReadPoolSize = runtime.GOMAXPROCS(0)
+	// Leave ReplicaRefreshInterval at zero so applyDefaults fills in the
+	// production default. This is what a real caller who sets ReadPoolSize
+	// without tuning the refresh interval will see in pprof.
+
+	runMixedPProf(t, cfg, dir, "pprof_mixed_default")
+}
+
+// runMixedPProf factors the common mixed-workload body used by both
+// TestPProf_MixedReadWrite and TestPProf_MixedReadWrite_DefaultRefresh so
+// the two variants produce strictly comparable profiles.
+func runMixedPProf(t *testing.T, cfg memdb.Config, dir, namePrefix string) {
+	t.Helper()
+
 	db, err := memdb.Open(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -326,10 +357,18 @@ func TestPProf_MixedReadWrite(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	time.Sleep(20 * time.Millisecond)
+	// Sleep long enough for the configured refresh interval to fire at
+	// least once so readers see the seeded rows when the timer starts.
+	// max(50ms, 2×interval) handles both the aggressive 2 ms variant and
+	// the 50 ms default.
+	warmup := 50 * time.Millisecond
+	if cfg.ReplicaRefreshInterval > 0 && 2*cfg.ReplicaRefreshInterval > warmup {
+		warmup = 2 * cfg.ReplicaRefreshInterval
+	}
+	time.Sleep(warmup)
 
-	cpuPath := filepath.Join(dir, "pprof_mixed.cpu.prof")
-	heapPath := filepath.Join(dir, "pprof_mixed.heap.prof")
+	cpuPath := filepath.Join(dir, namePrefix+".cpu.prof")
+	heapPath := filepath.Join(dir, namePrefix+".heap.prof")
 
 	const (
 		workDuration = 3 * time.Second
@@ -401,7 +440,8 @@ func TestPProf_MixedReadWrite(t *testing.T) {
 	}
 
 	w, r := writes.Load(), reads.Load()
-	t.Logf("mixed: %d writes, %d reads in %s (%.0f write/s, %.0f read/s)  cpu=%s  heap=%s",
+	t.Logf("%s (refresh=%s): %d writes, %d reads in %s (%.0f write/s, %.0f read/s)  cpu=%s  heap=%s",
+		namePrefix, cfg.ReplicaRefreshInterval,
 		w, r, time.Since(start),
 		float64(w)/time.Since(start).Seconds(),
 		float64(r)/time.Since(start).Seconds(),

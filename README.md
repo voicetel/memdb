@@ -188,8 +188,22 @@ type Config struct {
 	ReadPoolSize int
 
 	// How often the background goroutine refreshes replicas from the writer
-	// via sqlite3_serialize / sqlite3_deserialize.
-	// Only used when ReadPoolSize > 0. Default: 1ms.
+	// via sqlite3_serialize / sqlite3_deserialize. Shorter intervals yield
+	// fresher reads but copy the entire database into every replica on
+	// every tick — the cost scales with database size × ReadPoolSize.
+	//
+	// Empirical sweep (1 000-row dataset, 8 concurrent readers,
+	// BenchmarkReplicaRefreshInterval on a 20-thread x86_64 box):
+	//
+	//   refresh=250µs  ~83 µs/write  34 KB/op   refresh dominates CPU
+	//   refresh=1ms    ~75 µs/write  30 KB/op   8× slower writes than 100ms
+	//   refresh=5ms    ~72 µs/write  26 KB/op   marginal improvement
+	//   refresh=25ms   ~35 µs/write  14 KB/op   knee of the curve
+	//   refresh=100ms  ~10 µs/write  3.5 KB/op  writes at full speed
+	//
+	// Only used when ReadPoolSize > 0. Default: 50ms. Values below 5ms
+	// emit a warning at Open time because pprof traces attribute the
+	// majority of CPU to the refresh loop at those intervals.
 	ReplicaRefreshInterval time.Duration
 
 	// Called when a background flush fails.
@@ -1063,10 +1077,12 @@ making memdb's advantage even larger in practice.
 By default memdb pins all operations to a single connection. When `ReadPoolSize > 0`, `Query`
 and `QueryRow` are served from a channel-based pool of N independent in-memory replica
 databases, each refreshed via `sqlite3_serialize`/`sqlite3_deserialize` on a background
-ticker (`ReplicaRefreshInterval`, default 1 ms). Each replica is checked out exclusively for
-the duration of a query — `refresh()` blocks until all checked-out replicas are returned
-before calling `sqlite3_deserialize`, eliminating the open-cursor race. Reads may be at most
-one interval stale; writes and transactions always use the writer connection.
+ticker (`ReplicaRefreshInterval`, default **50 ms** — see the pprof-derived guidance in the
+`Config.ReplicaRefreshInterval` field doc; values below 5 ms emit a warning at Open time).
+Each replica is checked out exclusively for the duration of a query — `refresh()` blocks
+until all checked-out replicas are returned before calling `sqlite3_deserialize`,
+eliminating the open-cursor race. Reads may be at most one interval stale; writes and
+transactions always use the writer connection.
 
 | | 1 goroutine | 4 goroutines | 8 goroutines |
 |---|---|---|---|
