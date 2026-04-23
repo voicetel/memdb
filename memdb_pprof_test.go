@@ -145,7 +145,11 @@ func TestPProf_Writes(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestPProf_Writes_WAL is TestPProf_Writes with DurabilityWAL enabled so the
-// profile reveals WAL-specific overhead (gob encoding, fsync).
+// profile reveals WAL-specific overhead — the binary-format encoder plus
+// the per-write write(2)+fsync(2) syscall pair. Before v1.4 this path was
+// dominated by encoding/gob reflection (~25% of total CPU); the v1.4
+// binary format eliminated gob from the profile entirely, so the bulk of
+// CPU here is now the cgo boundary into SQLite and the fsync syscall.
 func TestPProf_Writes_WAL(t *testing.T) {
 	dir := pprofOutputDir(t)
 
