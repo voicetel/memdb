@@ -79,15 +79,8 @@ build: dirs ## Build the memdb CLI binary
 	$(GO) build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)
 	@echo -e "$(GREEN)✓ Build complete: $(BUILD_DIR)/$(BINARY_NAME)$(NC)"
 
-.PHONY: build-purego
-build-purego: dirs ## Build with the purego tag (no CGo, uses modernc/sqlite)
-	@echo -e "$(BLUE)Building $(BINARY_NAME) (purego)...$(NC)"
-	CGO_ENABLED=0 $(GO) build -tags purego $(LDFLAGS) \
-		-o $(BUILD_DIR)/$(BINARY_NAME)-purego $(CMD_DIR)
-	@echo -e "$(GREEN)✓ Purego build complete: $(BUILD_DIR)/$(BINARY_NAME)-purego$(NC)"
-
 .PHONY: build-prod
-build-prod: dirs ## Build optimised production binary (CGo, stripped)
+build-prod: dirs ## Build optimised production binary (stripped)
 	@echo -e "$(BLUE)Building production $(BINARY_NAME)...$(NC)"
 	CGO_ENABLED=1 $(GO) build $(LDFLAGS) \
 		-o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)
@@ -655,8 +648,7 @@ help: ## Show this help message
 	@echo ""
 	@echo -e "$(YELLOW)Build:$(NC)"
 	@echo "  build              Build the memdb CLI binary"
-	@echo "  build-purego       Build with purego tag (no CGo, uses modernc/sqlite)"
-	@echo "  build-prod         Build optimised production binary"
+	@echo "  build-prod         Build optimised production binary (stripped)"
 	@echo "  build-all          Build for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64"
 	@echo "  run                Build and run the server with default options"
 	@echo "  run-args           Run with custom args (ARGS=\"serve --file /tmp/x.db\")"
@@ -746,7 +738,6 @@ help: ## Show this help message
 	@echo "  clean-all          Deep clean including module and build caches"
 	@echo ""
 	@echo -e "$(YELLOW)Environment Variables:$(NC)"
-	@echo "  CGO_ENABLED        1 (default) for cgo, 0 for purego build"
 	@echo "  GOOS               Target OS  (linux, darwin)"
 	@echo "  GOARCH             Target arch (amd64, arm64)"
 	@echo "  TEST               Test name for test-specific target"

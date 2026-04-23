@@ -1,5 +1,3 @@
-//go:build !purego
-
 package raft
 
 import (

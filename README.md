@@ -22,7 +22,6 @@ Think Redis RDB+AOF semantics with full SQL query power — in a single Go impor
 - **Raft replication** — strong-consistency multi-node replication via `hashicorp/raft` over mutual TLS; any node accepts writes and transparently forwards to the leader
 - **Structured logging** — `log/slog` throughout with syslog, JSON, and text handlers; `hclog` bridge routes Raft internals through the same pipeline
 - **PostgreSQL wire protocol** — optional server mode accepts any Postgres client or ORM; SSL negotiation, correct `ErrorResponse` severity field
-- **Pure Go build tag** — swap `mattn/go-sqlite3` for `modernc.org/sqlite` with `-tags purego`
 - **ORM compatible** — exposes `*sql.DB` for use with `sqlx`, `bun`, `ent`, `sqlc`, GORM, and others
 
 ---
@@ -35,25 +34,27 @@ Think Redis RDB+AOF semantics with full SQL query power — in a single Go impor
 go get github.com/voicetel/memdb
 ```
 
-CGo is required by default (via `mattn/go-sqlite3`). A C compiler must be present:
+memdb uses `mattn/go-sqlite3` under the hood, which requires CGo. A C compiler
+must be present at build time:
 
 ```bash
-# Linux
+# Linux (Debian/Ubuntu)
 apt install gcc
+
+# Linux (Alpine / musl)
+apk add gcc musl-dev
 
 # macOS
 xcode-select --install
+
+# Windows
+# Install MinGW-w64, e.g. via MSYS2: pacman -S mingw-w64-x86_64-gcc
 ```
 
-For a pure Go build with no CGo requirement:
-
-```bash
-go build -tags purego ./...
-```
-
-> **Note:** The `purego` tag uses `modernc.org/sqlite` which does not expose the native backup API.
-> Snapshot flush and restore are unavailable in purego builds. All other functionality is identical;
-> performance is approximately 10-20% lower.
+`CGO_ENABLED=1` is the Go default on Linux and macOS for native builds, so no
+extra environment variable is required unless you have explicitly disabled it.
+Cross-compiling to a different OS/arch requires a matching C toolchain — see
+the [Cross-Compilation](#cross-compilation) section below.
 
 ### As a CLI binary (from source)
 
@@ -65,12 +66,6 @@ cd memdb
 
 make build          # build ./build/memdb
 make install        # install to /usr/local/bin
-```
-
-For a purego (no CGo) binary:
-
-```bash
-make build-purego   # build ./build/memdb-purego
 ```
 
 For all supported platforms at once:
@@ -912,9 +907,8 @@ memdb restore -h
 make help               # list all targets
 
 # Build
-make build              # CGo binary → ./build/memdb
-make build-purego       # purego binary → ./build/memdb-purego
-make build-prod         # optimised production binary
+make build              # memdb binary → ./build/memdb
+make build-prod         # optimised production binary (stripped)
 make build-all          # all platforms (linux/darwin × amd64/arm64)
 
 # Test
@@ -969,14 +963,14 @@ make tag VERSION_TAG=v1.2.0
 
 ### Operating Systems
 
-| OS | CGo (default) | Pure Go (`-tags purego`) |
-|---|---|---|
-| Linux (glibc) | ✅ | ✅ |
-| Linux (musl/Alpine) | ⚠️ Needs `gcc musl-dev` | ✅ |
-| macOS | ✅ | ✅ |
-| Windows | ⚠️ Needs MinGW-w64 | ✅ |
-| FreeBSD | ✅ | ✅ |
-| WASM / wasip1 | ❌ | ✅ |
+| OS | Status |
+|---|---|
+| Linux (glibc) | ✅ |
+| Linux (musl/Alpine) | ✅ — needs `gcc musl-dev` |
+| macOS | ✅ |
+| Windows | ✅ — needs MinGW-w64 |
+| FreeBSD | ✅ |
+| WASM / wasip1 | ❌ — CGo and `mattn/go-sqlite3` are not available on `wasip1` |
 
 ### Architectures
 
@@ -984,7 +978,9 @@ make tag VERSION_TAG=v1.2.0
 
 ### Cross-Compilation
 
-CGo makes cross-compilation require a cross C toolchain. The recommended approach for CI is Docker with `tonistiigi/xx`:
+CGo requires a cross C toolchain that matches the target OS/arch. The
+recommended approach for CI is Docker with `tonistiigi/xx`, which installs
+the correct cross toolchain automatically:
 
 ```dockerfile
 FROM --platform=$BUILDPLATFORM golang:1.24 AS builder
@@ -994,7 +990,10 @@ RUN xx-apt install -y gcc libc6-dev
 RUN CGO_ENABLED=1 xx-go build -o /app ./...
 ```
 
-For cross-compilation without Docker, use the `-tags purego` build tag to eliminate the CGo dependency entirely.
+For local development across architectures, native builds on the target host
+are simplest. `make build-all` already covers the four most common targets
+(linux/amd64, linux/arm64, darwin/amd64, darwin/arm64) and expects the
+matching C toolchain to be available on the build host.
 
 ---
 
@@ -1244,7 +1243,6 @@ go test -bench='^BenchmarkCompare_ConcurrentRead$' -benchtime=5s -cpu=1,4,8 .
 | Change notifications | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
 | Replication | ✅ Raft | ❌ | ❌ | ❌ | ✅ | ✅ Raft |
 | Postgres wire | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Pure Go option | ✅ | ✅ | ✅ | ✅ | N/A | ❌ |
 
 ---
 
@@ -1376,46 +1374,55 @@ has a doc comment citing its source so the audit trail stays clear. The
 
 ```
 memdb/
-├── memdb.go              # Public API: Open, Exec, Query, Flush, Close, ExecDirect
-├── backend.go            # Backend interface + LocalBackend + WrapBackend adapter
-├── backup.go             # SQLite Online Backup API; Serialize/Restore (cgo)
-├── backup_purego.go      # Backup stubs for purego build
-├── replica.go            # Channel-based read replica pool (cgo)
-├── replica_purego.go     # Replica stubs for purego build
-├── driver.go             # mattn driver registration + raw conn access (cgo)
-├── driver_purego.go      # modernc driver registration (purego)
-├── driver_shared.go      # fnv32 hash shared between cgo and purego builds
-├── config.go             # Config struct, defaults, validation
-├── errors.go             # Sentinel errors
-├── wal.go                # Write-ahead log: append, replay, truncate
-├── memdb_test.go         # Unit and integration tests
-├── memdb_extra_test.go   # Additional unit tests
-├── memdb_bench_test.go   # Throughput benchmarks
-├── memdb_compare_test.go # memdb vs file SQLite comparison benchmarks
+├── memdb.go                # Public API: Open, Exec, Query, Flush, Close, ExecDirect
+├── backend.go              # Backend interface + LocalBackend + WrapBackend adapter
+├── backup.go               # SQLite Online Backup API; Serialize/Restore
+├── replica.go              # Channel-based read replica pool
+├── driver.go               # mattn/go-sqlite3 driver registration + raw conn access
+├── driver_shared.go        # fnv32 hash used for driver-registration keys
+├── config.go               # Config struct, defaults, validation
+├── errors.go               # Sentinel errors
+├── wal.go                  # Write-ahead log: binary v1 format, replay, truncate
+├── memdb_test.go           # Unit and integration tests
+├── memdb_extra_test.go     # Additional unit tests
+├── memdb_bench_test.go     # Throughput benchmarks
+├── memdb_compare_test.go   # memdb vs file SQLite comparison benchmarks
+├── memdb_pprof_test.go     # pprof-capturing scenarios (MEMDB_PPROF=1 gated)
+├── wal_binary_test.go      # Binary WAL format: round-trip, backwards-compat, corruption
 ├── logging/
-│   ├── logging.go        # NewTextHandler, NewJSONHandler
-│   ├── syslog.go         # NewSyslogHandler (Linux/macOS)
-│   ├── syslog_stub.go    # NewSyslogHandler stub (Windows/Plan9)
-│   └── hclog.go          # NewHCLogAdapter — hclog.Logger → *slog.Logger bridge
+│   ├── logging.go          # NewTextHandler, NewJSONHandler
+│   ├── syslog.go           # NewSyslogHandler (Linux/macOS)
+│   ├── syslog_stub.go      # NewSyslogHandler stub (Windows/Plan9)
+│   └── hclog.go            # NewHCLogAdapter — hclog.Logger → *slog.Logger bridge
+├── profiling/
+│   ├── profiling.go        # net/http/pprof wrapper + Capture* helpers
+│   └── profiling_test.go   # Unit tests for StartServer and capture helpers
+├── tuning/
+│   ├── tuning.go           # Closed-form Recommend() for ReadPoolSize + interval
+│   ├── tuning_test.go      # Boundary, monotonicity, calibration-drift tests
+│   └── example_test.go     # Runnable doc examples with golden output
 ├── server/
-│   ├── server.go         # PostgreSQL wire protocol server (TLS, BasicAuth, Unix socket)
-│   └── handler.go        # Simple Query, DML dispatch, SSL negotiation, wire helpers
+│   ├── server.go           # PostgreSQL wire protocol server (TLS, BasicAuth, Unix socket)
+│   ├── handler.go          # Simple Query, DML dispatch, SSL negotiation, wire helpers
+│   └── server_pprof_test.go # Server pprof-capture scenarios (MEMDB_PPROF=1 gated)
 ├── replication/
-│   ├── replication.go    # WALEntry type (shared between packages)
+│   ├── replication.go      # WALEntry type (shared between packages)
 │   └── raft/
-│       ├── raft.go       # FSM: Apply, Snapshot, Restore; gob type registry
-│       ├── node.go       # Node: NewNode, Exec, forward, AddVoter, Shutdown
-│       ├── tls.go        # tlsStreamLayer — TLS StreamLayer for hashicorp/raft
-│       ├── forwarder.go  # Write-forwarding RPC server (leader side, WaitGroup tracked)
-│       ├── rpc.go        # ForwardRequest/Response wire protocol; channel-based ConnPool
-│       └── store.go      # Crash-safe fileLogStore + fileStableStore
+│       ├── raft.go         # FSM: Apply, Snapshot, Restore; gob type registry
+│       ├── node.go         # Node: NewNode, Exec, forward, AddVoter, Shutdown
+│       ├── tls.go          # tlsStreamLayer — TLS StreamLayer for hashicorp/raft
+│       ├── forwarder.go    # Write-forwarding RPC server (leader side, WaitGroup tracked)
+│       ├── rpc.go          # ForwardRequest/Response wire protocol; channel-based ConnPool
+│       ├── store.go        # Crash-safe fileLogStore + fileStableStore
+│       └── replication_integrity_test.go # 3-node end-to-end convergence / failover
 ├── backends/
-│   ├── local.go          # Atomic local file backend
-│   ├── compressed.go     # zstd compression wrapper
-│   └── encrypted.go      # AES-256-GCM encryption wrapper
-├── Makefile              # Build, test, lint, benchmark, and release targets
+│   ├── local.go            # Atomic local file backend
+│   ├── compressed.go       # zstd compression wrapper
+│   └── encrypted.go        # AES-256-GCM encryption wrapper
+├── BENCHMARKS.md           # v1.4.0 benchmark report with pprof analysis
+├── Makefile                # Build, test, lint, benchmark, profiling, release
 └── cmd/
-    └── memdb/            # CLI: serve, snapshot, restore
+    └── memdb/              # CLI: serve [--pprof], snapshot, restore
 ```
 
 ---
