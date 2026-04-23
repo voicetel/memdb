@@ -96,7 +96,7 @@ func (h *handler) handleStartup() error {
 	// psql and most drivers send this before the real startup message.
 	// We decline TLS upgrade at this layer (TLS should be configured on
 	// the listener itself) by responding with 'N'.
-	magic := int(binary.BigEndian.Uint32(buf[0:4]))
+	magic := int(binary.BigEndian.Uint32(buf[4:8]))
 	if magic == 80877103 {
 		if err := h.writeRaw([]byte{'N'}); err != nil {
 			return err
