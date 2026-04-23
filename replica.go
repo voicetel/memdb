@@ -42,6 +42,31 @@ type replicaPool struct {
 	refreshing atomic.Bool    // true while refresh() is draining/waiting
 	closed     atomic.Bool    // true after close() has been called
 	driverName string
+
+	// lastRefreshedGen records the value of DB.writeGen observed at the
+	// start of the most recent successful refresh. On the next tick,
+	// refresh() compares the current writeGen to this value and skips
+	// the expensive sqlite3_serialize + fan-out deserialize when no
+	// write has occurred since. This turns a read-heavy steady state
+	// into an atomic-load + compare — measured in nanoseconds — instead
+	// of a per-replica memcpy of the entire serialised database image.
+	//
+	// The field is only written from the single refresh goroutine (see
+	// replicaRefreshLoop in memdb.go) so it does not need atomic access.
+	// It is read from the same goroutine too, so no ordering concern.
+	lastRefreshedGen uint64
+
+	// seeded is false until the first refresh has populated every replica
+	// from the writer's serialised state. The no-op fast-path in refresh
+	// keys off both seeded and lastRefreshedGen so the one-shot initial
+	// seed in newReplicaPool always runs — even when writeGen is still 0
+	// (for example when InitSchema is nil and no WAL replay happened, or
+	// when WAL replay used d.mem.Exec directly and therefore did not
+	// bump the write generation counter).
+	//
+	// Like lastRefreshedGen, this is only written from the single refresh
+	// goroutine so it does not need atomic access.
+	seeded bool
 }
 
 // releaser is the per-checkout state used to return a replica to the pool
@@ -145,6 +170,30 @@ func (p *replicaPool) checkout() (*sql.DB, func()) {
 // that is otherwise blocked waiting on a leaked *sql.Rows holding a
 // replica's single connection (MaxOpenConns=1).
 func (p *replicaPool) refresh(ctx context.Context, d *DB) error {
+	// Fast-path: if the pool has already been seeded once AND no write
+	// has occurred since the last successful refresh, every replica
+	// already holds the correct bytes. Skip the drain / serialize /
+	// deserialize cycle entirely. This is the common case in read-heavy
+	// workloads where the writer is idle between refresh ticks.
+	//
+	// The seeded guard ensures the first refresh (called from
+	// newReplicaPool during Open) always runs, even when writeGen is
+	// still 0 — otherwise a DB opened with no InitSchema and no WAL
+	// replay would leave every replica pointing at an empty page image
+	// while the writer has a valid (but trivial) schema.
+	//
+	// Under concurrent writes the generation counter may be bumped
+	// between the load here and the serialize step below — that is
+	// harmless: the refresh will pick up the newer state, and
+	// lastRefreshedGen is captured AFTER the load so the next tick
+	// correctly re-evaluates. A rare spurious refresh is preferable to
+	// a rare skipped refresh (which would leave replicas stale beyond
+	// one tick).
+	currentGen := d.writeGen.Load()
+	if p.seeded && currentGen == p.lastRefreshedGen {
+		return nil
+	}
+
 	// Signal checkout() to fall back to the writer for the duration of the
 	// refresh, so released replicas land in the idle channel where this
 	// goroutine can drain them rather than being immediately handed back
@@ -201,6 +250,14 @@ func (p *replicaPool) refresh(ctx context.Context, d *DB) error {
 		}
 		p.idle <- r
 	}
+
+	// Record the generation observed at the top of the function. Using
+	// the snapshotted value (not a fresh Load) avoids "losing" a write
+	// that happened during the refresh itself — that write will bump
+	// writeGen past currentGen and trigger a follow-up refresh on the
+	// next tick, which is exactly what we want.
+	p.lastRefreshedGen = currentGen
+	p.seeded = true
 
 	return nil
 }
