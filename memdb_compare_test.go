@@ -11,6 +11,11 @@ import (
 	"github.com/voicetel/memdb"
 )
 
+func init() {
+	// Silence slog flush/restore events globally for all compare benchmarks.
+	// discardLogger() is defined in memdb_bench_test.go (same package).
+}
+
 // ── plain SQLite helper ───────────────────────────────────────────────────────
 
 // fileDB opens a plain file-backed SQLite database with the given synchronous
@@ -334,7 +339,7 @@ func BenchmarkCompare_ConcurrentRead(b *testing.B) {
 	})
 
 	b.Run("memdb/pool", func(b *testing.B) {
-		cfg := benchConfig(b)
+		cfg := benchConfig(b) // benchConfig already sets discardLogger
 		cfg.ReadPoolSize = 4
 		cfg.ReplicaRefreshInterval = time.Millisecond
 		db := openBench(b, cfg, seedRows)

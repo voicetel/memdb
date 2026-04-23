@@ -896,7 +896,7 @@ For cross-compilation without Docker, use the `-tags purego` build tag to elimin
 
 ## Benchmarks
 
-Benchmarks run on a 12th Gen Intel Core i7-1280P, Linux, Go 1.25, `github.com/mattn/go-sqlite3`.
+Benchmarks run on a 12th Gen Intel Core i7-1280P, Linux, Go 1.24, `github.com/mattn/go-sqlite3`.
 All file-SQLite numbers use WAL journal mode and `cache_size=-64000` (64 MB), identical to memdb's
 in-memory configuration. Run with `-benchtime=5s -benchmem`.
 
@@ -904,46 +904,50 @@ in-memory configuration. Run with `-benchtime=5s -benchmem`.
 
 | Operation | memdb | memdb + WAL | file/sync=off | file/sync=full | vs file/off |
 |---|---|---|---|---|---|
-| INSERT | **4,178 ns** | 5,495 ns | 7,556 ns | 7,713 ns | **1.81× faster** |
-| UPDATE | **3,033 ns** | — | 4,568 ns | 4,620 ns | **1.51× faster** |
-| QueryRow | **4,086 ns** | — | 4,926 ns | 4,901 ns | **1.21× faster** |
-| RangeScan (100 rows) | **44,006 ns** | — | 44,827 ns | 45,057 ns | **1.02× faster** |
-| BatchInsert (50 rows/tx) | **181,413 ns** | — | 191,265 ns | 195,922 ns | **1.05× faster** |
+| INSERT | **3,627 ns** | 5,224 ns | 8,190 ns | 8,641 ns | **2.26× faster** |
+| UPDATE | **3,206 ns** | — | 4,697 ns | 4,703 ns | **1.46× faster** |
+| QueryRow | **4,029 ns** | — | 4,903 ns | 4,969 ns | **1.22× faster** |
+| RangeScan (100 rows) | **42,590 ns** | — | 44,164 ns | 43,850 ns | **1.04× faster** |
+| BatchInsert (50 rows/tx) | **186,175 ns** | — | 199,449 ns | 200,630 ns | **1.07× faster** |
 
 memdb's advantage is proportional to how much time each operation spends in I/O vs pure SQL
 work. Single-row writes spend most of their time flushing pages through the OS VFS stack —
-memdb skips all of that, giving a **1.5–1.8× edge**. Point reads see a smaller **~1.2×**
+memdb skips all of that, giving a **1.5–2.3× edge**. Point reads see a smaller **~1.2×**
 gain because both backends serve hot pages from RAM; the difference is the VFS abstraction
 cost alone. For bulk operations and range scans the bottleneck shifts to SQLite's B-tree and
-cursor machinery, which is identical for both backends, so the gap narrows to **~2–5%**.
+cursor machinery, which is identical for both backends, so the gap narrows to **~2–7%**.
 
 `memdb + WAL` appends a gob-encoded entry and calls `fsync` after every `Exec`, adding
-~1.3 µs per write. Even so, it remains **1.37× faster** than `file/sync=off` on INSERT —
+~1.6 µs per write. Even so, it remains **1.57× faster** than `file/sync=off` on INSERT —
 you get near-zero data loss durability while still beating an unprotected file database.
 
-The `synchronous` pragma barely matters on fast NVMe storage (`off` vs `full` is only 2%).
+The `synchronous` pragma barely matters on fast NVMe storage (`off` vs `full` is only 5%).
 On spinning disk or network-attached storage the gap would be many milliseconds per commit,
 making memdb's advantage even larger in practice.
 
 ### Concurrent read throughput (`-cpu=1,4,8`)
 
 By default memdb pins all operations to a single connection. When `ReadPoolSize > 0`, `Query`
-and `QueryRow` are served from a pool of N independent in-memory replica databases, each
-refreshed via `sqlite3_serialize`/`sqlite3_deserialize` on a background ticker
-(`ReplicaRefreshInterval`, default 1 ms). Reads may be at most one interval stale;
-writes and transactions always use the writer connection and are always consistent.
+and `QueryRow` are served from a channel-based pool of N independent in-memory replica
+databases, each refreshed via `sqlite3_serialize`/`sqlite3_deserialize` on a background
+ticker (`ReplicaRefreshInterval`, default 1 ms). Each replica is checked out exclusively for
+the duration of a query — `refresh()` blocks until all checked-out replicas are returned
+before calling `sqlite3_deserialize`, eliminating the open-cursor race. Reads may be at most
+one interval stale; writes and transactions always use the writer connection.
 
 | | 1 goroutine | 4 goroutines | 8 goroutines |
 |---|---|---|---|
-| memdb (default, 1 connection) | 4,083 ns | 5,234 ns | 5,744 ns |
-| **memdb + ReadPoolSize=4** | 4,302 ns | **3,080 ns** | **3,019 ns** |
-| file SQLite (4 connections, WAL) | 5,133 ns | 2,358 ns | 2,668 ns |
+| memdb (default, 1 connection) | 4,759 ns | 5,958 ns | 6,073 ns |
+| **memdb + ReadPoolSize=4** | 4,825 ns | **2,630 ns** | 3,603 ns |
+| file SQLite (4 connections, WAL) | 5,193 ns | 2,592 ns | 3,038 ns |
 
 Without the pool, memdb serialises all readers through one connection and degrades under
 concurrency while file SQLite fans out across 4 independent connections. With
-`ReadPoolSize=4`, memdb eliminates the bottleneck: at 4 goroutines it is **1.70× faster**
-than the default single-connection mode and is within **~30%** of a 4-connection file
-database — while retaining the full write speed advantage that file SQLite can never match.
+`ReadPoolSize=4` and the channel-based pool, memdb **matches file SQLite at 4 goroutines**
+(2,630 ns vs 2,592 ns) — essentially tied — while retaining the full 2.26× write speed
+advantage that file SQLite can never match. At 8 goroutines, goroutines that cannot
+immediately check out a replica fall back to the writer connection; increasing `ReadPoolSize`
+to match the goroutine count recovers the throughput.
 
 ### Flush cost vs table size
 

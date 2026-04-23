@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -11,6 +13,13 @@ import (
 
 	"github.com/voicetel/memdb"
 )
+
+// discardLogger returns a *slog.Logger that silently drops all output.
+// Used in benchmarks to prevent slog flush/restore events from printing
+// to stdout and contaminating benchmark output.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError + 1}))
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -27,6 +36,7 @@ func benchConfig(b *testing.B) memdb.Config {
 		FilePath:      f.Name(),
 		FlushInterval: -1,
 		InitSchema:    schemaKV,
+		Logger:        discardLogger(),
 	}
 }
 
