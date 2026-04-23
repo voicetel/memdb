@@ -100,25 +100,53 @@ func newThreeNodeCluster(t *testing.T) *threeNodeCluster {
 		tlsCfg: tlsCfg,
 	}
 
-	if err := cluster.waitForLeader(10 * time.Second); err != nil {
+	if err := cluster.waitForLeader(20 * time.Second); err != nil {
 		t.Fatal(err)
 	}
 	return cluster
 }
 
-// waitForLeader blocks until any node reports leadership or the timeout
-// elapses.
+// waitForLeader blocks until the cluster has fully converged on a leader:
+// exactly one node reports IsLeader() == true AND every node reports a
+// non-empty LeaderAddr(). Waiting only for IsLeader (the previous
+// behaviour) returned as soon as the winning node entered the leader
+// state, which on a loaded test host (parallel -race runs sharing CPU
+// with many other Raft clusters in the same binary) meant the followers
+// had not yet received the first heartbeat and would flake any
+// subsequent Exec/forwarding call.
+//
+// The timeout is generous because the heartbeat / election timeouts
+// used in tests are 500 ms and under CPU starvation elections can take
+// several cycles to converge. This is a test helper, not a production
+// code path, so a larger budget is acceptable.
 func (c *threeNodeCluster) waitForLeader(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		leaders := 0
+		allHaveLeaderAddr := true
 		for _, n := range c.nodes {
 			if n.IsLeader() {
-				return nil
+				leaders++
 			}
+			if n.LeaderAddr() == "" {
+				allHaveLeaderAddr = false
+			}
+		}
+		if leaders == 1 && allHaveLeaderAddr {
+			return nil
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return fmt.Errorf("no leader elected within %s", timeout)
+	// Build a diagnostic snapshot so a flaky run in CI is easier to
+	// triage from the test output alone.
+	var state []string
+	for i, n := range c.nodes {
+		state = append(state,
+			fmt.Sprintf("node-%d{isLeader=%t leaderAddr=%q}",
+				i+1, n.IsLeader(), n.LeaderAddr()))
+	}
+	return fmt.Errorf("cluster did not converge on a single leader within %s: %v",
+		timeout, state)
 }
 
 // leader returns the current leader node (or nil if none). Callers that
