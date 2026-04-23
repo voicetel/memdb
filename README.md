@@ -233,8 +233,10 @@ const (
 	// On startup: snapshot is loaded, then WAL is replayed.
 	DurabilityWAL
 
-	// DurabilitySync — every write flushed to disk immediately.
-	// Equivalent to a regular file-backed SQLite. Slowest.
+	// DurabilitySync — every write appended to the WAL AND a full
+	// backend snapshot is flushed before Exec returns. Slowest mode;
+	// provides zero-loss durability equivalent to a regular file-backed
+	// SQLite configured with synchronous=FULL.
 	DurabilitySync
 )
 ```
@@ -242,8 +244,15 @@ const (
 | Mode | Loss Window | Write Latency | Use Case |
 |---|---|---|---|
 | `DurabilityNone` | Up to `FlushInterval` | Lowest | Caches, rate limiters, ephemeral state |
-| `DurabilityWAL` | Milliseconds | Low | Session stores, feature flags, analytics |
-| `DurabilitySync` | None | Higher | Audit logs, financial state |
+| `DurabilityWAL` | Milliseconds (fsync per write, WAL replay on restart) | Low | Session stores, feature flags, analytics |
+| `DurabilitySync` | None (WAL append + full backend flush per write) | Highest | Audit logs, financial state |
+
+Context-aware variants are available for all three modes: `ExecContext`,
+`QueryContext`, and `QueryRowContext` thread a `context.Context` into the
+underlying `database/sql` call and — for `DurabilitySync` — bound the
+worst-case latency of the synchronous backend flush. Prefer the context
+variants in any code path where a caller-supplied deadline should be
+honoured.
 
 ---
 
@@ -687,6 +696,36 @@ if err := node.Shutdown(); err != nil {
 }
 ```
 
+### Replication Testing
+
+The `replication/raft` package ships with an extensive end-to-end integrity
+suite (`replication_integrity_test.go`) that brings up a real three-node
+cluster on loopback ports for every test. Each test asserts byte-level
+equality of every node's FSM log — the same property Raft guarantees on
+paper — so any corruption, duplication, or reordering in the wire, log
+store, or FSM path is caught immediately.
+
+| Test | What it verifies |
+|---|---|
+| `TestReplication_AllNodesConverge` | Every committed entry is applied on every node in the same order |
+| `TestReplication_WriteThroughFollower` | Follower-submitted writes are forwarded and preserve global log order |
+| `TestReplication_ConcurrentWriters` | 8 goroutines × 25 writes produce identical FSM state on every node with no duplicates or drops |
+| `TestReplication_LeaderRestart` | Cluster re-elects and keeps replicating after the leader is shut down |
+| `TestReplication_HighVolume_NoCorruption` | 500-entry soak with 6 argument types exercising every gob-registered scalar |
+| `TestReplication_Snapshot_RestoresCleanly` | 10 000 entries force multiple snapshot cycles without divergence |
+| `TestReplication_NotLeader_Returned` | Writes fail cleanly with `ErrNotLeader` when forwarding is unavailable |
+| `TestReplication_StateAPIs` | `Stats`, `IsLeader`, `LeaderAddr` remain safe and consistent |
+| `TestReplication_Shutdown_Ordering` | Reverse-order cluster shutdown is idempotent and does not deadlock |
+| `TestReplication_ForwardingReconnect` | Follower's forwarding pool recovers across a leadership change |
+| `TestReplication_AtomicCommit` | Post-`Exec` convergence window is bounded and logged |
+
+Run them with the race detector:
+
+```bash
+make test-replication-integrity   # full suite (~10 s with -race)
+make test-replication-soak        # high-volume soak + 10k-entry snapshot
+```
+
 ---
 
 ## Server Mode (PostgreSQL Wire Protocol)
@@ -733,6 +772,80 @@ srv := server.New(db, server.Config{
 
 ---
 
+## Profiling (pprof)
+
+memdb ships with a small `profiling` package that wraps `net/http/pprof` and
+provides helpers for capturing CPU, heap, mutex, and block profiles from
+inside tests or benchmarks.
+
+### HTTP endpoint from the CLI
+
+The `serve` sub-command exposes all standard pprof endpoints when started
+with the `--pprof` flag:
+
+```bash
+memdb serve \
+  --file /var/lib/myapp/data.db \
+  --addr 127.0.0.1:5433 \
+  --pprof 127.0.0.1:6060 \
+  --pprof-mutex-fraction 100 \
+  --pprof-block-rate 10000
+```
+
+Then point `go tool pprof` at the server:
+
+```bash
+go tool pprof -http=: http://127.0.0.1:6060/debug/pprof/heap
+go tool pprof -http=: http://127.0.0.1:6060/debug/pprof/profile?seconds=30
+go tool pprof -http=: http://127.0.0.1:6060/debug/pprof/mutex
+go tool pprof -http=: http://127.0.0.1:6060/debug/pprof/block
+```
+
+The listener defaults to **loopback only** — pprof exposes full heap contents
+and should never be bound to a public address without an explicit threat
+model.
+
+### Programmatic use
+
+```go
+import "github.com/voicetel/memdb/profiling"
+
+srv, err := profiling.StartServer(profiling.Config{
+    Addr:                 "127.0.0.1:6060",
+    MutexProfileFraction: 100,   // sample ~1% of mutex contention
+    BlockProfileRate:     10000, // 10 µs blocking threshold
+})
+if err != nil { log.Fatal(err) }
+defer srv.Close()
+```
+
+`profiling.CaptureCPUProfile`, `profiling.CaptureHeapProfile`, and
+`profiling.CaptureNamedProfile` write profiles to disk for the duration of a
+single function call — intended for use in integration tests and long-running
+benchmarks.
+
+### Capture targets
+
+A set of `make` targets runs representative workloads and writes profiles to
+`./coverage/pprof/`:
+
+```bash
+make pprof              # run all pprof-capturing scenarios
+make pprof-writes       # single-writer INSERT workload
+make pprof-reads        # concurrent read workload (replica pool)
+make pprof-mixed        # mixed read/write workload
+make pprof-flush        # flush path at 50 000 rows
+make pprof-wal          # DurabilityWAL writes
+make bench-pprof        # benchmarks with -cpuprofile / -memprofile / -mutex / -block
+make pprof-view PROF=./coverage/pprof/pprof_writes.cpu.prof
+```
+
+The underlying tests live in `memdb_pprof_test.go` and are gated behind the
+`MEMDB_PPROF=1` environment variable so the default `go test ./...` run never
+writes profile artefacts.
+
+---
+
 ## CLI
 
 Build and install the CLI with `make install`, then:
@@ -740,6 +853,9 @@ Build and install the CLI with `make install`, then:
 ```bash
 # Start the PostgreSQL wire-protocol server
 memdb serve --file /var/lib/myapp/data.db --addr 127.0.0.1:5433 --flush 30s
+
+# Start the server with pprof on loopback (:6060)
+memdb serve --file /var/lib/myapp/data.db --pprof 127.0.0.1:6060
 
 # Force a snapshot flush to disk
 memdb snapshot --file /var/lib/myapp/data.db
@@ -775,10 +891,25 @@ make test-ci            # vet + lint + race + coverage threshold (CI pipeline)
 make test-smoke         # quick open/write/flush/restore sanity check
 make test-specific TEST=TestFlushAndRestore  # run one test
 
+# Replication integrity & profiling
+make test-replication-integrity  # 3-node end-to-end Raft convergence/failover
+make test-replication-soak       # high-volume soak + 10k-entry snapshot
+make test-profiling              # profiling package unit tests
+
 # Benchmarks
 make bench              # all benchmarks, 5 s each
 make bench-compare      # memdb vs file SQLite comparison
 make bench-concurrency  # concurrent reads at -cpu=1,4,8
+make bench-pprof        # benchmarks with CPU/mem/mutex/block pprof capture
+
+# Profiling
+make pprof              # capture all pprof scenarios → ./coverage/pprof
+make pprof-writes       # single-writer INSERT workload
+make pprof-reads        # concurrent replica-pool reads
+make pprof-mixed        # mixed read/write workload
+make pprof-flush        # flush path at 50k rows
+make pprof-wal          # DurabilityWAL writes
+make pprof-view PROF=<file>  # open a profile in the pprof web UI
 
 # Code quality
 make check              # fmt-check + vet + lint
