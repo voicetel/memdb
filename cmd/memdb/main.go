@@ -15,6 +15,7 @@ import (
 
 	"github.com/voicetel/memdb"
 	"github.com/voicetel/memdb/logging"
+	"github.com/voicetel/memdb/profiling"
 	"github.com/voicetel/memdb/server"
 )
 
@@ -30,6 +31,12 @@ func main() {
 	serveFile := serveCmd.String("file", "memdb.db", "path to SQLite snapshot file")
 	serveAddr := serveCmd.String("addr", "127.0.0.1:5433", "listen address (TCP or unix://path)")
 	serveFlush := serveCmd.Duration("flush", 30*time.Second, "flush interval")
+	servePprof := serveCmd.String("pprof", "",
+		"enable net/http/pprof on the given address (e.g. 127.0.0.1:6060); empty disables")
+	servePprofMutex := serveCmd.Int("pprof-mutex-fraction", 0,
+		"mutex profile sampling fraction (see runtime.SetMutexProfileFraction); 0 disables")
+	servePprofBlock := serveCmd.Int("pprof-block-rate", 0,
+		"block profile sampling rate in nanoseconds (see runtime.SetBlockProfileRate); 0 disables")
 
 	snapCmd := flag.NewFlagSet("snapshot", flag.ExitOnError)
 	snapFile := snapCmd.String("file", "memdb.db", "path to SQLite snapshot file")
@@ -49,7 +56,8 @@ func main() {
 			slog.Error("serve parse flags", "error", err)
 			os.Exit(1)
 		}
-		runServe(*serveFile, *serveAddr, *serveFlush)
+		runServe(*serveFile, *serveAddr, *serveFlush,
+			*servePprof, *servePprofMutex, *servePprofBlock)
 
 	case "snapshot":
 		if err := snapCmd.Parse(os.Args[2:]); err != nil {
@@ -75,7 +83,8 @@ func main() {
 	}
 }
 
-func runServe(file, addr string, flush time.Duration) {
+func runServe(file, addr string, flush time.Duration,
+	pprofAddr string, pprofMutex, pprofBlock int) {
 	// If using a Unix socket, remove any stale socket file from a previous run.
 	if strings.HasPrefix(addr, "unix://") {
 		path := strings.TrimPrefix(addr, "unix://")
@@ -83,6 +92,29 @@ func runServe(file, addr string, flush time.Duration) {
 			// Existing socket — likely stale from a previous crash.
 			os.Remove(path)
 		}
+	}
+
+	// Optional profiling HTTP server. Bound to a loopback address by default
+	// because /debug/pprof/heap exposes full process memory — see profiling
+	// package docs for security notes.
+	var profSrv *profiling.Server
+	if pprofAddr != "" {
+		var err error
+		profSrv, err = profiling.StartServer(profiling.Config{
+			Addr:                 pprofAddr,
+			MutexProfileFraction: pprofMutex,
+			BlockProfileRate:     pprofBlock,
+		})
+		if err != nil {
+			slog.Error("pprof server failed to start", "addr", pprofAddr, "error", err)
+			os.Exit(1)
+		}
+		slog.Info("pprof listening", "addr", profSrv.Addr())
+		defer func() {
+			if err := profSrv.Close(); err != nil {
+				slog.Warn("pprof shutdown error", "error", err)
+			}
+		}()
 	}
 
 	db, err := memdb.Open(memdb.Config{
