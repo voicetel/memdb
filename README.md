@@ -910,6 +910,33 @@ memdb snapshot -h
 memdb restore -h
 ```
 
+### Inspecting snapshots with sqlite3
+
+Snapshot files are not directly openable by the `sqlite3` CLI because they
+start with a 40-byte `MDBK` integrity header rather than the SQLite magic
+bytes. Strip the header first:
+
+```bash
+# Force a flush so the snapshot is up to date
+memdb snapshot --file /var/lib/myapp/data.db
+
+# Strip the MDBK header and open with sqlite3
+dd if=/var/lib/myapp/data.db bs=1 skip=40 of=/tmp/inspect.db
+sqlite3 /tmp/inspect.db ".tables"
+sqlite3 /tmp/inspect.db "SELECT COUNT(*) FROM sessions"
+```
+
+For live data inspection without touching the snapshot file at all, use the
+PostgreSQL wire protocol — it always reads the in-memory state:
+
+```bash
+# Requires the server to be running
+psql -h 127.0.0.1 -p 5433 -U memdb -c "SELECT * FROM sessions LIMIT 10"
+```
+
+See the [Snapshot integrity](#snapshot-integrity) section for a full
+explanation of the `MDBK` header format.
+
 ### Makefile reference
 
 ```bash
@@ -1215,12 +1242,54 @@ entry — matching the behaviour expected after an unclean shutdown.
 
 ### Snapshot integrity
 
-Snapshots include a 40-byte integrity header: the 4-byte magic `"MDBK"`, a
-1-byte version tag, and a SHA-256 checksum of the payload. On load the
-checksum is verified; a mismatch returns `ErrSnapshotCorrupt`. Legacy
+Snapshots include a 40-byte integrity header prepended to the raw SQLite
+bytes:
+
+```
+Offset  Length  Content
+     0       4  "MDBK" magic
+     4       4  version = 1 (uint32 big-endian)
+     8      32  SHA-256 of the raw SQLite payload that follows
+    40       ∞  Raw SQLite database bytes
+```
+
+On restore the checksum is verified; a mismatch returns `ErrSnapshotCorrupt`
+so a corrupt or partially-written snapshot is never silently loaded. Legacy
 snapshots written without the header are accepted with a warning and are
-upgraded (header prepended) on the next flush. Corrupt snapshots are never
-silently accepted.
+upgraded (header prepended) on the next flush.
+
+#### Direct access with the sqlite3 CLI
+
+Because snapshot files start with `MDBK` rather than the SQLite magic bytes
+(`SQLite format 3\0`), the `sqlite3` command-line tool cannot open them
+directly:
+
+```bash
+$ sqlite3 /var/lib/myapp/data.db ".tables"
+Error: file is not a database
+```
+
+To inspect a snapshot with `sqlite3`, strip the 40-byte header first:
+
+```bash
+# Strip the MDBK header — the remainder is a valid SQLite 3 database.
+dd if=/var/lib/myapp/data.db bs=1 skip=40 of=/tmp/inspect.db
+
+sqlite3 /tmp/inspect.db ".tables"
+sqlite3 /tmp/inspect.db "SELECT * FROM your_table LIMIT 10"
+```
+
+> **Note:** the stripped file is a read-only copy for inspection. Write
+> changes to it and then try to load it via memdb — the missing integrity
+> header means memdb will treat it as a legacy snapshot and accept it, but
+> you lose checksum protection. For production inspection prefer connecting
+> via the PostgreSQL wire protocol instead (`psql -h 127.0.0.1 -p 5433`),
+> which always reads the live in-memory state rather than the on-disk
+> snapshot.
+
+The `memdb restore` subcommand can copy a snapshot to a new location while
+preserving the header, or you can use `dd` to produce a header-free file
+for archiving and third-party tooling.
 
 ### Lifecycle
 
@@ -1386,6 +1455,10 @@ has a doc comment citing its source so the audit trail stays clear. The
 - Datasets that do not fit in RAM
 - Multi-process write-heavy workloads without the replication layer
 - Serverless or ephemeral container environments without persistent volume mounts
+- Workflows that require opening the database file directly with the `sqlite3`
+  CLI or other SQLite tooling — snapshot files include a 40-byte `MDBK`
+  integrity header that those tools do not understand (a `dd skip=40`
+  workaround exists; see [Inspecting snapshots with sqlite3](#inspecting-snapshots-with-sqlite3))
 
 ---
 
