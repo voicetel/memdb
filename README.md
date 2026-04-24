@@ -808,6 +808,49 @@ srv := server.New(db, server.Config{
 
 `BasicAuth` uses constant-time comparison (`crypto/subtle.ConstantTimeCompare`) to prevent timing attacks.
 
+### Protocol compatibility
+
+The server implements the PostgreSQL Simple Query protocol. All DML and DDL
+that application code needs works out of the box:
+
+| Statement | Supported |
+|---|---|
+| `SELECT` / `WITH` / `EXPLAIN` | ✅ |
+| `INSERT` / `UPDATE` / `DELETE` | ✅ |
+| `CREATE TABLE` / `CREATE INDEX` / `DROP` | ✅ |
+| `BEGIN` / `COMMIT` / `ROLLBACK` | ✅ via the underlying SQLite connection |
+| `PRAGMA` | ✅ |
+
+**Administrator schema-browsing commands are not supported.** When an
+operator connects with `psql` and types `\d tablename`, psql internally
+generates a sequence of `pg_catalog` queries that contain PostgreSQL-specific
+syntax (`OPERATOR(pg_catalog.~)`, `::regtype::text` casts) that SQLite cannot
+parse. These are issued by the `psql` client itself, not by application code,
+and the server returns an error for them.
+
+**For administrator introspection use the CLI instead:**
+
+```bash
+# List tables in a snapshot
+memdb snapshot --file /var/lib/myapp/data.db   # ensure snapshot is current
+dd if=/var/lib/myapp/data.db bs=1 skip=40 of=/tmp/inspect.db
+sqlite3 /tmp/inspect.db ".tables"
+sqlite3 /tmp/inspect.db ".schema users"
+
+# Query live data while the server is running
+psql -h 127.0.0.1 -p 5433 -U memdb -c "SELECT * FROM users LIMIT 10"
+psql -h 127.0.0.1 -p 5433 -U memdb -c "SELECT name FROM sqlite_master WHERE type='table'"
+```
+
+`SELECT name FROM sqlite_master WHERE type='table'` is the portable
+alternative to `\dt` and works correctly through the memdb server because it
+is plain SQL, not a psql client command.
+
+> **Note:** Extended Query protocol (prepared statements with `$1` placeholders,
+> `Parse`/`Bind`/`Execute` message flow) is also not implemented. Applications
+> that require extended protocol should use the library API directly rather
+> than the wire-protocol server.
+
 ---
 
 ## Profiling (pprof)
@@ -1459,6 +1502,11 @@ has a doc comment citing its source so the audit trail stays clear. The
   CLI or other SQLite tooling — snapshot files include a 40-byte `MDBK`
   integrity header that those tools do not understand (a `dd skip=40`
   workaround exists; see [Inspecting snapshots with sqlite3](#inspecting-snapshots-with-sqlite3))
+- Administrator schema-browsing via `psql` backslash commands (`\d`, `\dt`,
+  `\di`) — these generate `pg_catalog` queries with PostgreSQL-specific syntax
+  that SQLite cannot execute; use `sqlite3` on the stripped snapshot or
+  `SELECT name FROM sqlite_master` instead (see
+  [Protocol compatibility](#protocol-compatibility))
 
 ---
 
