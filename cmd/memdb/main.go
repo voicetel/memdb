@@ -20,9 +20,10 @@ import (
 )
 
 func main() {
-	// Configure slog to write to syslog, falling back to stderr text logging.
-	if logger, err := logging.NewSyslogHandler("memdb", slog.LevelInfo); err == nil {
-		slog.SetDefault(logger)
+	// Configure slog. Always fall back to stderr; mirror to syslog in
+	// production so log aggregators receive events too.
+	if syslogLogger, err := logging.NewSyslogHandler("memdb", slog.LevelInfo); err == nil {
+		slog.SetDefault(syslogLogger)
 	} else {
 		slog.SetDefault(logging.NewTextHandler(os.Stderr, slog.LevelInfo))
 	}
@@ -143,7 +144,13 @@ func runServe(file, addr string, flush time.Duration,
 
 	slog.Info("memdb listening", "addr", addr, "file", file, "flush", flush)
 	if err := srv.ListenAndServe(); err != nil {
+		// Write directly to stderr so a port-conflict or bind error is always
+		// visible in the terminal, even when syslog is the default handler.
+		// Without this the operator sees a silent zero-exit with no indication
+		// of the cause (e.g. "address already in use").
+		fmt.Fprintf(os.Stderr, "memdb: server error: %v\n", err)
 		slog.Error("server stopped unexpectedly", "error", err)
+		os.Exit(1)
 	}
 }
 
