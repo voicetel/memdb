@@ -331,13 +331,13 @@ func (d *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.
 	if d.replica == nil {
 		return d.stmts.QueryContext(ctx, query, args...)
 	}
-	r, release := d.replica.checkout()
+	r, rel := d.replica.checkout()
 	if r == nil {
 		// All replicas busy or refresh in progress — fall back to the writer.
 		return d.stmts.QueryContext(ctx, query, args...)
 	}
 	rows, err := r.QueryContext(ctx, query, args...)
-	release()
+	rel.Release()
 	if err != nil {
 		return nil, err
 	}
@@ -363,13 +363,13 @@ func (d *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sq
 	if d.replica == nil {
 		return d.stmts.QueryRowContext(ctx, query, args...)
 	}
-	r, release := d.replica.checkout()
+	r, rel := d.replica.checkout()
 	if r == nil {
 		return d.stmts.QueryRowContext(ctx, query, args...)
 	}
 	// Return the replica immediately — QueryRow buffers its result internally
 	// so the replica connection is not needed once QueryRow returns.
-	defer release()
+	defer rel.Release()
 	return r.QueryRowContext(ctx, query, args...)
 }
 

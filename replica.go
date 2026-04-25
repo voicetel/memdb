@@ -67,20 +67,26 @@ type replicaPool struct {
 	seeded bool
 }
 
-// releaser is the per-checkout state used to return a replica to the pool
-// exactly once. Using a small struct with an atomic flag avoids the three
-// allocations (sync.Once + outer closure + inner closure) that the previous
-// implementation incurred on every read.
-type releaser struct {
+// replicaReleaser returns a checked-out replica to the pool. It is an
+// unboxed value type so checkout can return it directly without a heap
+// allocation — the previous implementation returned a `func()` method
+// value bound to a heap-allocated *releaser, which the alloc-only pprof
+// diff measured at ~9 MB of churn over a 3-second SELECT workload.
+//
+// The contract is "call Release exactly once" (typically via defer
+// immediately after the checkout). A double-Release would push the same
+// *sql.DB onto the idle channel twice and double-decrement inUse,
+// corrupting refresh's quiescence wait. The previous atomic-based
+// double-Release guard has been removed in favour of the call-site
+// discipline that already exists everywhere checkout is used.
+type replicaReleaser struct {
 	pool *replicaPool
 	r    *sql.DB
-	done atomic.Bool
 }
 
-func (rl *releaser) release() {
-	if !rl.done.CompareAndSwap(false, true) {
-		return
-	}
+// Release returns the checked-out replica to the pool, or closes it if
+// the pool has been shut down in the meantime.
+func (rl replicaReleaser) Release() {
 	if rl.pool.closed.Load() {
 		_ = rl.r.Close()
 		rl.pool.inUse.Done()
@@ -125,28 +131,27 @@ func newReplicaPool(d *DB, n int, driverName string) (*replicaPool, error) {
 }
 
 // checkout removes a replica from the idle channel for exclusive use.
-// The caller must call the returned release function when done — this
-// returns the replica to the channel and decrements inUse.
+// The caller must call the returned releaser's Release method when done —
+// this returns the replica to the channel and decrements inUse.
 //
 // If the channel is empty (all replicas busy), or if a refresh is in progress,
-// returns (nil, nil) and the caller should fall back to the writer connection.
-// Yielding to refresh prevents read-load starvation: without this guard, a
-// hot read path can repeatedly hand released replicas back to checkouts and
-// keep the channel empty enough that refresh's blocking <-p.idle never
-// completes.
-func (p *replicaPool) checkout() (*sql.DB, func()) {
+// returns (nil, replicaReleaser{}) and the caller should fall back to the
+// writer connection. Yielding to refresh prevents read-load starvation:
+// without this guard, a hot read path can repeatedly hand released replicas
+// back to checkouts and keep the channel empty enough that refresh's
+// blocking <-p.idle never completes.
+func (p *replicaPool) checkout() (*sql.DB, replicaReleaser) {
 	if p.refreshing.Load() {
-		return nil, nil
+		return nil, replicaReleaser{}
 	}
 	var r *sql.DB
 	select {
 	case r = <-p.idle:
 	default:
-		return nil, nil
+		return nil, replicaReleaser{}
 	}
 	p.inUse.Add(1)
-	rl := &releaser{pool: p, r: r}
-	return r, rl.release
+	return r, replicaReleaser{pool: p, r: r}
 }
 
 // refresh serializes the writer's current state and deserializes it into every

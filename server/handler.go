@@ -23,6 +23,16 @@ type handler struct {
 	bufR        *bufio.Reader
 	bufW        *bufio.Writer
 	startupUser string // username from startup packet
+
+	// readBuf is the per-connection scratch buffer used by readMessage to
+	// hold the body of the most recently read wire message. It grows once
+	// to the largest message ever seen and is then reused for the lifetime
+	// of the handler. A previous version of readMessage allocated a fresh
+	// []byte per call — the alloc-only pprof diff showed this at ~15 MB
+	// of churn over a 3-second SELECT workload. Callers that retain any
+	// part of the returned body past the next readMessage call MUST copy
+	// (e.g. via string conversion in trimTrailingNUL).
+	readBuf []byte
 }
 
 // writeBufSize is the bufio.Writer buffer size for each client connection.
@@ -482,8 +492,8 @@ func (h *handler) handleExec(query, verb string) error {
 const maxMessageLen = 16 * 1024 * 1024
 
 func (h *handler) readMessage() (byte, []byte, error) {
-	header := make([]byte, 5)
-	if _, err := io.ReadFull(h.bufR, header); err != nil {
+	var header [5]byte
+	if _, err := io.ReadFull(h.bufR, header[:]); err != nil {
 		return 0, nil, err
 	}
 	msgType := header[0]
@@ -491,11 +501,16 @@ func (h *handler) readMessage() (byte, []byte, error) {
 	if length < 4 || length > maxMessageLen {
 		return 0, nil, fmt.Errorf("server: invalid message length %d", length)
 	}
-	body := make([]byte, length-4)
-	if _, err := io.ReadFull(h.bufR, body); err != nil {
+	bodyLen := length - 4
+	if cap(h.readBuf) < bodyLen {
+		h.readBuf = make([]byte, bodyLen)
+	} else {
+		h.readBuf = h.readBuf[:bodyLen]
+	}
+	if _, err := io.ReadFull(h.bufR, h.readBuf); err != nil {
 		return 0, nil, err
 	}
-	return msgType, body, nil
+	return msgType, h.readBuf, nil
 }
 
 func (h *handler) sendRowDescription(cols []string) error {
