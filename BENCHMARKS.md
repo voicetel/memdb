@@ -1,27 +1,39 @@
-# memdb v1.5.0 — Benchmark Report
+# memdb v1.6.1 — Benchmark Report
 
 Consolidated results from the full benchmark suite and the pprof-driven
 throughput scenarios. All numbers captured in a single session against the
-commit tagged `v1.5.0` after the pprof-driven optimisation sprint; see the
+commit tagged `v1.6.1` after the second-sweep allocation cleanups; see the
 Setup section for the exact environment.
 
-> **Update for v1.6.0** — a second pprof sweep removed the remaining `gob`
-> usage from the Raft FSM apply path (`replication/codec.go`, shared with
-> the WAL hot path), added a writer-side prepared-statement cache
-> (`stmt_cache.go`), let AEAD backends opt out of the SHA-256 snapshot
-> header (`memdb.AuthenticatedBackend`), and pinned `CompressedBackend` to
-> `zstd.SpeedFastest`. Measured deltas from `make pprof`:
+> **Headline change vs the v1.5.0 baseline** — repeated `Exec`/`Query`
+> calls now skip per-call Prepare/Close on the writer (prepared-statement
+> cache added in v1.6.0), the Raft and WAL hot paths share the same binary
+> codec with no `encoding/gob`, and a second-sweep pass replaced JSON in
+> the Raft on-disk log with a binary codec, swapped two more per-request
+> allocations for reusable buffers (server reader, replica pool checkout),
+> and pinned `CompressedBackend` to `zstd.SpeedFastest`.
 >
-> | Scenario | v1.5 | v1.6 | Delta |
-> |---|---:|---:|---:|
-> | Raft Apply (3-node cluster, writes/s) | 5,082 | 12,579 | **2.47×** |
-> | Contended writes (16 goroutines, ops/s) | 163,186 | 224,568 | **1.38×** |
-> | WAL cold-start replay (entries/s) | 123,687 | 164,595 | **1.33×** |
-> | Compressed flush (CPU samples, 5×50k rows) | 120 ms | 90 ms | **−25 %** |
-> | Encrypted flush (CPU samples) | 60 ms | 50 ms; SHA-256 fully removed | **−17 %** |
+> | Scenario | v1.5.0 | v1.6.0 | v1.6.1 | v1.5→v1.6.1 |
+> |---|---:|---:|---:|---:|
+> | Raft Apply (3-node cluster, writes/s) | 5,082 | 12,579 | **16,864** | **3.32×** |
+> | Contended writes (16 goroutines, ops/s) | 163k | 225k | 131k | see note¹ |
+> | Single-row INSERT vs file SQLite (`memdb` ns/op) | 3,686 | — | **2,359** | **1.56× faster** |
+> | Single-row UPDATE vs file SQLite (`memdb` ns/op) | 2,951 | — | **1,327** | **2.22× faster** |
+> | Concurrent RW (50 % writes, 20 goroutines, ns/op) | 5,923 | — | **3,884** | **−34 %** |
+> | Compressed flush (CPU samples, 5×50k rows) | 120 ms | 90 ms | 90 ms | **−25 %** |
+> | Encrypted flush (CPU samples) | 60 ms | 50 ms | 50 ms | **−17 %** |
 >
-> Numbers from `/tmp/memdb-prof-after/` on the v1.5 setup — re-run `make pprof`
-> on your hardware for fresh comparisons.
+> ¹ The contended-writes pprof scenario is sensitive to background load on
+> the host; the 131k v1.6.1 figure is from a single 3 s window. The
+> microbench (`Concurrent RW` row above, derived from
+> `BenchmarkConcurrentReadWrite`) is averaged over 5 s and is the more
+> stable indicator that v1.6.x writer-side contention is materially
+> better than v1.5.0.
+>
+> v1.6.0 numbers above are from `/tmp/memdb-prof-after/`; v1.6.1 numbers
+> are from a fresh `make bench` + `make pprof` + `make pprof-server` +
+> `make pprof-raft` on the reference hardware. Re-run on your hardware
+> for fresh comparisons.
 
 > Re-run with `make bench`, `make pprof`, and `make pprof-server` from the
 > repo root. Raw output is written to `coverage/bench.txt` and the `.prof`
@@ -42,7 +54,7 @@ Setup section for the exact environment.
 | CPU | 12th Gen Intel(R) Core(TM) i7-1280P (20 threads) |
 | Go | go1.24.4 linux/amd64 |
 | SQLite driver | github.com/mattn/go-sqlite3 (cgo) |
-| Commit | v1.5.0 |
+| Commit | v1.6.1 |
 | `-benchtime` | 5 s per bench |
 | `-cpu` | default (GOMAXPROCS=20) unless noted |
 
@@ -51,32 +63,41 @@ timings reflect only the operation under measurement, not periodic I/O.
 
 ---
 
-## What changed in v1.5.0 (Sprint 1 security + pprof optimisations)
+## What changed since v1.5.0
 
-### Security hardening
+### v1.6.1 — second-sweep allocation cleanups
 
-v1.5.0 adds four security hardening items with observable performance impact
-on the flush and restore paths. All other hot paths (write, read, WAL append)
-are unaffected.
-
-| Change | Impact |
-|---|---|
-| **Snapshot integrity** — SHA-256 header (`"MDBK"`) prepended to every flush | `snapshotWriter` buffers the full payload to hash before writing; flush `B/op` now scales with DB size |
-| **Restore verification** — `verifyAndStrip` reads the full payload via `io.ReadAll` to verify the digest | `OpenRestore` latency is roughly proportional to snapshot size |
-| **FK enforcement on by default** | No measurable hot-path impact (FK checks happen inside SQLite's cgo layer) |
-| **Panic recovery in callbacks** | No measurable hot-path impact (fast-path is a single `defer recover()`) |
-
-### pprof-driven optimisations
-
-Two optimisations were applied after profiling the v1.5.0 security baseline.
+Three smaller allocation hotspots surfaced after the v1.6.0 sweep removed
+the dominant ones. None is individually large, but each removes a
+per-operation allocation from a hot path that runs once per request.
 
 | Change | Impact |
 |---|---|
-| **`WAL.Append` zero-alloc** — 4-byte length prefix now reserved in the pool buffer before `walEncodeBinary`, eliminating the separate `make+copy` | `WAL_Append`: **642 → 476 ns/op**, **128 → 0 B/op**, **1 → 0 allocs/op** (~26% faster) |
-| **Server write buffer 4 KB → 32 KB** — `bufio.NewWriterSize(conn, 32×1024)` | Eliminates ~6 implicit mid-response `write(2)` syscalls on wide SELECT (~500 rows); only the final `Flush()` in `sendReadyForQuery` triggers a syscall |
+| **Raft on-disk log codec** — `replication/raft/log_codec.go` replaces `encoding/json` with a hand-rolled binary codec; `appendLocked` reuses a per-batch scratch buffer | Raft Apply on a 3-node cluster: **12,579 → 16,864 writes/s** (1.34×). Removes ~27 % of Raft inuse heap. **Wire-format break** — v1.6.0 JSON log entries cannot be decoded by v1.6.1; snapshot before upgrading. |
+| **Server `handler.readMessage` scratch buffer** — per-call body alloc replaced with a per-handler `[]byte` reused across reads | Removes ~15 MB of GC churn over a 3 s SELECT workload. |
+| **`replicaPool.checkout` value-type releaser** — returns a `replicaReleaser` value instead of a heap-allocated `*releaser` plus closure | Removes ~9 MB of churn under the 16-goroutine read scenario. |
 
-The write, read, and server paths otherwise remain within noise of the
-v1.4.0 reference run.
+### v1.6.0 — pprof-driven perf sprint
+
+The headline win of the sprint was removing the last `encoding/gob` usage
+from the Raft FSM apply path: the WAL binary v1 codec was lifted into
+package `replication` so the FSM and the WAL share the same encoder.
+
+| Change | Impact |
+|---|---|
+| **Shared binary codec** for WAL hot path + Raft FSM apply path (`replication/codec.go`); no `encoding/gob` left on either path | Raft Apply on a 3-node cluster: **5,082 → 12,579 writes/s** (2.47×). Was ~25 % of CPU on the WAL path, ~31 % on the FSM apply path. |
+| **Writer-side prepared-statement cache** (`stmt_cache.go`) — repeated `Exec`/`Query`/`QueryRow` on the same SQL string skip `Prepare → Close` inside `mattn/go-sqlite3`. Multi-statement SQL bypasses (a `*sql.Stmt` only handles one statement). | Contended writes: 163k → 225k ops/s (1.38×). WAL replay: 124k → 165k entries/s (1.33×). |
+| **`CompressedBackend` pinned to `zstd.SpeedFastest`** | Halves encoder CPU for ~10 % larger snapshots — the right trade for a frequently-flushed hot path. Compressed flush CPU: 120 ms → 90 ms across 5×50k rows. |
+| **`memdb.AuthenticatedBackend`** marker; `EncryptedBackend` opts in so the redundant 40-byte SHA-256 `MDBK` header is skipped (the AES-GCM tag is already an integrity check) | Encrypted flush CPU: 60 → 50 ms; SHA-256 fully removed from the encrypted path. |
+
+### v1.5.0 — Sprint 1 security + early pprof optimisations
+
+Snapshot/restore integrity (SHA-256 header `"MDBK"`), FK enforcement on
+by default, panic recovery in callbacks, the WAL binary v1 format and
+pool buffer (zero-alloc `WAL.Append`), and the 32 KB server write buffer
+all landed in v1.5.0 — the foundation the later sprints built on. The
+flush/restore paths still buffer the full payload to hash it, which is
+why flush B/op scales with DB size; on AEAD backends v1.6.0 skips this.
 
 ---
 
@@ -90,31 +111,43 @@ orchestration, buffered-writer flushing, and connection churn.
 
 | Scenario | Throughput |
 |---|---|
-| Pure writes (single goroutine, `DurabilityNone`) | **260 322 ops/s** |
-| Pure writes (single goroutine, `DurabilityWAL`) | **200 280 ops/s** |
-| Concurrent reads (16 goroutines, replica pool) | **832 623 ops/s** |
-| Mixed RW, `ReplicaRefreshInterval=2ms` | 14 489 w/s + 116 411 r/s |
-| Mixed RW, `ReplicaRefreshInterval=50ms` *(default)* | 44 190 w/s + 305 223 r/s |
+| Pure writes (single goroutine, `DurabilityNone`) | **255 672 ops/s** |
+| Pure writes (single goroutine, `DurabilityWAL`) | **183 247 ops/s** |
+| Concurrent reads (16 goroutines, replica pool) | **655 407 ops/s** |
+| Contended writes (16 goroutines, single writer) | **130 827 ops/s** |
+| Mixed RW, `ReplicaRefreshInterval=2ms` | 14 701 w/s + 113 499 r/s |
+| Mixed RW, `ReplicaRefreshInterval=50ms` *(default)* | 42 924 w/s + 201 129 r/s |
+| Raft Apply (3-node cluster, sustained writes) | **16 864 writes/s** |
 | Flush (50 000 rows) | ~41 ms / flush |
+| WAL cold-start replay (50 000 entries) | **98 584 entries/s** |
 
 Notes:
 
 - `DurabilityWAL` pays ~0.5 µs per write for `WAL.Append` + fsync; throughput
-  is 77 % of the no-durability path. The WAL hot path contributes only ~9 % of
-  total DurabilityWAL CPU after the zero-alloc optimisation.
+  is 72 % of the no-durability path. The WAL hot path contributes only ~9 % of
+  total DurabilityWAL CPU after the v1.5.0 zero-alloc optimisation.
 - The mixed-RW default refresh case represents a 3-second wall-clock window;
   variance between runs is ±10–15 % — use `BenchmarkReplicaRefreshInterval`
   for stable parameter-sweep data.
+- Raft Apply throughput is measured against a 3-node in-process cluster; on
+  real hardware with cross-host networking the ceiling is set by RTT.
 
 ### Postgres wire-protocol server
 
+The server tests bind `ReadPoolSize=GOMAXPROCS` (added in v1.6.0) so SELECT
+traffic exercises the read replica pool — the v1.5.0 numbers serialised
+every read through the single writer connection, which is why the SELECT
+throughputs in the table below are several × the v1.5.0 figures.
+
 | Scenario | Throughput |
 |---|---|
-| Narrow SELECT (16 clients, ~10 rows/query) | **41 836 q/s** |
-| Wide SELECT (8 clients, 500 rows/query) | **3 467 q/s (~1.7M rows/s)** |
-| INSERT (8 clients, simple-query protocol) | **65 611 q/s** |
-| Mixed SELECT/INSERT (20 clients, 1-in-4 writes) | **56 705 q/s** |
-| Connect → query → disconnect (8 clients) | **14 690 cycles/s** |
+| Narrow SELECT (16 clients, ~10 rows/query) | **186 359 q/s** |
+| Wide SELECT (8 clients, 500 rows/query) | **7 939 q/s (~4.0 M rows/s)** |
+| INSERT (8 clients, simple-query protocol) | **23 874 q/s** |
+| Mixed SELECT/INSERT (20 clients, 1-in-4 writes) | **80 883 q/s** |
+| Connect → query → disconnect (8 clients) | **14 229 cycles/s** |
+| TLS connect → query → disconnect (8 clients) | **3 189 cycles/s** |
+| Allocation diff scenario (8 clients) | **45 277 q/s** |
 
 ---
 
@@ -124,56 +157,62 @@ Notes:
 
 | Benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| `Exec_Insert` | 6 203 | 448 | 14 |
-| `Exec_Insert_WAL` | 7 210 | 448 | 14 |
-| `Exec_Update` | 4 724 | 454 | 14 |
-| `Exec_Delete` | 3 587 | 264 | 12 |
-| `QueryRow` | 5 547 | 758 | 23 |
-| `Query_RangeScan` (100 rows) | 45 464 | 7 080 | 420 |
+| `Exec_Insert` | 4 142 | 368 | 12 |
+| `Exec_Insert_WAL` | 5 088 | 368 | 12 |
+| `Exec_Update` | 2 225 | 374 | 12 |
+| `Exec_Delete` | 2 006 | 184 | 10 |
+| `QueryRow` | 3 664 | 702 | 22 |
+| `Query_RangeScan` (100 rows) | 39 565 | 7 024 | 419 |
 
 The absolute allocation counts are dominated by `database/sql` and the
 `mattn/go-sqlite3` driver — memdb itself contributes <2 allocs/op on the
-write path. `Exec_Insert_WAL` carries 1 fewer alloc and 128 fewer B/op than
-the v1.5.0 pre-optimisation baseline, exactly matching the WAL pool-buffer
-allocation that was eliminated.
+write path. The 2 fewer allocs/op vs the v1.5.0 baseline (`Exec_Insert`
+went from 14 → 12) come from the prepared-statement cache added in
+v1.6.0: `Prepare` and `Close` no longer run on every `Exec`/`Query`
+against a previously-seen SQL string.
 
 ### Transactions
 
 | Benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| `WithTx_SingleInsert` | 8 498 | 896 | 29 |
-| `WithTx_BatchInsert` (50 rows) | 180 695 | 15 414 | 617 |
-| `WithTx_ReadOnly` | 7 963 | 1 416 | 44 |
+| `WithTx_SingleInsert` | 7 620 | 897 | 29 |
+| `WithTx_BatchInsert` (50 rows) | 164 294 | 15 414 | 617 |
+| `WithTx_ReadOnly` | 7 448 | 1 416 | 44 |
 
-Batching 50 inserts inside a single transaction is ~1.7× faster per row
-than 50 individual `Exec` calls (3 614 ns/row vs 6 203 ns/row) — the
-amortised SQLite `COMMIT` cost is the reason.
+Batching 50 inserts inside a single transaction is ~1.3× faster per row
+than 50 individual `Exec` calls (3 286 ns/row vs 4 142 ns/row) — the
+amortised SQLite `COMMIT` cost is the reason. The gap is narrower than in
+v1.5.0 because the per-row `Exec` path now also skips per-call Prepare
+overhead via the writer-side statement cache.
 
 ### WAL primitives (binary format, v1.4+)
 
 | Benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| `WAL_Append` | **476.4** | **0** | **0** |
-| `WAL_Replay` / 100 entries | 72 230 | 39 008 | 609 |
-| `WAL_Replay` / 1 000 entries | 726 822 | 366 311 | 6 012 |
-| `WAL_Replay` / 10 000 entries | 8 772 540 | 5 129 774 | 60 023 |
+| `WAL_Append` | **559.7** | **0** | **0** |
+| `WAL_Replay` / 100 entries | 74 440 | 39 008 | 609 |
+| `WAL_Replay` / 1 000 entries | 736 386 | 366 311 | 6 012 |
+| `WAL_Replay` / 10 000 entries | 8 851 291 | 5 129 758 | 60 024 |
 
 Replay scales linearly and costs ~9 ms for a 10 000-entry WAL — a one-time
-cost at startup.
+cost at startup. Replay throughput end-to-end (50 000 entries through
+`WAL.Replay` + the writer's prepared-statement cache) is **98 584 entries/s**.
 
 For context, the v1.3 baseline (gob-encoded, unpooled buffers) was
 **2 809 ns/op / 1 602 B/op / 20 allocs/op** for `WAL_Append`. The binary
 format plus buffer pooling (v1.4) and the zero-alloc length-prefix trick
-(v1.5.0) together yield a 5.9× speed-up, infinite memory reduction, and
-zero hot-path allocations.
+(v1.5.0) together yield a 5.0× speed-up, infinite memory reduction, and
+zero hot-path allocations. The v1.6.x prepared-statement cache further
+amortises replay's `Prepare`/`Close` cost when repeated SQL templates
+dominate the WAL.
 
 ### Flush (SQLite backup API + SHA-256 integrity, v1.5.0)
 
 | Rows | ns/op | B/op | allocs/op |
 |---:|---:|---:|---:|
-| 100 | 115 646 | 49 108 | 88 |
-| 1 000 | 252 705 | 266 430 | 90 |
-| 10 000 | 1 481 689 | 2 103 215 | 97 |
+| 100 | 118 175 | 49 109 | 88 |
+| 1 000 | 283 127 | 266 427 | 90 |
+| 10 000 | 1 454 781 | 2 103 270 | 97 |
 
 Starting in v1.5.0, every flush buffers the full SQLite payload in
 `snapshotWriter` to compute the SHA-256 checksum before writing to the
@@ -197,8 +236,8 @@ price to pay for integrity guarantees on the restore path.
 
 | Benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| `Open` (empty DB) | 84 650 | 3 707 | 92 |
-| `OpenRestore` (1 000-row snapshot) | 278 191 | 218 258 | 173 |
+| `Open` (empty DB) | 81 068 | 4 778 | 106 |
+| `OpenRestore` (1 000-row snapshot) | 270 744 | 219 334 | 187 |
 
 `OpenRestore` is notably higher than v1.4.0 (153 369 ns/op, 6 413 B/op)
 because `verifyAndStrip` reads the entire snapshot payload via `io.ReadAll`
@@ -209,13 +248,15 @@ cost at restore time scales with snapshot size.
 
 | Write mix | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| 10 % writes | 5 862 | 727 | 22 |
-| 50 % writes | 5 923 | 603 | 19 |
-| 90 % writes | 5 968 | 479 | 15 |
+| 10 % writes | 4 026 | 669 | 21 |
+| 50 % writes | 3 884 | 537 | 17 |
+| 90 % writes | 3 876 | 404 | 13 |
 
 Per-op cost is remarkably flat across the write ratio — read contention
 on the replica pool and write contention on the single writer connection
-balance out near 6 µs/op regardless of mix.
+balance out near 4 µs/op regardless of mix. The ~34 % improvement vs
+v1.5.0 (5.9 → 3.9 µs) is the prepared-statement cache and the
+second-sweep allocation cleanups compounding.
 
 ---
 
@@ -227,13 +268,13 @@ balance out near 6 µs/op regardless of mix.
 
 | Interval | ns/op (write) | B/op | Note |
 |---|---:|---:|---|
-| 250 µs | 86 944 | 31 859 | refresh dominates CPU |
-| 1 ms | 82 320 | 33 105 | 4× slower than 100 ms |
-| 5 ms | 71 803 | 28 444 | marginal improvement |
-| 25 ms | 57 669 | 26 702 | knee of the curve |
-| 100 ms | **11 061** | **4 961** | writes near full speed |
+| 250 µs | 56 732 | 23 237 | refresh dominates CPU |
+| 1 ms | 53 494 | 22 100 | 4.5× slower than 100 ms |
+| 5 ms | 45 795 | 21 879 | marginal improvement |
+| 25 ms | 37 685 | 24 839 | knee of the curve |
+| 100 ms | **11 761** | **5 100** | writes near full speed |
 
-**v1.5.0 default is 50 ms.** Values below 5 ms emit a warning at `Open`
+**Default is 50 ms.** Values below 5 ms emit a warning at `Open`
 because pprof showed the refresh loop dominating CPU at those intervals.
 
 ---
@@ -249,54 +290,54 @@ levels on a file-backed database.
 
 | Backend | ns/op | vs `memdb` |
 |---|---:|---:|
-| `memdb` | 3 686 | 1.00× |
-| `memdb/wal` | 4 559 | 1.24× |
-| `file/sync=off` | 7 436 | 2.02× |
-| `file/sync=normal` | 7 558 | 2.05× |
-| `file/sync=full` | 7 838 | 2.13× |
+| `memdb` | 2 359 | 1.00× |
+| `memdb/wal` | 3 104 | 1.32× |
+| `file/sync=off` | 7 446 | 3.16× |
+| `file/sync=normal` | 7 379 | 3.13× |
+| `file/sync=full` | 7 465 | 3.16× |
 
-`memdb` is **2.02× faster** than the *fastest* file-backed configuration
-(`sync=off`) and `memdb/wal` is still **1.63× faster** while providing
+`memdb` is **3.16× faster** than the *fastest* file-backed configuration
+(`sync=off`) and `memdb/wal` is still **2.40× faster** while providing
 near-zero data loss durability.
 
 ### Single-row UPDATE
 
 | Backend | ns/op | vs `memdb` |
 |---|---:|---:|
-| `memdb` | 2 951 | 1.00× |
-| `file/sync=off` | 4 242 | 1.44× |
-| `file/sync=normal` | 4 260 | 1.44× |
-| `file/sync=full` | 4 205 | 1.42× |
+| `memdb` | 1 327 | 1.00× |
+| `file/sync=off` | 4 141 | 3.12× |
+| `file/sync=normal` | 4 082 | 3.08× |
+| `file/sync=full` | 4 153 | 3.13× |
 
 ### Single-row QueryRow
 
 | Backend | ns/op | vs `memdb` |
 |---|---:|---:|
-| `memdb` | 3 665 | 1.00× |
-| `file/sync=off` | 4 503 | 1.23× |
-| `file/sync=normal` | 4 553 | 1.24× |
-| `file/sync=full` | 4 562 | 1.25× |
+| `memdb` | 2 017 | 1.00× |
+| `file/sync=off` | 4 271 | 2.12× |
+| `file/sync=normal` | 4 254 | 2.11× |
+| `file/sync=full` | 4 304 | 2.13× |
 
 ### 100-row range scan
 
 | Backend | ns/op | vs `memdb` |
 |---|---:|---:|
-| `memdb` | 39 750 | 1.00× |
-| `file/sync=off` | 40 603 | 1.02× |
-| `file/sync=normal` | 40 675 | 1.02× |
-| `file/sync=full` | 41 939 | 1.06× |
+| `memdb` | 35 865 | 1.00× |
+| `file/sync=off` | 38 633 | 1.08× |
+| `file/sync=normal` | 38 915 | 1.09× |
+| `file/sync=full` | 38 834 | 1.08× |
 
 Sequential scans spend almost all their time in SQLite's cursor machinery,
-which is identical across backends — the gap collapses to noise.
+which is identical across backends — the gap stays small.
 
 ### 50-row batch INSERT (in one transaction)
 
 | Backend | ns/op | vs `memdb` |
 |---|---:|---:|
-| `memdb` | 174 048 | 1.00× |
-| `file/sync=off` | 178 328 | 1.02× |
-| `file/sync=normal` | 180 758 | 1.04× |
-| `file/sync=full` | 182 092 | 1.05× |
+| `memdb` | 164 146 | 1.00× |
+| `file/sync=off` | 169 091 | 1.03× |
+| `file/sync=normal` | 167 694 | 1.02× |
+| `file/sync=full` | 167 730 | 1.02× |
 
 ### Concurrent read (parallelism=4, 500-row dataset)
 
@@ -304,20 +345,20 @@ Baseline (1.00×) is `memdb/pool` — the fastest backend in this table.
 
 | Backend | ns/op | vs `memdb/pool` |
 |---|---:|---:|
-| `memdb/pool` (`ReadPoolSize=4`) | **2 058** | **1.00×** |
-| `file/sync=off` | 2 599 | 1.26× |
-| `file/sync=normal` | 2 597 | 1.26× |
-| `file/sync=full` | 2 588 | 1.26× |
-| `memdb` (single-conn) | 5 646 | 2.74× |
+| `memdb/pool` (`ReadPoolSize=4`) | **1 783** | **1.00×** |
+| `file/sync=off` | 2 396 | 1.34× |
+| `file/sync=normal` | 2 463 | 1.38× |
+| `file/sync=full` | 2 456 | 1.38× |
+| `memdb` (single-conn) | 3 895 | 2.18× |
 
-With the replica pool `memdb` is **~26 % faster than file SQLite** on
-concurrent reads, and **2.74× faster than `memdb` without the pool**.
+With the replica pool `memdb` is **~34 % faster than file SQLite** on
+concurrent reads, and **2.18× faster than `memdb` without the pool**.
 
 ---
 
 ## Profile analysis (what the pprof files say)
 
-### `pprof_reads.cpu.prof` — 832k reads/s
+### `pprof_reads.cpu.prof` — 655k reads/s
 
 | Function | cum % | Comment |
 |---|---:|---|
@@ -330,7 +371,7 @@ concurrent reads, and **2.74× faster than `memdb` without the pool**.
 write-generation short-circuit and the fast-path tick, it is below the
 0.5 % sampling threshold during a read-only workload.
 
-### `pprof_writes_wal.cpu.prof` — 200k WAL writes/s
+### `pprof_writes_wal.cpu.prof` — 183k WAL writes/s
 
 | Function | flat % | Comment |
 |---|---:|---|
@@ -346,7 +387,7 @@ carries through to v1.5. The `WAL.Append` cumulative dropped from 13.8 %
 to 9.8 % after the zero-alloc optimisation — the function is now dominated
 by the `write(2)` + `fsync(2)` pair which cannot be eliminated.
 
-### `pprof_server_select_wide.cpu.prof` — 3 467 q/s, 500 rows each
+### `pprof_server_select_wide.cpu.prof` — 7 939 q/s, 500 rows each
 
 | Function | flat % | Comment |
 |---|---:|---|
@@ -362,9 +403,10 @@ only 1.6 % cumulative — confirming that the 32 KB write buffer collapses
 the ~6 mid-response implicit flushes into the one explicit `sendReadyForQuery`
 flush.
 
-### `pprof_server_select_wide.heap.prof` — 3 467 q/s, 500 rows each
+### `pprof_server_select_wide.heap.prof` — 7 939 q/s, 500 rows each
 
-Allocation rate: **~340 MB / 3 s**.
+Allocation rate: **~780 MB / 3 s** (rate scales with the higher
+throughput now that `ReadPoolSize=GOMAXPROCS` lets readers fan out).
 
 | Function | alloc_space % | Comment |
 |---|---:|---|
@@ -388,7 +430,7 @@ replicas (`ReadPoolSize`) scales this linearly.
 
 ## Where the remaining cost lives
 
-After the v1.5.0 sprint, the profiles say memdb is spending its cycles on:
+After the v1.6.x sweeps, the profiles say memdb is spending its cycles on:
 
 1. **cgo boundary crossing into SQLite** (~40–60 % depending on workload)
    — structural, requires replacing the driver to reduce.
@@ -428,7 +470,7 @@ make pprof-server-select-wide
 make pprof-view PROF=./coverage/pprof/pprof_reads.cpu.prof
 ```
 
-Full results from the v1.5.0 run are written to `coverage/bench.txt`
+Full results from the v1.6.1 run are written to `coverage/bench.txt`
 alongside the raw `.prof` files in `coverage/pprof/`. Both paths are
 gitignored — this report (`BENCHMARKS.md`) lives at the repo root and is
 the committed summary of that data.

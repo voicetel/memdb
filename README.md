@@ -4,16 +4,16 @@ A high-performance, embedded Go database library built on SQLite. All reads and 
 
 Think Redis RDB+AOF semantics with full SQL query power — in a single Go import.
 
-**2.02× faster writes than file SQLite. ~26% faster concurrent reads than file SQLite with `ReadPoolSize > 0`.** See [BENCHMARKS.md](./BENCHMARKS.md) for the current v1.5.0 report.
+**3.16× faster writes than file SQLite. ~34% faster concurrent reads than file SQLite with `ReadPoolSize > 0`.** See [BENCHMARKS.md](./BENCHMARKS.md) for the current v1.6.1 report.
 
 ---
 
 ## Features
 
 - **Full SQL** — joins, indexes, transactions, aggregates via SQLite
-- **2.02× faster writes** — all writes hit memory; no VFS, no page-cache overhead
+- **3.16× faster writes** — all writes hit memory; no VFS, no page-cache overhead
 - **Sub-millisecond reads** — all queries hit memory, no disk I/O on the hot path
-- **Concurrent reads** — channel-based replica pool (`ReadPoolSize`) is ~26% faster than file SQLite at 4 goroutines (and 2.74× faster than memdb without the pool)
+- **Concurrent reads** — channel-based replica pool (`ReadPoolSize`) is ~34% faster than file SQLite at 4 goroutines (and 2.18× faster than memdb without the pool)
 - **Prepared-statement cache** — repeated `Exec`/`Query` against the writer skip per-call Prepare/Close; ~1.4× contended write throughput from a single `sync.Map[string]*sql.Stmt`
 - **Configurable durability** — periodic snapshot only, WAL-backed near-zero loss, or fully synchronous
 - **Atomic snapshots** — write-then-rename prevents corrupt state on crash
@@ -1166,7 +1166,7 @@ matching C toolchain to be available on the build host.
 
 ## Benchmarks
 
-> **For the current v1.5.0 report see [BENCHMARKS.md](./BENCHMARKS.md).**
+> **For the current v1.6.1 report see [BENCHMARKS.md](./BENCHMARKS.md).**
 > It contains the full throughput table (core DB + Postgres wire server),
 > the `ReplicaRefreshInterval` parameter sweep, the side-by-side vs
 > file-SQLite comparison, and a section-by-section pprof analysis of
@@ -1179,7 +1179,7 @@ microbenchmarks for quick reference.
 Benchmarks run on a 12th Gen Intel Core i7-1280P (20 threads), Linux, Go 1.24,
 `github.com/mattn/go-sqlite3`. All file-SQLite numbers use WAL journal mode and
 `cache_size=-64000` (64 MB), identical to memdb's in-memory configuration. Run
-with `-benchtime=5s -benchmem`. Numbers below are from the v1.5.0 reference run
+with `-benchtime=5s -benchmem`. Numbers below are from the v1.6.1 reference run
 — see [BENCHMARKS.md](./BENCHMARKS.md) for the full table and the raw
 `coverage/bench.txt` output.
 
@@ -1187,29 +1187,29 @@ with `-benchtime=5s -benchmem`. Numbers below are from the v1.5.0 reference run
 
 | Operation | memdb | memdb + WAL | file/sync=off | file/sync=full | vs file/off |
 |---|---|---|---|---|---|
-| INSERT | **3,686 ns** | 4,559 ns | 7,436 ns | 7,838 ns | **2.02× faster** |
-| UPDATE | **2,951 ns** | — | 4,242 ns | 4,205 ns | **1.44× faster** |
-| QueryRow | **3,665 ns** | — | 4,503 ns | 4,562 ns | **1.23× faster** |
-| RangeScan (100 rows) | **39,750 ns** | — | 40,603 ns | 41,939 ns | **1.02× faster** |
-| BatchInsert (50 rows/tx) | **174,048 ns** | — | 178,328 ns | 182,092 ns | **1.02× faster** |
+| INSERT | **2,359 ns** | 3,104 ns | 7,446 ns | 7,465 ns | **3.16× faster** |
+| UPDATE | **1,327 ns** | — | 4,141 ns | 4,153 ns | **3.12× faster** |
+| QueryRow | **2,017 ns** | — | 4,271 ns | 4,304 ns | **2.12× faster** |
+| RangeScan (100 rows) | **35,865 ns** | — | 38,633 ns | 38,834 ns | **1.08× faster** |
+| BatchInsert (50 rows/tx) | **164,146 ns** | — | 169,091 ns | 167,730 ns | **1.03× faster** |
 
 memdb's advantage is proportional to how much time each operation spends in I/O vs pure SQL
 work. Single-row writes spend most of their time flushing pages through the OS VFS stack —
-memdb skips all of that, giving a **1.4–1.9× edge**. Point reads see a smaller **~1.2×**
-gain because both backends serve hot pages from RAM; the difference is the VFS abstraction
-cost alone. For bulk operations and range scans the bottleneck shifts to SQLite's B-tree and
-cursor machinery, which is identical for both backends, so the gap narrows to **~1–6%**.
+memdb skips all of that, giving a **2.1–3.2× edge**. Point reads see a smaller gain because
+both backends serve hot pages from RAM; the difference is the VFS abstraction cost alone.
+For bulk operations and range scans the bottleneck shifts to SQLite's B-tree and cursor
+machinery, which is identical for both backends, so the gap narrows to **~3–8%**.
 
 `memdb + WAL` appends a binary-encoded entry and calls `fsync` after every `Exec`. The
 WAL hot path uses a hand-rolled binary wire format (defined in package `replication`
 as `EncodeEntry` / `DecodeEntry`, shared with the Raft FSM) in place of `encoding/gob`,
 which previously accounted for ~25% of total CPU under `DurabilityWAL` in pprof traces.
 A zero-alloc optimisation pre-reserves the 4-byte length prefix in the pool buffer,
-eliminating a `make+copy` per write. `BenchmarkWAL_Append` measures **~476 ns/op,
+eliminating a `make+copy` per write. `BenchmarkWAL_Append` measures **~560 ns/op,
 0 B/op, 0 allocs/op** (down from 2,809 ns/op, 1,602 B/op, 20 allocs/op pre-binary-codec).
-End-to-end WAL-durability insert throughput in `TestPProf_Writes_WAL` reaches 200k
-writes/s. Even with the per-write `fsync` included, `DurabilityWAL` (4,559 ns/op) remains
-**1.63× faster than `file/sync=off`** (7,436 ns/op) on INSERT — you get near-zero data
+End-to-end WAL-durability insert throughput in `TestPProf_Writes_WAL` reaches 183k
+writes/s. Even with the per-write `fsync` included, `DurabilityWAL` (3,104 ns/op) remains
+**2.40× faster than `file/sync=off`** (7,446 ns/op) on INSERT — you get near-zero data
 loss durability while still beating an unprotected file database.
 
 The `synchronous` pragma barely matters on fast NVMe storage (`off` vs `full` is only 5%).
@@ -1232,17 +1232,17 @@ From `BenchmarkCompare_ConcurrentRead` at parallelism=4:
 
 | Backend | ns/op | vs `memdb/pool` |
 |---|---:|---:|
-| **memdb + ReadPoolSize=4** | **2,058** | **1.00×** |
-| file SQLite (sync=off, WAL) | 2,599 | 1.26× |
-| file SQLite (sync=normal, WAL) | 2,597 | 1.26× |
-| file SQLite (sync=full, WAL) | 2,588 | 1.26× |
-| memdb (default, 1 connection) | 5,646 | 2.74× |
+| **memdb + ReadPoolSize=4** | **1,783** | **1.00×** |
+| file SQLite (sync=off, WAL) | 2,396 | 1.34× |
+| file SQLite (sync=normal, WAL) | 2,463 | 1.38× |
+| file SQLite (sync=full, WAL) | 2,456 | 1.38× |
+| memdb (default, 1 connection) | 3,895 | 2.18× |
 
 Without the pool, memdb serialises all readers through one connection and degrades under
 concurrency while file SQLite fans out across independent connections. With
-`ReadPoolSize=4` and the channel-based pool, memdb is **~26% faster than file SQLite at
-4 goroutines** (2,058 ns vs 2,599 ns) and **2.74× faster than memdb without the pool**,
-while retaining the full 2.02× write-speed advantage over file SQLite. At higher goroutine
+`ReadPoolSize=4` and the channel-based pool, memdb is **~34% faster than file SQLite at
+4 goroutines** (1,783 ns vs 2,396 ns) and **2.18× faster than memdb without the pool**,
+while retaining the full 3.16× write-speed advantage over file SQLite. At higher goroutine
 counts, any goroutine that cannot immediately check out a replica falls back to the writer
 connection; raise `ReadPoolSize` to match the goroutine count to recover the throughput.
 See the [Tuning](#tuning) section for a closed-form recommender.
@@ -1251,9 +1251,9 @@ See the [Tuning](#tuning) section for a closed-form recommender.
 
 | Rows | Flush latency | B/op | Allocs |
 |---|---|---|---|
-| 100 | ~116 µs | ~49 KB | 88 |
-| 1,000 | ~253 µs | ~266 KB | 90 |
-| 10,000 | ~1,482 µs | ~2.1 MB | 97 |
+| 100 | ~118 µs | ~49 KB | 88 |
+| 1,000 | ~283 µs | ~266 KB | 90 |
+| 10,000 | ~1,455 µs | ~2.1 MB | 97 |
 
 Starting in v1.5.0, every flush buffers the full SQLite snapshot in memory to compute its
 SHA-256 integrity checksum before writing to the backend. Flush time and memory now scale
@@ -1266,18 +1266,18 @@ workloads; avoid flushing more frequently than every few seconds on a hot write 
 
 | Operation | Latency | Allocs |
 |---|---|---|
-| WAL append (binary encode + fsync) | ~476 ns | 0 |
-| WAL replay — 100 entries | ~72 µs | 609 |
-| WAL replay — 1,000 entries | ~727 µs | 6,012 |
-| WAL replay — 10,000 entries | ~8,773 µs | 60,023 |
+| WAL append (binary encode + fsync) | ~560 ns | 0 |
+| WAL replay — 100 entries | ~74 µs | 609 |
+| WAL replay — 1,000 entries | ~736 µs | 6,012 |
+| WAL replay — 10,000 entries | ~8,851 µs | 60,024 |
 
-WAL append costs ~476 ns including `fsync` on a warm buffer (benchmarked on a 20-thread
+WAL append costs ~560 ns including `fsync` on a warm buffer (benchmarked on a 20-thread
 x86_64 box; dominated by the `write(2)` + `fsync` syscall pair, not the encoder itself —
 see the WAL on-disk format section below for the binary v1 layout), making
 `DurabilityWAL` practical for most workloads. Replay is perfectly linear (10× entries
 = ~10× time). A 10,000-entry WAL replays in ~9 ms; the prepared-statement cache on the
-writer brings replay throughput to ~165k entries/s by reusing one `*sql.Stmt` per
-distinct SQL string instead of preparing on every entry.
+writer brings end-to-end replay throughput on `TestPProf_WAL_Replay` to ~99k entries/s
+by reusing one `*sql.Stmt` per distinct SQL string instead of preparing on every entry.
 
 ## WAL on-disk format
 
@@ -1371,8 +1371,8 @@ for archiving and third-party tooling.
 
 | Operation | Latency |
 |---|---|
-| Open (fresh, no snapshot) | ~85 µs |
-| Open + restore (1,000-row snapshot) | ~278 µs |
+| Open (fresh, no snapshot) | ~81 µs |
+| Open + restore (1,000-row snapshot) | ~271 µs |
 
 Open cost covers driver registration, pragma application via the connect hook, and
 `InitSchema` execution. Restore adds a full SQLite backup-API round-trip (file → temp →
@@ -1595,7 +1595,7 @@ memdb/
 │   ├── compressed.go       # zstd compression wrapper (fixed at SpeedFastest)
 │   └── encrypted.go        # AES-256-GCM encryption wrapper (implements AuthenticatedBackend)
 ├── stmt_cache.go           # Prepared-statement cache (writer); multi-statement bypass
-├── BENCHMARKS.md           # v1.5.0 benchmark report with pprof analysis
+├── BENCHMARKS.md           # v1.6.1 benchmark report with pprof analysis
 ├── Makefile                # Build, test, lint, benchmark, profiling, release
 └── cmd/
     └── memdb/              # CLI: serve [--pprof], snapshot, restore
