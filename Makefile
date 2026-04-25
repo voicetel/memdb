@@ -435,6 +435,14 @@ pprof-server-connect: dirs ## Rapid connect/query/disconnect cycle (short-lived-
 		$(GO) test -v -timeout 60s -run "TestPProf_Server_Connect$$" ./server/...
 	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_server_connect.*$(NC)"
 
+.PHONY: pprof-raft
+pprof-raft: dirs ## Capture CPU/heap profile of the Raft Apply path (3-node cluster, sustained writes through consensus)
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	@echo -e "$(BLUE)Capturing Raft pprof profiles into $(COVERAGE_DIR)/pprof...$(NC)"
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 120s -run "TestPProf_Raft_" ./replication/raft/...
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_raft_*$(NC)"
+
 .PHONY: pprof-view
 pprof-view: ## Open the last captured CPU profile in the pprof web UI (PROF=<path>)
 	@if [ -z "$(PROF)" ]; then \

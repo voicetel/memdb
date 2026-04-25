@@ -1,8 +1,6 @@
 package raft
 
 import (
-	"bytes"
-	"encoding/gob"
 	"fmt"
 	"io"
 	"time"
@@ -10,28 +8,6 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/voicetel/memdb/replication"
 )
-
-func init() {
-	// Register concrete types that may appear as SQL argument values in
-	// WALEntry.Args so that gob can encode and decode []any correctly
-	// across process boundaries and after restarts.
-	gob.Register(int(0))
-	gob.Register(int8(0))
-	gob.Register(int16(0))
-	gob.Register(int32(0))
-	gob.Register(int64(0))
-	gob.Register(uint(0))
-	gob.Register(uint8(0))
-	gob.Register(uint16(0))
-	gob.Register(uint32(0))
-	gob.Register(uint64(0))
-	gob.Register(float32(0))
-	gob.Register(float64(0))
-	gob.Register(bool(false))
-	gob.Register(string(""))
-	gob.Register([]byte(nil))
-	gob.Register(time.Time{})
-}
 
 // FSM implements raft.FSM using a *sql.DB-compatible exec function as the
 // state machine. All nodes in the cluster apply the same WAL entries in
@@ -93,8 +69,8 @@ func (f *FSM) Apply(log *raft.Log) (result any) {
 		}
 	}()
 
-	var entry replication.WALEntry
-	if err := gob.NewDecoder(bytes.NewReader(log.Data)).Decode(&entry); err != nil {
+	entry, err := replication.DecodeEntry(log.Data)
+	if err != nil {
 		return fmt.Errorf("raft fsm: decode: %w", err)
 	}
 	if err := f.execFn(entry.SQL, entry.Args...); err != nil {
@@ -150,13 +126,17 @@ func (s *fsmSnapshot) Release() {}
 // raft.ErrNotLeader from r.Apply if this node is not the leader. A pre-check
 // would introduce a TOCTOU race (leadership can be lost between the check and
 // the actual Apply call).
+//
+// The wire encoding is the package replication binary v1 format. pprof of
+// the FSM Apply path showed encoding/gob accounting for ~31% of CPU; the
+// binary codec is the same one already used by the WAL hot path.
 func Apply(r *raft.Raft, entry replication.WALEntry, timeout time.Duration) error {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(entry); err != nil {
+	data, err := replication.EncodeEntry(nil, entry)
+	if err != nil {
 		return fmt.Errorf("raft: encode entry: %w", err)
 	}
 
-	future := r.Apply(buf.Bytes(), timeout)
+	future := r.Apply(data, timeout)
 	if err := future.Error(); err != nil {
 		return fmt.Errorf("raft: apply: %w", err)
 	}

@@ -3,7 +3,6 @@ package raft_test
 import (
 	"bytes"
 	"context"
-	"encoding/gob"
 	"errors"
 	"io"
 	"reflect"
@@ -97,11 +96,11 @@ func newSingleNodeRaft(t *testing.T, fsm hraft.FSM) *hraft.Raft {
 
 func encodeEntry(t *testing.T, entry replication.WALEntry) []byte {
 	t.Helper()
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(entry); err != nil {
-		t.Fatalf("gob encode: %v", err)
+	data, err := replication.EncodeEntry(nil, entry)
+	if err != nil {
+		t.Fatalf("encode entry: %v", err)
 	}
-	return buf.Bytes()
+	return data
 }
 
 func noopFSM() *memraft.FSM {
@@ -172,11 +171,11 @@ func TestFSM_Apply_BadGob(t *testing.T) {
 
 	fsm := noopFSM()
 
-	log := &hraft.Log{Data: []byte("not gob data at all")}
+	log := &hraft.Log{Data: []byte("not a valid binary entry at all")}
 	result := fsm.Apply(log)
 
 	if result == nil {
-		t.Fatal("expected non-nil error result for bad gob data")
+		t.Fatal("expected non-nil error result for malformed log data")
 	}
 	if _, ok := result.(error); !ok {
 		t.Errorf("expected result to be an error, got: %T %v", result, result)

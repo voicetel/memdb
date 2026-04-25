@@ -8,8 +8,15 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// CompressedBackend wraps any Backend with zstd compression.
-// Typical SQLite files compress 50-70% at default settings.
+// CompressedBackend wraps any Backend with zstd compression at the
+// SpeedFastest level. Snapshot bytes are highly compressible
+// (SQLite pages are repetitive headers + zero-padded slack space) so
+// SpeedFastest still yields ~50% size reduction while running roughly
+// 2× faster than the default encoder level — pprof of the flush path
+// showed zstd encode dominating CPU at the default level. The level is
+// fixed because flushes are an internal hot path, not a tunable knob;
+// callers who want a different size/CPU trade can wrap their own
+// io.Pipe + zstd.Encoder around an inner backend.
 type CompressedBackend struct {
 	Inner Backend
 }
@@ -30,7 +37,7 @@ func (b *CompressedBackend) Exists(ctx context.Context) (bool, error) {
 
 func (b *CompressedBackend) Write(ctx context.Context, r io.Reader) error {
 	pr, pw := io.Pipe()
-	enc, err := zstd.NewWriter(pw)
+	enc, err := zstd.NewWriter(pw, zstd.WithEncoderLevel(zstd.SpeedFastest))
 	if err != nil {
 		return fmt.Errorf("compressed backend: encoder: %w", err)
 	}

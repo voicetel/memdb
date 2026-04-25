@@ -233,6 +233,26 @@ type ExternalBackend interface {
 	Read(ctx context.Context) (io.ReadCloser, error)
 }
 
+// AuthenticatedBackend is an optional capability marker an ExternalBackend
+// may implement to declare that it provides its own authenticated
+// integrity (typically AEAD encryption such as AES-GCM). When the
+// adapter detects this marker and Authenticated returns true, the
+// 40-byte MDBK SHA-256 header normally prepended to every snapshot is
+// skipped — the backend's own authentication tag is the integrity check.
+//
+// Why this matters: pprof of the encrypted-flush path showed sha256
+// blockSHANI at ~17% of CPU. AEAD wrappers like backends.EncryptedBackend
+// already authenticate the payload, so the SHA pass is redundant.
+//
+// Backward compatibility on restore is preserved: the adapter inspects
+// the first four bytes of the stored payload. A snapshot written before
+// the marker was added still has the MDBK header and is verified
+// normally; a new headerless snapshot is loaded directly without a
+// "legacy" warning when the inner backend is Authenticated.
+type AuthenticatedBackend interface {
+	Authenticated() bool
+}
+
 // WrapBackend adapts any ExternalBackend so it can be used as Config.Backend.
 // The adapter serialises the in-memory DB to bytes (via copyMemToWriter) before
 // calling Write, and deserialises bytes back into memory (via copyReaderToMem)
@@ -256,15 +276,45 @@ func (a *externalBackendAdapter) Exists(ctx context.Context) (bool, error) {
 	return a.inner.Exists(ctx)
 }
 
-// flush serialises the in-memory DB to a byte stream, prepends the SHA-256
-// checksum header, and passes the complete (header + payload) stream to the
-// external backend's Write method.
+// flush serialises the in-memory DB to a byte stream and passes it to the
+// external backend's Write method. By default the stream is prefixed with
+// the 40-byte MDBK SHA-256 integrity header; when the inner backend
+// implements AuthenticatedBackend and reports true, the header is skipped
+// because the backend's own authenticator (e.g. AES-GCM tag) is the
+// integrity check.
 //
 // We buffer the payload in memory so that SHA-256 can be computed before the
 // header is written. For very large databases this trades memory for integrity
 // guarantees; operators with multi-GiB datasets may prefer to accept the
 // memory cost or switch to the local backend which writes to a temp file.
 func (a *externalBackendAdapter) flush(ctx context.Context, d *DB) error {
+	if a.skipHeader() {
+		// AEAD backends authenticate their own payloads; stream raw bytes
+		// directly to avoid the redundant SHA-256 pass measured at ~17%
+		// of CPU in the encrypted-flush pprof.
+		pr, pw := io.Pipe()
+
+		var copyErr error
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			copyErr = copyMemToWriter(ctx, d, pw, d.cfg.BackupStepPages)
+			pw.CloseWithError(copyErr)
+		}()
+
+		writeErr := a.inner.Write(ctx, pr)
+		pr.CloseWithError(writeErr)
+		<-done
+
+		if copyErr != nil {
+			return fmt.Errorf("external backend: serialize: %w", copyErr)
+		}
+		if writeErr != nil {
+			return fmt.Errorf("external backend: write: %w", writeErr)
+		}
+		return nil
+	}
+
 	// Step 1: buffer the raw SQLite bytes.
 	var sw snapshotWriter
 	if err := copyMemToWriter(ctx, d, &sw, d.cfg.BackupStepPages); err != nil {
@@ -297,8 +347,20 @@ func (a *externalBackendAdapter) flush(ctx context.Context, d *DB) error {
 	return nil
 }
 
+// skipHeader reports whether the inner backend opts out of the SHA-256
+// integrity header by implementing AuthenticatedBackend with a true
+// return. Hidden behind a helper so the interface assertion happens in
+// one place and adding more capability markers later stays cheap.
+func (a *externalBackendAdapter) skipHeader() bool {
+	ab, ok := a.inner.(AuthenticatedBackend)
+	return ok && ab.Authenticated()
+}
+
 // restore reads a snapshot from the external backend, verifies its SHA-256
-// checksum, and deserialises the payload into the in-memory DB.
+// checksum, and deserialises the payload into the in-memory DB. When the
+// inner backend is Authenticated, an absent MDBK header is treated as the
+// new headerless format rather than a legacy snapshot — no warning is
+// emitted because the AEAD tag has already authenticated the bytes.
 func (a *externalBackendAdapter) restore(ctx context.Context, d *DB) error {
 	rc, err := a.inner.Read(ctx)
 	if err != nil {
@@ -310,7 +372,7 @@ func (a *externalBackendAdapter) restore(ctx context.Context, d *DB) error {
 	if err != nil {
 		return fmt.Errorf("external backend: %w", err)
 	}
-	if isLegacy {
+	if isLegacy && !a.skipHeader() {
 		d.logger().Warn("memdb: snapshot has no integrity checksum (legacy format); " +
 			"the next flush will upgrade it to the checksummed format")
 	}

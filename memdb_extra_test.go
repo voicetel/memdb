@@ -2,6 +2,7 @@ package memdb_test
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -531,6 +532,74 @@ func TestWAL_Replay_CorruptEntry(t *testing.T) {
 }
 
 // ── WrapBackend end-to-end ────────────────────────────────────────────────────
+
+// TestWrapBackend_AuthenticatedSkipsHeader exercises the AuthenticatedBackend
+// opt-out: a snapshot flushed through EncryptedBackend → LocalBackend has
+// the SHA-256 MDBK header skipped (the AES-GCM tag is the integrity
+// check), and the same backend chain restores it cleanly without
+// triggering the legacy-snapshot warning.
+//
+// Verification is by round-trip — the row inserted before flush must be
+// visible after a fresh Open against the same backend. A failure to
+// honour the headerless format would surface as either an integrity
+// check error during restore or as garbage SQLite bytes (because the
+// 40-byte non-header would be passed to sqlite3_deserialize).
+func TestWrapBackend_AuthenticatedSkipsHeader(t *testing.T) {
+	dir := t.TempDir()
+	backendPath := filepath.Join(dir, "encrypted.db")
+
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		t.Fatal(err)
+	}
+
+	openCfg := func() memdb.Config {
+		return memdb.Config{
+			Backend: memdb.WrapBackend(&backends.EncryptedBackend{
+				Inner: &backends.LocalBackend{Path: backendPath},
+				Key:   key,
+			}),
+			FlushInterval: -1,
+			Logger:        silentLogger(),
+			InitSchema: func(db *memdb.DB) error {
+				_, err := db.Exec(`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`)
+				return err
+			},
+		}
+	}
+
+	db, err := memdb.Open(openCfg())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES ('aead-key', 'aead-val')`); err != nil {
+		db.Close()
+		t.Fatalf("Exec: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.Flush(ctx); err != nil {
+		db.Close()
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db2, err := memdb.Open(openCfg())
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	defer db2.Close()
+
+	var val string
+	if err := db2.QueryRow(`SELECT value FROM kv WHERE key = 'aead-key'`).Scan(&val); err != nil {
+		t.Fatalf("QueryRow after restore: %v", err)
+	}
+	if val != "aead-val" {
+		t.Errorf("expected 'aead-val', got %q", val)
+	}
+}
 
 func TestWrapBackend_FlushAndRestore(t *testing.T) {
 	dir := t.TempDir()

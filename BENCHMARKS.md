@@ -5,6 +5,24 @@ throughput scenarios. All numbers captured in a single session against the
 commit tagged `v1.5.0` after the pprof-driven optimisation sprint; see the
 Setup section for the exact environment.
 
+> **Update for v1.6.0** — a second pprof sweep removed the remaining `gob`
+> usage from the Raft FSM apply path (`replication/codec.go`, shared with
+> the WAL hot path), added a writer-side prepared-statement cache
+> (`stmt_cache.go`), let AEAD backends opt out of the SHA-256 snapshot
+> header (`memdb.AuthenticatedBackend`), and pinned `CompressedBackend` to
+> `zstd.SpeedFastest`. Measured deltas from `make pprof`:
+>
+> | Scenario | v1.5 | v1.6 | Delta |
+> |---|---:|---:|---:|
+> | Raft Apply (3-node cluster, writes/s) | 5,082 | 12,579 | **2.47×** |
+> | Contended writes (16 goroutines, ops/s) | 163,186 | 224,568 | **1.38×** |
+> | WAL cold-start replay (entries/s) | 123,687 | 164,595 | **1.33×** |
+> | Compressed flush (CPU samples, 5×50k rows) | 120 ms | 90 ms | **−25 %** |
+> | Encrypted flush (CPU samples) | 60 ms | 50 ms; SHA-256 fully removed | **−17 %** |
+>
+> Numbers from `/tmp/memdb-prof-after/` on the v1.5 setup — re-run `make pprof`
+> on your hardware for fresh comparisons.
+
 > Re-run with `make bench`, `make pprof`, and `make pprof-server` from the
 > repo root. Raw output is written to `coverage/bench.txt` and the `.prof`
 > files land in `coverage/pprof/` — both are gitignored, so a fresh run

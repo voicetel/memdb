@@ -14,10 +14,11 @@ Think Redis RDB+AOF semantics with full SQL query power — in a single Go impor
 - **2.02× faster writes** — all writes hit memory; no VFS, no page-cache overhead
 - **Sub-millisecond reads** — all queries hit memory, no disk I/O on the hot path
 - **Concurrent reads** — channel-based replica pool (`ReadPoolSize`) is ~26% faster than file SQLite at 4 goroutines (and 2.74× faster than memdb without the pool)
+- **Prepared-statement cache** — repeated `Exec`/`Query` against the writer skip per-call Prepare/Close; ~1.4× contended write throughput from a single `sync.Map[string]*sql.Stmt`
 - **Configurable durability** — periodic snapshot only, WAL-backed near-zero loss, or fully synchronous
 - **Atomic snapshots** — write-then-rename prevents corrupt state on crash
-- **Pluggable backends** — local disk or any custom `Backend` implementation
-- **Snapshot compression** — zstd compression built in, ~50-70% size reduction on typical schemas
+- **Pluggable backends** — local disk or any custom `Backend` implementation; AEAD backends opt out of the redundant SHA-256 snapshot header via `AuthenticatedBackend`
+- **Snapshot compression** — zstd at `SpeedFastest` built in, ~50-60% size reduction on typical schemas, ~2× faster encode than the default level
 - **Change notifications** — `OnChange` hook via SQLite update hook for cache invalidation and audit
 - **Panic-safe callbacks** — `OnChange`, `OnFlushError`, `OnFlushComplete`, and background goroutines recover panics so a misbehaving callback cannot crash the process.
 - **Raft replication** — strong-consistency multi-node replication via `hashicorp/raft` over mutual TLS; any node accepts writes and transparently forwards to the leader
@@ -320,7 +321,10 @@ cfg.Backend = memdb.WrapBackend(&backends.CompressedBackend{
 })
 ```
 
-Uses zstd compression. Typical SQLite files compress 50–70% at default settings.
+Uses zstd compression at `SpeedFastest` — pprof showed the default level
+dominating CPU on a frequently-flushed hot path; `SpeedFastest` halves
+encoder CPU for ~10% larger snapshots, the right trade for snapshots that
+get rewritten often. Typical SQLite files still compress 50–60%.
 
 ### Encrypted (wraps any backend)
 
@@ -335,7 +339,10 @@ cfg.Backend = memdb.WrapBackend(&backends.EncryptedBackend{
 ```
 
 AES-256-GCM encryption. The nonce is prepended to the ciphertext; each flush
-generates a fresh random nonce.
+generates a fresh random nonce. `EncryptedBackend` implements
+`memdb.AuthenticatedBackend`, so the adapter skips its 40-byte SHA-256
+snapshot header — the GCM tag already provides authenticated integrity, and
+SHA-256 was measured at ~17% of the encrypted-flush CPU profile.
 
 Backends compose freely — compression and encryption are independent layers that
 stack in any order:
@@ -367,6 +374,21 @@ cfg.Backend = memdb.WrapBackend(myCustomBackend)
 `Write` receives a stream of the raw SQLite database bytes. `Read` must return
 those exact bytes. `Exists` should return `false, nil` (not an error) when no
 snapshot has been written yet.
+
+A custom backend that already authenticates its payload (AEAD encryption,
+HMAC, signed object stores, etc.) can opt out of the adapter's redundant
+SHA-256 snapshot header by additionally implementing
+`memdb.AuthenticatedBackend`:
+
+```go
+type AuthenticatedBackend interface {
+    Authenticated() bool
+}
+```
+
+Returning `true` causes the adapter to write the SQLite payload directly
+and to suppress the legacy-snapshot warning on restore when the bytes
+do not start with the `MDBK` header.
 
 ---
 
@@ -745,7 +767,7 @@ store, or FSM path is caught immediately.
 | `TestReplication_WriteThroughFollower` | Follower-submitted writes are forwarded and preserve global log order |
 | `TestReplication_ConcurrentWriters` | 8 goroutines × 25 writes produce identical FSM state on every node with no duplicates or drops |
 | `TestReplication_LeaderRestart` | Cluster re-elects and keeps replicating after the leader is shut down |
-| `TestReplication_HighVolume_NoCorruption` | 500-entry soak with 6 argument types exercising every gob-registered scalar |
+| `TestReplication_HighVolume_NoCorruption` | 500-entry soak with 6 argument types exercising every binary-codec scalar |
 | `TestReplication_Snapshot_RestoresCleanly` | 10 000 entries force multiple snapshot cycles without divergence |
 | `TestReplication_NotLeader_Returned` | Writes fail cleanly with `ErrNotLeader` when forwarding is unavailable |
 | `TestReplication_StateAPIs` | `Stats`, `IsLeader`, `LeaderAddr` remain safe and consistent |
@@ -911,19 +933,25 @@ A set of `make` targets runs representative workloads and writes profiles to
 `./coverage/pprof/`:
 
 ```bash
-make pprof              # run all pprof-capturing scenarios
+make pprof              # run all pprof-capturing scenarios in package memdb
 make pprof-writes       # single-writer INSERT workload
 make pprof-reads        # concurrent read workload (replica pool)
-make pprof-mixed        # mixed read/write workload
-make pprof-flush        # flush path at 50 000 rows
+make pprof-mixed        # mixed read/write workload (2 ms and default refresh)
+make pprof-flush        # flush path at 50 000 rows (bare; compressed and
+                        # encrypted variants run via the full pprof target)
 make pprof-wal          # DurabilityWAL writes
+make pprof-server       # PostgreSQL wire-protocol server scenarios
+make pprof-raft         # Raft Apply on a 3-node cluster
 make bench-pprof        # benchmarks with -cpuprofile / -memprofile / -mutex / -block
 make pprof-view PROF=./coverage/pprof/pprof_writes.cpu.prof
 ```
 
-The underlying tests live in `memdb_pprof_test.go` and are gated behind the
-`MEMDB_PPROF=1` environment variable so the default `go test ./...` run never
-writes profile artefacts.
+The underlying tests live in `memdb_pprof_test.go`, `server/server_pprof_test.go`,
+and `replication/raft/raft_pprof_test.go`, all gated behind the `MEMDB_PPROF=1`
+environment variable so the default `go test ./...` run never writes profile
+artefacts. Coverage includes Raft FSM Apply, writer-pool contention (mutex +
+block), WAL cold-start replay, compressed and encrypted flush paths, TLS
+handshake cost, and a Postgres-wire allocations diff.
 
 ---
 
@@ -1172,17 +1200,17 @@ gain because both backends serve hot pages from RAM; the difference is the VFS a
 cost alone. For bulk operations and range scans the bottleneck shifts to SQLite's B-tree and
 cursor machinery, which is identical for both backends, so the gap narrows to **~1–6%**.
 
-`memdb + WAL` appends a binary-encoded entry and calls `fsync` after every `Exec`. Since
-the v1.4 sprint the WAL hot path uses a hand-rolled binary wire format in place of
-`encoding/gob`, which previously accounted for ~25% of total CPU under `DurabilityWAL`
-in pprof traces. In v1.5.0 a zero-alloc optimisation pre-reserves the 4-byte length prefix
-in the pool buffer, eliminating a `make+copy` per write. `BenchmarkWAL_Append` now measures
-**~476 ns/op, 0 B/op, 0 allocs/op** (down from 2,809 ns/op, 1,602 B/op, 20 allocs/op in
-v1.3; ~26% faster than the v1.5.0 pre-optimisation baseline of 642 ns). End-to-end
-WAL-durability insert throughput in `TestPProf_Writes_WAL` reaches 200k writes/s. Even with
-the per-write `fsync` included, `DurabilityWAL` (4,559 ns/op) remains **1.63× faster than
-`file/sync=off`** (7,436 ns/op) on INSERT — you get near-zero data loss durability while
-still beating an unprotected file database.
+`memdb + WAL` appends a binary-encoded entry and calls `fsync` after every `Exec`. The
+WAL hot path uses a hand-rolled binary wire format (defined in package `replication`
+as `EncodeEntry` / `DecodeEntry`, shared with the Raft FSM) in place of `encoding/gob`,
+which previously accounted for ~25% of total CPU under `DurabilityWAL` in pprof traces.
+A zero-alloc optimisation pre-reserves the 4-byte length prefix in the pool buffer,
+eliminating a `make+copy` per write. `BenchmarkWAL_Append` measures **~476 ns/op,
+0 B/op, 0 allocs/op** (down from 2,809 ns/op, 1,602 B/op, 20 allocs/op pre-binary-codec).
+End-to-end WAL-durability insert throughput in `TestPProf_Writes_WAL` reaches 200k
+writes/s. Even with the per-write `fsync` included, `DurabilityWAL` (4,559 ns/op) remains
+**1.63× faster than `file/sync=off`** (7,436 ns/op) on INSERT — you get near-zero data
+loss durability while still beating an unprotected file database.
 
 The `synchronous` pragma barely matters on fast NVMe storage (`off` vs `full` is only 5%).
 On spinning disk or network-attached storage the gap would be many milliseconds per commit,
@@ -1245,9 +1273,11 @@ workloads; avoid flushing more frequently than every few seconds on a hot write 
 
 WAL append costs ~476 ns including `fsync` on a warm buffer (benchmarked on a 20-thread
 x86_64 box; dominated by the `write(2)` + `fsync` syscall pair, not the encoder itself —
-see the WAL on-disk format section below for the binary v1 layout that replaced
-`encoding/gob`), making `DurabilityWAL` practical for most workloads. Replay is perfectly
-linear (10× entries = ~10× time). A 10,000-entry WAL replays in ~9 ms.
+see the WAL on-disk format section below for the binary v1 layout), making
+`DurabilityWAL` practical for most workloads. Replay is perfectly linear (10× entries
+= ~10× time). A 10,000-entry WAL replays in ~9 ms; the prepared-statement cache on the
+writer brings replay throughput to ~165k entries/s by reusing one `*sql.Stmt` per
+distinct SQL string instead of preparing on every entry.
 
 ## WAL on-disk format
 
@@ -1257,27 +1287,21 @@ The WAL file is a simple append-only sequence of length-prefixed records:
 [4-byte big-endian length][record body]
 ```
 
-The record body is one of:
+Each record body is the binary v1 format defined in package `replication`: it
+begins with the 4-byte magic `"MDBW"` followed by a 1-byte version tag, then
+`uint64 seq`, `int64 timestamp`, a length-prefixed SQL string, and a
+length-prefixed tagged argument list. The same codec is used by the Raft FSM
+apply path so a single hand-rolled encoder serves both the WAL hot path and
+inter-node replication. `encoding/gob` was measured at ~25% of total CPU on
+the WAL hot path and ~31% on the FSM apply path before the swap.
 
-1. **Binary v1** (current, preferred) — begins with the 4-byte magic `"MDBW"`
-   followed by a 1-byte version tag. The rest is a purpose-built binary
-   encoding of `WALEntry` (`uint64 seq`, `int64 timestamp`, length-prefixed SQL
-   string, length-prefixed tagged argument list). Replaces the previous
-   `encoding/gob` encoding — measured at ~25% of total CPU in pprof traces
-   before the change, now below 1%.
-
-2. **Legacy gob** — the format used by memdb versions prior to v1.4. A record
-   that does not begin with the binary magic is decoded as gob so existing
-   on-disk WAL files continue to replay correctly after an in-place upgrade.
-   Mixed-format files (legacy records followed by binary records appended
-   after the upgrade) are supported.
-
-Supported argument types in the binary format: `nil`, all signed integers
-(widened to `int64` on decode), all unsigned integers (widened to `uint64`),
-`float32`/`float64` (widened to `float64`), `bool`, `string`, `[]byte`, and
-`time.Time` (stored as `UnixNano` and decoded in UTC). Arguments of any
-other Go type are rejected with `memdb.ErrWALUnsupportedArgType` so callers
-see the failure at `Exec` time rather than losing the entry silently.
+Supported argument types: `nil`, all signed integers (widened to `int64` on
+decode), all unsigned integers (widened to `uint64`), `float32`/`float64`
+(widened to `float64`), `bool`, `string`, `[]byte`, and `time.Time` (stored
+as `UnixNano` and decoded in UTC). Arguments of any other Go type are
+rejected with `memdb.ErrWALUnsupportedArgType` (aliased to
+`replication.ErrUnsupportedArgType`) so callers see the failure at `Exec`
+time rather than losing the entry silently.
 
 Records with a corrupt header, truncated body, or unknown binary version
 tag cause `Replay` to stop at that record and return every prior valid
@@ -1300,6 +1324,15 @@ On restore the checksum is verified; a mismatch returns `ErrSnapshotCorrupt`
 so a corrupt or partially-written snapshot is never silently loaded. Legacy
 snapshots written without the header are accepted with a warning and are
 upgraded (header prepended) on the next flush.
+
+**AEAD backends skip the header.** External backends that implement
+`memdb.AuthenticatedBackend` with a `true` return advertise that they
+already authenticate their payload (e.g. `backends.EncryptedBackend`'s
+AES-256-GCM tag). For these the adapter writes the SQLite bytes directly
+— the redundant SHA-256 pass would double the integrity work without
+adding security. On restore, an absent `MDBK` header is treated as the
+new headerless format (no warning) when the inner backend is
+authenticated; otherwise it is treated as legacy as before.
 
 #### Direct access with the sqlite3 CLI
 
@@ -1547,18 +1580,21 @@ memdb/
 │   └── server_pprof_test.go # Server pprof-capture scenarios (MEMDB_PPROF=1 gated)
 ├── replication/
 │   ├── replication.go      # WALEntry type (shared between packages)
+│   ├── codec.go            # Binary v1 EncodeEntry/DecodeEntry; shared by WAL + Raft FSM
 │   └── raft/
-│       ├── raft.go         # FSM: Apply, Snapshot, Restore; gob type registry
+│       ├── raft.go         # FSM: Apply (binary v1 decode), Snapshot, Restore; Apply submitter
 │       ├── node.go         # Node: NewNode, Exec, forward, AddVoter, Shutdown
 │       ├── tls.go          # tlsStreamLayer — TLS StreamLayer for hashicorp/raft
 │       ├── forwarder.go    # Write-forwarding RPC server (leader side, WaitGroup tracked)
 │       ├── rpc.go          # ForwardRequest/Response wire protocol; channel-based ConnPool
 │       ├── store.go        # Crash-safe fileLogStore + fileStableStore
+│       ├── raft_pprof_test.go # Raft Apply pprof scenario (MEMDB_PPROF=1 gated)
 │       └── replication_integrity_test.go # 3-node end-to-end convergence / failover
 ├── backends/
 │   ├── local.go            # Atomic local file backend
-│   ├── compressed.go       # zstd compression wrapper
-│   └── encrypted.go        # AES-256-GCM encryption wrapper
+│   ├── compressed.go       # zstd compression wrapper (fixed at SpeedFastest)
+│   └── encrypted.go        # AES-256-GCM encryption wrapper (implements AuthenticatedBackend)
+├── stmt_cache.go           # Prepared-statement cache (writer); multi-statement bypass
 ├── BENCHMARKS.md           # v1.5.0 benchmark report with pprof analysis
 ├── Makefile                # Build, test, lint, benchmark, profiling, release
 └── cmd/
