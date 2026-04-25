@@ -1603,7 +1603,21 @@ memdb/
 
 ---
 
-## License
+## 🙌 Contributors
+
+We welcome contributions! Thanks to these awesome people:
+
+- [Michael Mavroudis](https://github.com/mavroudis) - Lead Developer & Architect
+
+## 💖 Sponsors
+
+Proudly supported by:
+
+| Sponsor | Contribution |
+|---------|--------------|
+| [VoiceTel Communications](http://www.voicetel.com) | Primary development and testing infrastructure |
+
+## 📄 License
 
 This project is licensed under the MIT License with the Commons Clause - see the [LICENSE](LICENSE) file for details.
 

@@ -358,14 +358,18 @@ concurrent reads, and **2.18× faster than `memdb` without the pool**.
 
 ## Profile analysis (what the pprof files say)
 
+All percentages below are read off the v1.6.1 profile captures in
+`coverage/pprof/`. Open any file with
+`go tool pprof -http=: coverage/pprof/<file>.prof` to reproduce.
+
 ### `pprof_reads.cpu.prof` — 655k reads/s
 
 | Function | cum % | Comment |
 |---|---:|---|
-| `TestPProf_Reads_Replicas.func1.1` | 93.2 % | user goroutine doing the work |
-| `database/sql.withLock` | 71.6 % | driver-internal lock (unavoidable) |
-| `memdb.(*DB).QueryRowContext` | 54.3 % | our entry point |
-| `runtime.cgocall` (flat 39.6 %) | 49.4 % | crossing into SQLite (unavoidable) |
+| `TestPProf_Reads_Replicas.func1.1` | 95.1 % | user goroutine doing the work |
+| `database/sql.withLock` | 76.8 % | driver-internal lock (unavoidable) |
+| `memdb.(*DB).QueryRowContext` | 56.1 % | our entry point |
+| `runtime.cgocall` (flat 45.0 %) | 55.4 % | crossing into SQLite (unavoidable) |
 
 `replicaRefreshLoop` does not appear in the top 10 — after the
 write-generation short-circuit and the fast-path tick, it is below the
@@ -373,58 +377,77 @@ write-generation short-circuit and the fast-path tick, it is below the
 
 ### `pprof_writes_wal.cpu.prof` — 183k WAL writes/s
 
-| Function | flat % | Comment |
-|---|---:|---|
-| `runtime.cgocall` | 59.3 % | SQLite work (unavoidable) |
-| `internal/runtime/syscall.Syscall6` | 6.9 % | `write(2)` + `fsync(2)` |
-| `WAL.Append` (self + cum 9.8 %) | <1 % | our encoder |
-| `runtime.casgstatus` | 3.3 % | goroutine scheduling |
-| (no `encoding/gob.*` anywhere) | — | eliminated by the v1.4 binary format |
-| (no allocation site in `WAL.Append`) | — | eliminated by the v1.5.0 zero-alloc change |
+| Function | flat % | cum % | Comment |
+|---|---:|---:|---|
+| `runtime.cgocall` | 55.5 % | 60.7 % | SQLite work (unavoidable) |
+| `internal/runtime/syscall.Syscall6` | 11.2 % | 11.2 % | `write(2)` + `fsync(2)` |
+| `database/sql.resultFromStatement` | 1.3 % | 68.3 % | driver result handling |
+| `memdb.(*stmtCache).ExecContext` | <1 % | 75.6 % | prepared-stmt cache (v1.6.0) |
+| `WAL.Append` | <1 % | 15.8 % | our encoder; dominated by `fsync` |
 
-`gob` is completely absent from the profile, confirming the v1.4 change
-carries through to v1.5. The `WAL.Append` cumulative dropped from 13.8 %
-to 9.8 % after the zero-alloc optimisation — the function is now dominated
-by the `write(2)` + `fsync(2)` pair which cannot be eliminated.
+`gob` is completely absent from the profile, confirming the v1.4 binary
+codec change carries through to v1.6.1. The new `(*stmtCache).ExecContext`
+node at 75.6 % cumulative is the v1.6.0 prepared-statement cache — it
+sits in front of `database/sql.(*Stmt).ExecContext` and lets repeated
+INSERT statements skip per-call `Prepare`/`Close`. `WAL.Append` itself
+remains a thin wrapper around the `write(2)` + `fsync(2)` pair, which
+cannot be eliminated.
+
+> Note: server pprof captures land in `server/coverage/pprof/` (the test
+> resolves the `MEMDB_PPROF_DIR` env var relative to the package), so
+> `coverage/pprof/` at the repo root will not contain `pprof_server_*`
+> files. Use the package-relative path when running `go tool pprof`.
 
 ### `pprof_server_select_wide.cpu.prof` — 7 939 q/s, 500 rows each
 
-| Function | flat % | Comment |
-|---|---:|---|
-| `internal/runtime/syscall.Syscall6` | 45.1 % | CGO sqlite3 reads |
-| `runtime.cgocall` | 13.6 % | cgo boundary crossing |
-| `handleSelect` (self + cum 35.8 %) | 1.5 % | our handler |
-| `bufio.(*Writer).Flush` | 0.9 % | **single** flush per response (was ~6 with 4 KB buffer) |
-| `internal/poll.(*FD).Write` | 1.6 % cum | network write — low after 32 KB buffer |
+| Function | flat % | cum % | Comment |
+|---|---:|---:|---|
+| `internal/runtime/syscall.Syscall6` | 45.8 % | 45.8 % | cgo + network read/write |
+| `runtime.cgocall` | 15.2 % | 21.8 % | cgo boundary crossing |
+| `memdb/server.(*handler).handleSelect` | 0.9 % | 37.3 % | our handler |
+| `runtime.casgstatus` | 4.5 % | 5.9 % | goroutine scheduling |
 
-The dominant `Syscall6` at 45 % is now attributed to sqlite3's internal CGO
-read operations, not to network `write(2)` calls. `FD.Write` contributes
-only 1.6 % cumulative — confirming that the 32 KB write buffer collapses
-the ~6 mid-response implicit flushes into the one explicit `sendReadyForQuery`
-flush.
+The dominant `Syscall6` at 46 % is split between sqlite3's internal cgo
+read operations and the per-connection network reads on the test
+clients; the memdb-side handler (`handleSelect`) sits at 37 %
+cumulative and 0.9 % flat — almost all the time inside it is spent in
+`db.Query` and the row iteration loop, not in the handler's own code.
+`bufio.Writer.Flush` does not appear in the top 30 — confirming that
+the 32 KB server write buffer (v1.5.0) collapses the ~6 implicit
+mid-response flushes into a single explicit flush in
+`sendReadyForQuery`.
 
 ### `pprof_server_select_wide.heap.prof` — 7 939 q/s, 500 rows each
 
-Allocation rate: **~780 MB / 3 s** (rate scales with the higher
-throughput now that `ReadPoolSize=GOMAXPROCS` lets readers fan out).
+Cumulative allocation: **~1.84 GB / 3 s** (~613 MB/s).
 
 | Function | alloc_space % | Comment |
 |---|---:|---|
-| `mattn/go-sqlite3._Cfunc_GoStringN` | 45.4 % | cgo string copy — driver-internal |
-| `(*SQLiteRows).nextSyncLocked` | 41.7 % | driver row iteration |
-| `memdb/server.(*handler).handleSelect` | **< 1 %** | server handler overhead |
+| `mattn/go-sqlite3._Cfunc_GoStringN` | 29.5 % | cgo string copy — driver-internal |
+| `(*SQLiteRows).nextSyncLocked` (flat 28.4 %, cum 59.7 %) | 28.4 % | driver row iteration |
+| `memdb/server.(*handler).handleSelect` (flat 4.5 %, cum 85.3 %) | 4.5 % | server handler |
+| `(*SQLiteConn).prepare` | 3.1 % | per-query SQL prepare on replicas |
+| `memdb/server.trimTrailingNUL` | 2.3 % | wire-format helper |
+| `memdb/server.(*handler).sendRowDescription` | 1.9 % | column metadata write |
 
-The server-side row hotspots from v1.3 remain below the sampling threshold —
-remaining allocations are in the SQLite driver's cgo boundary, which cannot
-be optimised without replacing the driver.
+The dominant remaining hotspots are still inside `mattn/go-sqlite3`'s
+cgo boundary (the `_Cfunc_GoStringN` string copy and the row
+iteration), which cannot be reduced without replacing the driver. On
+the memdb side, `(*SQLiteConn).prepare` at 3.1 % is the per-query
+prepare on the read replicas (which deliberately bypass the writer's
+prepared-statement cache — `sqlite3_deserialize` invalidates statement
+handles on each refresh tick).
 
 ### `pprof_reads.block.prof`
 
-The biggest named blocker is `database/sql.(*DB).conn` (readers waiting
-for the per-replica single connection to free). This is by design: it is
-how the replica pool maintains mutual exclusion between open `*sql.Rows`
-cursors and `sqlite3_deserialize` calls during refresh. Adding more
-replicas (`ReadPoolSize`) scales this linearly.
+The biggest named blockers under the read replica pool are
+`runtime.selectgo` (62.6 %) and `runtime.chanrecv1` (36.8 %) — both are
+the channel-based replica check-in/check-out machinery in
+`replicaPool`. `database/sql.(*DB).conn` follows at 22.3 %: readers
+waiting for the per-replica single connection to free. This is by
+design — it is how the replica pool maintains mutual exclusion between
+open `*sql.Rows` cursors and `sqlite3_deserialize` calls during
+refresh. Adding more replicas (`ReadPoolSize`) scales this linearly.
 
 ---
 
