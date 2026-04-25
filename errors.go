@@ -1,6 +1,10 @@
 package memdb
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/voicetel/memdb/replication"
+)
 
 var (
 	ErrFlushFailed             = errors.New("memdb: flush to disk failed")
@@ -17,7 +21,12 @@ var (
 	//
 	// Supported arg types: nil, all integer widths, float32/64, bool,
 	// string, []byte, and time.Time.
-	ErrWALUnsupportedArgType = errors.New("memdb: wal: unsupported arg type")
+	//
+	// Aliased onto replication.ErrUnsupportedArgType so that the sentinel
+	// returned from the WAL hot path and the Raft FSM apply path is the
+	// same value — callers can use a single errors.Is check regardless of
+	// which encode site rejected the argument.
+	ErrWALUnsupportedArgType = replication.ErrUnsupportedArgType
 
 	// ErrSnapshotCorrupt is returned by Open/Restore when the on-disk
 	// snapshot fails its integrity checksum. The file exists but its

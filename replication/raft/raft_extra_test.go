@@ -3,7 +3,6 @@ package raft_test
 import (
 	"bytes"
 	"crypto/tls"
-	"encoding/gob"
 	"errors"
 	"io"
 	"net"
@@ -380,17 +379,19 @@ func TestApply_FutureFSMError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestApply_GobEncodeFailure_UnregisteredType
+// TestApply_EncodeFailure_UnsupportedType
 // ---------------------------------------------------------------------------
 
-// unregistered is an unexported struct type that is NOT registered with gob,
-// so it cannot be encoded when stored in an []any.
+// unregistered is an unexported struct type that is not in the binary
+// codec's supported argument set (nil/int*/uint*/float*/bool/string/
+// []byte/time.Time), so EncodeEntry rejects it with ErrUnsupportedArgType.
 type unregistered struct{ V int }
 
-// TestApply_GobEncodeFailure_UnregisteredType verifies that Apply returns a
-// non-nil error containing "encode" or "gob" when args contain a type that
-// gob cannot encode.
-func TestApply_GobEncodeFailure_UnregisteredType(t *testing.T) {
+// TestApply_EncodeFailure_UnsupportedType verifies that Apply returns a
+// non-nil error when args contain a type the binary codec cannot encode.
+// Pre-codec-swap this was a gob-encode failure; the assertion is unchanged
+// because the failure mode (Apply rejects the entry) is what matters.
+func TestApply_EncodeFailure_UnsupportedType(t *testing.T) {
 	t.Parallel()
 
 	fsm := noopFSM()
@@ -412,14 +413,25 @@ func TestApply_GobEncodeFailure_UnregisteredType(t *testing.T) {
 // TestFSM_Apply_AllRegisteredTypes
 // ---------------------------------------------------------------------------
 
-// TestFSM_Apply_AllRegisteredTypes verifies that all types registered in the
-// package's init() survive a full gob round-trip through FSM.Apply via a
-// single-node Raft cluster.
+// TestFSM_Apply_AllRegisteredTypes verifies that all argument types
+// supported by the binary codec survive a full encode/decode round-trip
+// through FSM.Apply via a single-node Raft cluster. The codec widens
+// signed integers to int64 on decode (documented in package replication),
+// so the expected values reflect that — int(1) on the wire decodes as
+// int64(1), not int(1).
 func TestFSM_Apply_AllRegisteredTypes(t *testing.T) {
 	t.Parallel()
 
-	wantArgs := []any{
+	sendArgs := []any{
 		int(1),
+		int64(2),
+		float64(3.14),
+		bool(true),
+		string("hello"),
+		[]byte("bytes"),
+	}
+	wantArgs := []any{
+		int64(1), // int widens to int64
 		int64(2),
 		float64(3.14),
 		bool(true),
@@ -451,7 +463,7 @@ func TestFSM_Apply_AllRegisteredTypes(t *testing.T) {
 	entry := replication.WALEntry{
 		Seq:  1,
 		SQL:  "INSERT INTO t VALUES (?,?,?,?,?,?)",
-		Args: wantArgs,
+		Args: sendArgs,
 	}
 	if err := memraft.Apply(r, entry, time.Second); err != nil {
 		t.Fatalf("Apply() returned unexpected error: %v", err)
@@ -501,15 +513,15 @@ func TestFSM_Apply_NonLogCommandType_IsIgnored(t *testing.T) {
 	)
 
 	// A LogNoop entry has empty Data. Passing it to FSM.Apply exercises the
-	// error path (bad gob) without panicking.
+	// decode-error path without panicking.
 	log := &hraft.Log{
 		Type: hraft.LogNoop,
 		Data: nil,
 	}
 
-	// Must not panic. The result will be a decode error (nil data), which is
-	// the same code-path as bad-gob — already tested separately; here we just
-	// verify no panic and that execFn was NOT called.
+	// Must not panic. The result will be a decode error (empty data fails
+	// the binary-magic check and falls through to gob, which fails too);
+	// here we just verify no panic and that execFn was NOT called.
 	result := fsm.Apply(log)
 	_ = result // may be nil or an error depending on implementation
 
@@ -572,7 +584,7 @@ func TestFSM_Snapshot_DataRoundTrip(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestFSM_Apply_EmptyArgs verifies that a WALEntry with a nil/empty Args
-// slice round-trips cleanly through gob encoding in FSM.Apply.
+// slice round-trips cleanly through binary encoding in FSM.Apply.
 func TestFSM_Apply_EmptyArgs(t *testing.T) {
 	t.Parallel()
 
@@ -631,12 +643,15 @@ func TestApply_Timeout(t *testing.T) {
 // TestFSM_Apply_IntTypes_RoundTrip
 // ---------------------------------------------------------------------------
 
-// TestFSM_Apply_IntTypes_RoundTrip specifically exercises the integer family
-// of registered types to guard against accidental width-widening by gob.
+// TestFSM_Apply_IntTypes_RoundTrip exercises the integer family and
+// asserts the binary codec's documented widening: signed → int64,
+// unsigned → uint64, float32 → float64. database/sql + the SQLite driver
+// accept the widened types transparently, so the widening is a wire-format
+// simplification, not a correctness loss.
 func TestFSM_Apply_IntTypes_RoundTrip(t *testing.T) {
 	t.Parallel()
 
-	wantArgs := []any{
+	sendArgs := []any{
 		int8(8),
 		int16(16),
 		int32(32),
@@ -647,17 +662,17 @@ func TestFSM_Apply_IntTypes_RoundTrip(t *testing.T) {
 		uint64(500),
 		float32(1.5),
 	}
-
-	// Register types used only in this test so gob can handle them in []any.
-	gob.Register(int8(0))
-	gob.Register(int16(0))
-	gob.Register(int32(0))
-	gob.Register(uint(0))
-	gob.Register(uint8(0))
-	gob.Register(uint16(0))
-	gob.Register(uint32(0))
-	gob.Register(uint64(0))
-	gob.Register(float32(0))
+	wantArgs := []any{
+		int64(8),
+		int64(16),
+		int64(32),
+		uint64(100),
+		uint64(200),
+		uint64(300),
+		uint64(400),
+		uint64(500),
+		float64(1.5),
+	}
 
 	var gotArgs []any
 	ch := make(chan struct{}, 1)
@@ -680,7 +695,7 @@ func TestFSM_Apply_IntTypes_RoundTrip(t *testing.T) {
 	entry := replication.WALEntry{
 		Seq:  2,
 		SQL:  "INSERT INTO t VALUES (?,?,?,?,?,?,?,?,?)",
-		Args: wantArgs,
+		Args: sendArgs,
 	}
 	if err := memraft.Apply(r, entry, time.Second); err != nil {
 		t.Fatalf("Apply() error: %v", err)

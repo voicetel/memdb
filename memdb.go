@@ -36,6 +36,7 @@ type DB struct {
 	cfg      Config
 	wal      *WAL
 	replica  *replicaPool // nil when ReadPoolSize == 0
+	stmts    *stmtCache   // prepared-statement cache for d.mem
 	mu       sync.Mutex   // serialises Flush calls
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -105,9 +106,10 @@ func Open(cfg Config) (*DB, error) {
 	mem.SetMaxIdleConns(1)
 
 	db := &DB{
-		mem:  mem,
-		cfg:  cfg,
-		stop: make(chan struct{}),
+		mem:   mem,
+		cfg:   cfg,
+		stop:  make(chan struct{}),
+		stmts: newStmtCache(mem),
 	}
 
 	// restore() checks Exists internally and is a no-op when no snapshot
@@ -127,9 +129,11 @@ func Open(cfg Config) (*DB, error) {
 			mem.Close()
 			return nil, err
 		}
-		// Replay any entries written after the last snapshot.
+		// Replay any entries written after the last snapshot. Use the stmt
+		// cache so repeated SQL strings (the common case for replay — many
+		// INSERTs into the same table) don't re-prepare per entry.
 		if err := db.wal.Replay(func(e WALEntry) error {
-			_, err := db.mem.Exec(e.SQL, e.Args...)
+			_, err := db.stmts.ExecContext(context.Background(), e.SQL, e.Args...)
 			return err
 		}); err != nil {
 			mem.Close()
@@ -231,7 +235,7 @@ func (d *DB) execDirect(query string, args ...any) error {
 	if d.closed.Load() {
 		return ErrClosed
 	}
-	if _, err := d.mem.Exec(query, args...); err != nil {
+	if _, err := d.stmts.ExecContext(context.Background(), query, args...); err != nil {
 		return err
 	}
 	d.bumpWriteGen()
@@ -282,7 +286,7 @@ func (d *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Re
 	}
 
 	// Standalone (no replication): write locally.
-	result, err := d.mem.ExecContext(ctx, query, args...)
+	result, err := d.stmts.ExecContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -325,12 +329,12 @@ func (d *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.
 		return nil, err
 	}
 	if d.replica == nil {
-		return d.mem.QueryContext(ctx, query, args...)
+		return d.stmts.QueryContext(ctx, query, args...)
 	}
 	r, release := d.replica.checkout()
 	if r == nil {
 		// All replicas busy or refresh in progress — fall back to the writer.
-		return d.mem.QueryContext(ctx, query, args...)
+		return d.stmts.QueryContext(ctx, query, args...)
 	}
 	rows, err := r.QueryContext(ctx, query, args...)
 	release()
@@ -357,11 +361,11 @@ func (d *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sq
 		return d.mem.QueryRowContext(ctx, query, args...) // returns sql: database is closed on Scan
 	}
 	if d.replica == nil {
-		return d.mem.QueryRowContext(ctx, query, args...)
+		return d.stmts.QueryRowContext(ctx, query, args...)
 	}
 	r, release := d.replica.checkout()
 	if r == nil {
-		return d.mem.QueryRowContext(ctx, query, args...)
+		return d.stmts.QueryRowContext(ctx, query, args...)
 	}
 	// Return the replica immediately — QueryRow buffers its result internally
 	// so the replica connection is not needed once QueryRow returns.
@@ -486,6 +490,12 @@ func (d *DB) Close() error {
 
 		if d.replica != nil {
 			d.replica.close()
+		}
+		// Close cached statements before closing the underlying *sql.DB —
+		// stmt.Close on a closed db returns an error we don't care about
+		// but the order is more obviously correct this way.
+		if d.stmts != nil {
+			_ = d.stmts.Close()
 		}
 		d.mem.Close()
 		if d.wal != nil {

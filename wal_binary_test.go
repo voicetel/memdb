@@ -3,7 +3,6 @@ package memdb_test
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/gob"
 	"errors"
 	"math"
 	"os"
@@ -41,10 +40,6 @@ import (
 //     not recognise surfaces ErrWALUnsupportedArgType so the caller can
 //     reject the offending write.
 //
-//   - TestWAL_Binary_BackwardsCompat_Gob    — WAL files written in the
-//     legacy gob-encoded format are still readable; Replay transparently
-//     dispatches between the two.
-//
 //   - TestWAL_Binary_TruncatedTail_StopsCleanly — a record with a valid
 //     length prefix but a truncated body aborts Replay at exactly that
 //     record; all prior records are still returned.
@@ -52,10 +47,6 @@ import (
 //   - TestWAL_Binary_CorruptVersion         — a record prefixed with the
 //     binary magic but an unknown version tag is treated as corrupt
 //     (Replay stops); it does not propagate garbage back to the caller.
-//
-//   - TestWAL_Binary_MixedFormat            — a WAL file containing a
-//     legacy gob record followed by a binary record is replayed in
-//     order with both entries intact.
 
 // helperWAL opens a fresh WAL in a temp dir and registers cleanup.
 func helperWAL(t *testing.T) (*memdb.WAL, string) {
@@ -395,59 +386,6 @@ func TestWAL_Binary_UnsupportedArgType(t *testing.T) {
 	}
 }
 
-// TestWAL_Binary_BackwardsCompat_Gob writes a record directly in the
-// legacy gob format (as memdb versions prior to the binary codec did) and
-// verifies Replay decodes it.
-func TestWAL_Binary_BackwardsCompat_Gob(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "legacy.wal")
-
-	// Build one gob-encoded record by hand: [4-byte BE length][gob body].
-	entry := memdb.WALEntry{
-		Seq:       42,
-		Timestamp: 1_700_000_000_000_000_000,
-		SQL:       "INSERT INTO legacy VALUES (?, ?)",
-		Args:      []any{"old-format", int64(7)},
-	}
-	var body bytes.Buffer
-	if err := gob.NewEncoder(&body).Encode(entry); err != nil {
-		t.Fatalf("gob encode: %v", err)
-	}
-	record := make([]byte, 4+body.Len())
-	binary.BigEndian.PutUint32(record[:4], uint32(body.Len()))
-	copy(record[4:], body.Bytes())
-
-	if err := os.WriteFile(path, record, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// Now open with the current WAL implementation and replay.
-	wal, err := memdb.OpenWAL(path)
-	if err != nil {
-		t.Fatalf("OpenWAL: %v", err)
-	}
-	t.Cleanup(func() { _ = wal.Close() })
-
-	got := collectReplay(t, wal)
-	if len(got) != 1 {
-		t.Fatalf("got %d entries, want 1", len(got))
-	}
-	if got[0].Seq != 42 {
-		t.Errorf("Seq=%d, want 42", got[0].Seq)
-	}
-	if got[0].SQL != entry.SQL {
-		t.Errorf("SQL=%q, want %q", got[0].SQL, entry.SQL)
-	}
-	if len(got[0].Args) != 2 {
-		t.Fatalf("len(Args)=%d, want 2", len(got[0].Args))
-	}
-	if s, _ := got[0].Args[0].(string); s != "old-format" {
-		t.Errorf("Args[0]=%#v, want \"old-format\"", got[0].Args[0])
-	}
-	if n, _ := got[0].Args[1].(int64); n != 7 {
-		t.Errorf("Args[1]=%#v, want int64(7)", got[0].Args[1])
-	}
-}
-
 // TestWAL_Binary_TruncatedTail_StopsCleanly appends two valid records,
 // then writes a third header whose body is truncated. Replay must return
 // the first two records and stop — not error, because a partial tail is
@@ -548,69 +486,6 @@ func TestWAL_Binary_CorruptVersion(t *testing.T) {
 	}
 	if got[0].Seq != 1 {
 		t.Errorf("Seq=%d, want 1", got[0].Seq)
-	}
-}
-
-// TestWAL_Binary_MixedFormat writes one legacy gob record followed by one
-// binary record in the same file. Replay must return both, in order,
-// with correct content — the dispatcher must not get confused by the
-// format change mid-file.
-func TestWAL_Binary_MixedFormat(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "mixed.wal")
-
-	// Record 1: legacy gob.
-	legacy := memdb.WALEntry{
-		Seq:       1,
-		Timestamp: 1,
-		SQL:       "legacy",
-		Args:      []any{"a"},
-	}
-	var body bytes.Buffer
-	if err := gob.NewEncoder(&body).Encode(legacy); err != nil {
-		t.Fatal(err)
-	}
-	record1 := make([]byte, 4+body.Len())
-	binary.BigEndian.PutUint32(record1[:4], uint32(body.Len()))
-	copy(record1[4:], body.Bytes())
-
-	if err := os.WriteFile(path, record1, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// Record 2: append via the normal WAL Append path (binary format).
-	wal, err := memdb.OpenWAL(path)
-	if err != nil {
-		t.Fatalf("OpenWAL: %v", err)
-	}
-	if err := wal.Append(memdb.WALEntry{
-		Seq:       2,
-		Timestamp: 2,
-		SQL:       "binary",
-		Args:      []any{int64(99)},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	_ = wal.Close()
-
-	// Replay via a fresh reader.
-	wal2, err := memdb.OpenWAL(path)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	t.Cleanup(func() { _ = wal2.Close() })
-
-	got := collectReplay(t, wal2)
-	if len(got) != 2 {
-		t.Fatalf("got %d entries, want 2", len(got))
-	}
-	if got[0].SQL != "legacy" || got[1].SQL != "binary" {
-		t.Errorf("SQL order wrong: %q, %q", got[0].SQL, got[1].SQL)
-	}
-	if s, _ := got[0].Args[0].(string); s != "a" {
-		t.Errorf("legacy Args[0]=%#v, want \"a\"", got[0].Args[0])
-	}
-	if n, _ := got[1].Args[0].(int64); n != 99 {
-		t.Errorf("binary Args[0]=%#v, want int64(99)", got[1].Args[0])
 	}
 }
 

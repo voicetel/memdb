@@ -2,6 +2,7 @@ package memdb_test
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/voicetel/memdb"
+	"github.com/voicetel/memdb/backends"
 	"github.com/voicetel/memdb/profiling"
 )
 
@@ -507,4 +509,252 @@ func TestPProf_Flush(t *testing.T) {
 		flushes, rows, time.Since(start),
 		float64(time.Since(start).Milliseconds())/float64(flushes),
 		cpuPath, heapPath)
+}
+
+// ---------------------------------------------------------------------------
+// TestPProf_WAL_Replay
+// ---------------------------------------------------------------------------
+
+// TestPProf_WAL_Replay captures CPU and heap profiles of the cold-start path
+// where Open() replays a non-trivial WAL into an empty :memory: database.
+// The replay is the only place where the binary v1 decoder runs at scale —
+// every entry is decoded, type-converted to []any, and re-Exec'd against
+// SQLite — so this profile points directly at any regression in wal.Replay
+// or in the Args round-trip.
+//
+// We bypass DurabilityWAL during the seeding phase because Open() also
+// flushes-on-close, which would truncate the WAL before the replay round.
+// Instead we (1) Open + Close once with InitSchema so the snapshot on disk
+// contains the kv table, then (2) OpenWAL directly, append entries, close,
+// then (3) re-Open with DurabilityWAL — Open() loads the snapshot first,
+// then runs WAL replay against the now-existing schema. This is
+// indistinguishable from a process that crashed between flushes.
+func TestPProf_WAL_Replay(t *testing.T) {
+	dir := pprofOutputDir(t)
+
+	cfg := pprofConfig(t)
+	cfg.Durability = memdb.DurabilityWAL
+
+	// Step 1: bake the schema into a snapshot on disk so the eventual
+	// replay has somewhere to INSERT. Close() flushes and truncates the WAL.
+	seed, err := memdb.Open(cfg)
+	if err != nil {
+		t.Fatalf("seed Open: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("seed Close: %v", err)
+	}
+
+	// Step 2: write the WAL out-of-band so it survives until replay.
+	walPath := cfg.FilePath + ".wal"
+	wal, err := memdb.OpenWAL(walPath)
+	if err != nil {
+		t.Fatalf("OpenWAL: %v", err)
+	}
+	const entries = 50_000
+	for i := 0; i < entries; i++ {
+		if err := wal.Append(memdb.WALEntry{
+			SQL:  `INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+			Args: []any{fmt.Sprintf("wal-%d", i), fmt.Sprintf("v-%d", i)},
+		}); err != nil {
+			t.Fatalf("WAL Append: %v", err)
+		}
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("WAL Close: %v", err)
+	}
+
+	cpuPath := filepath.Join(dir, "pprof_wal_replay.cpu.prof")
+	heapPath := filepath.Join(dir, "pprof_wal_replay.heap.prof")
+
+	var db *memdb.DB
+	start := time.Now()
+	err = profiling.CaptureCPUProfile(cpuPath, func() error {
+		var openErr error
+		db, openErr = memdb.Open(cfg)
+		return openErr
+	})
+	if err != nil {
+		t.Fatalf("CaptureCPUProfile: %v", err)
+	}
+	defer db.Close()
+
+	if err := profiling.CaptureHeapProfile(heapPath, func() error { return nil }); err != nil {
+		t.Fatalf("CaptureHeapProfile: %v", err)
+	}
+
+	t.Logf("WAL replay: %d entries in %s (%.0f entries/s)  cpu=%s  heap=%s",
+		entries, time.Since(start),
+		float64(entries)/time.Since(start).Seconds(),
+		cpuPath, heapPath)
+}
+
+// ---------------------------------------------------------------------------
+// TestPProf_Flush_Compressed / TestPProf_Flush_Encrypted
+// ---------------------------------------------------------------------------
+
+// TestPProf_Flush_Compressed captures profiles of the flush path with the
+// snapshot stream wrapped through backends.CompressedBackend (zstd). zstd
+// at default settings is the most CPU-intensive part of the production
+// flush path; this profile makes the encoder cost vs. the SQLite backup
+// API cost directly comparable to TestPProf_Flush.
+func TestPProf_Flush_Compressed(t *testing.T) {
+	flushBackendPProf(t, "compressed", func(local *backends.LocalBackend) memdb.Backend {
+		return memdb.WrapBackend(&backends.CompressedBackend{Inner: local})
+	})
+}
+
+// TestPProf_Flush_Encrypted captures profiles of the flush path with the
+// snapshot stream wrapped through backends.EncryptedBackend (AES-256-GCM).
+// AES-NI on modern CPUs makes this much cheaper than zstd, but the
+// io.ReadAll buffering inside EncryptedBackend.Write means heap usage is
+// non-trivial — the heap profile here will surface that.
+func TestPProf_Flush_Encrypted(t *testing.T) {
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	flushBackendPProf(t, "encrypted", func(local *backends.LocalBackend) memdb.Backend {
+		return memdb.WrapBackend(&backends.EncryptedBackend{Inner: local, Key: key})
+	})
+}
+
+// flushBackendPProf is the shared body for the wrapped-backend flush profiles.
+// It seeds a fixed-size table, then runs N flushes through the wrapped
+// backend so the captured CPU profile is dominated by the wrapping cost
+// (compression / encryption / both) rather than SQLite's backup stepping.
+func flushBackendPProf(t *testing.T, name string, wrap func(*backends.LocalBackend) memdb.Backend) {
+	t.Helper()
+	dir := pprofOutputDir(t)
+
+	cfg := pprofConfig(t)
+	cfg.Backend = wrap(&backends.LocalBackend{Path: cfg.FilePath})
+
+	db, err := memdb.Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const rows = 50_000
+	for i := 0; i < rows; i++ {
+		if _, err := db.Exec(
+			`INSERT INTO kv (key, value) VALUES (?, ?)`,
+			fmt.Sprintf("k-%d", i), fmt.Sprintf("v-%d", i),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cpuPath := filepath.Join(dir, "pprof_flush_"+name+".cpu.prof")
+	heapPath := filepath.Join(dir, "pprof_flush_"+name+".heap.prof")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const flushes = 5
+	start := time.Now()
+	err = profiling.CaptureCPUProfile(cpuPath, func() error {
+		for i := 0; i < flushes; i++ {
+			if err := db.Flush(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CaptureCPUProfile: %v", err)
+	}
+	if err := profiling.CaptureHeapProfile(heapPath, func() error { return nil }); err != nil {
+		t.Fatalf("CaptureHeapProfile: %v", err)
+	}
+
+	t.Logf("flush %s: %d×%d rows in %s (%.0f ms/flush)  cpu=%s  heap=%s",
+		name, flushes, rows, time.Since(start),
+		float64(time.Since(start).Milliseconds())/float64(flushes),
+		cpuPath, heapPath)
+}
+
+// ---------------------------------------------------------------------------
+// TestPProf_Writes_Contention
+// ---------------------------------------------------------------------------
+
+// TestPProf_Writes_Contention captures mutex and block profiles of a
+// write-heavy workload run by many goroutines simultaneously. Because the
+// writer is pinned to a single connection (MaxOpenConns=1) every concurrent
+// caller serialises on database/sql's connection wait queue — the mutex /
+// block profiles surface that wait directly so the tail-latency cost of
+// sharing the writer is visible in pprof, not just in benchmark numbers.
+func TestPProf_Writes_Contention(t *testing.T) {
+	dir := pprofOutputDir(t)
+
+	profiling.EnableMutexProfiling(1)
+	profiling.EnableBlockProfiling(1)
+	defer profiling.EnableMutexProfiling(0)
+	defer profiling.EnableBlockProfiling(0)
+
+	db, err := memdb.Open(pprofConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	cpuPath := filepath.Join(dir, "pprof_writes_contention.cpu.prof")
+	mutexPath := filepath.Join(dir, "pprof_writes_contention.mutex.prof")
+	blockPath := filepath.Join(dir, "pprof_writes_contention.block.prof")
+
+	const (
+		workDuration = 3 * time.Second
+		writers      = 16
+	)
+	var writes atomic.Int64
+
+	start := time.Now()
+	err = profiling.CaptureCPUProfile(cpuPath, func() error {
+		var wg sync.WaitGroup
+		done := make(chan struct{})
+		for g := 0; g < writers; g++ {
+			g := g
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				i := g
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+					if _, err := db.Exec(
+						`INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+						fmt.Sprintf("c-%d-%d", g, i), "v",
+					); err != nil {
+						return
+					}
+					i += writers
+					writes.Add(1)
+				}
+			}()
+		}
+		time.Sleep(workDuration)
+		close(done)
+		wg.Wait()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CaptureCPUProfile: %v", err)
+	}
+
+	if err := profiling.CaptureNamedProfile("mutex", mutexPath); err != nil {
+		t.Fatalf("capture mutex: %v", err)
+	}
+	if err := profiling.CaptureNamedProfile("block", blockPath); err != nil {
+		t.Fatalf("capture block: %v", err)
+	}
+
+	n := writes.Load()
+	t.Logf("contended writes: %d across %d goroutines in %s (%.0f ops/s)  cpu=%s  mutex=%s  block=%s",
+		n, writers, time.Since(start),
+		float64(n)/time.Since(start).Seconds(),
+		cpuPath, mutexPath, blockPath)
 }

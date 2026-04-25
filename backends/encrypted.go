@@ -26,6 +26,14 @@ func (b *EncryptedBackend) Exists(ctx context.Context) (bool, error) {
 	return b.Inner.Exists(ctx)
 }
 
+// Authenticated reports true to signal to memdb.WrapBackend that this
+// backend already authenticates its payload (via the AES-GCM tag). The
+// adapter uses this to skip the redundant 40-byte MDBK SHA-256 header
+// it would otherwise prepend to every flushed snapshot — pprof showed
+// SHA-256 at ~17% of the encrypted-flush CPU profile, all of it
+// duplicating work GCM already did.
+func (b *EncryptedBackend) Authenticated() bool { return true }
+
 func (b *EncryptedBackend) Write(ctx context.Context, r io.Reader) error {
 	plaintext, err := io.ReadAll(r)
 	if err != nil {

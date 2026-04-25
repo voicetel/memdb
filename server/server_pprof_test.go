@@ -2,10 +2,17 @@ package server_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -93,7 +100,12 @@ func silentLoggerSrv() *slog.Logger {
 
 // srvPprofDB opens a memdb suitable for server pprof runs: fresh file,
 // kv schema, background flush disabled so the profile reflects only the
-// server/handler workload we are measuring.
+// server/handler workload we are measuring. ReadPoolSize is set to
+// GOMAXPROCS so SELECT traffic exercises the read replica pool —
+// without this, every read serialises through the single writer
+// connection (MaxOpenConns=1) and pprof's block profile shows readers
+// queued behind one another rather than the realistic parallel-read
+// behaviour of a tuned deployment.
 func srvPprofDB(t *testing.T) *memdb.DB {
 	t.Helper()
 	f, err := os.CreateTemp(t.TempDir(), "memdb-srv-pprof-*.db")
@@ -104,9 +116,11 @@ func srvPprofDB(t *testing.T) *memdb.DB {
 	_ = os.Remove(f.Name())
 
 	cfg := memdb.Config{
-		FilePath:      f.Name(),
-		FlushInterval: -1,
-		Logger:        silentLoggerSrv(),
+		FilePath:               f.Name(),
+		FlushInterval:          -1,
+		ReadPoolSize:           runtime.GOMAXPROCS(0),
+		ReplicaRefreshInterval: 50 * time.Millisecond, // package default; named explicitly so changes here don't drift
+		Logger:                 silentLoggerSrv(),
 		InitSchema: func(db *memdb.DB) error {
 			_, err := db.Exec(`
 				CREATE TABLE IF NOT EXISTS kv (
@@ -652,6 +666,244 @@ func TestPProf_Server_Connect(t *testing.T) {
 	t.Logf("connect: %d connect/query/disconnect cycles across %d clients in %s (%.0f cyc/s)  cpu=%s  heap=%s",
 		n, clients, time.Since(start), float64(n)/time.Since(start).Seconds(),
 		cpuPath, heapPath)
+}
+
+// ── TestPProf_Server_Connect_TLS ───────────────────────────────────────
+
+// TestPProf_Server_Connect_TLS is the TLS-wrapped twin of
+// TestPProf_Server_Connect. Each iteration is a TLS handshake plus one
+// SELECT 1 plus a clean disconnect, so the captured CPU profile is
+// dominated by ECDSA / AES-GCM handshake cost — exactly the fixed
+// per-connection price of running the server with TLS enabled. Compare
+// the two profiles side-by-side to size the gap a connection pool buys.
+func TestPProf_Server_Connect_TLS(t *testing.T) {
+	dir := srvPprofOutputDir(t)
+
+	tlsCfg, clientCfg := genServerTLS(t)
+
+	db := srvPprofDB(t)
+	addr := srvPickAddr(t)
+	startPprofServerTLS(t, db, addr, tlsCfg)
+
+	cpuPath := filepath.Join(dir, "pprof_server_connect_tls.cpu.prof")
+	heapPath := filepath.Join(dir, "pprof_server_connect_tls.heap.prof")
+
+	const (
+		clients      = 8
+		workDuration = 3 * time.Second
+	)
+
+	var wg sync.WaitGroup
+	var iters atomic.Int64
+	start := time.Now()
+	done := make(chan struct{})
+
+	err := profiling.CaptureCPUProfile(cpuPath, func() error {
+		for g := 0; g < clients; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+					sc, err := dialSrvTLS(addr, clientCfg)
+					if err != nil {
+						return
+					}
+					_, _ = sc.simpleQuery(`SELECT 1`)
+					sc.close()
+					iters.Add(1)
+				}
+			}()
+		}
+		time.Sleep(workDuration)
+		close(done)
+		wg.Wait()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CaptureCPUProfile: %v", err)
+	}
+	if err := profiling.CaptureHeapProfile(heapPath, func() error { return nil }); err != nil {
+		t.Fatalf("CaptureHeapProfile: %v", err)
+	}
+
+	n := iters.Load()
+	t.Logf("connect-tls: %d TLS connect/query/disconnect cycles across %d clients in %s (%.0f cyc/s)  cpu=%s  heap=%s",
+		n, clients, time.Since(start), float64(n)/time.Since(start).Seconds(),
+		cpuPath, heapPath)
+}
+
+// ── TestPProf_Server_Allocs ────────────────────────────────────────────
+
+// TestPProf_Server_Allocs captures the runtime "allocs" profile (every
+// allocation since process start) at two points around a SELECT workload
+// so the operator can diff them with `go tool pprof -base before after`
+// to see exactly which allocations the wire-protocol serving path made.
+// The CPU profile alone tells you where time is spent; the diff tells
+// you where the GC pressure comes from — usually appendCell, sendDataRow,
+// and the per-row [][]byte slice in handleSelect.
+func TestPProf_Server_Allocs(t *testing.T) {
+	dir := srvPprofOutputDir(t)
+
+	db := srvPprofDB(t)
+	const seed = 1000
+	seedRows(t, db, seed)
+
+	addr := srvPickAddr(t)
+	startPprofServer(t, db, addr)
+
+	beforePath := filepath.Join(dir, "pprof_server_allocs.before.prof")
+	afterPath := filepath.Join(dir, "pprof_server_allocs.after.prof")
+
+	// Snapshot allocations BEFORE the workload starts. runtime.GC ensures
+	// any pending finalizers have run so the "before" baseline is stable.
+	runtime.GC()
+	if err := profiling.CaptureNamedProfile("allocs", beforePath); err != nil {
+		t.Fatalf("capture before: %v", err)
+	}
+
+	const (
+		clients      = 8
+		workDuration = 3 * time.Second
+	)
+	iters, elapsed := runClients(t, addr, clients, workDuration,
+		func(sc *srvClient, iter int) error {
+			q := fmt.Sprintf(
+				`SELECT key, value FROM kv WHERE key >= 'seed-%06d' ORDER BY key LIMIT 50`,
+				iter%(seed-50))
+			_, err := sc.simpleQuery(q)
+			return err
+		})
+
+	runtime.GC()
+	if err := profiling.CaptureNamedProfile("allocs", afterPath); err != nil {
+		t.Fatalf("capture after: %v", err)
+	}
+
+	t.Logf("allocs: %d queries across %d clients in %s (%.0f q/s)\n"+
+		"  diff with: go tool pprof -base %s %s",
+		iters, clients, elapsed, float64(iters)/elapsed.Seconds(),
+		beforePath, afterPath)
+}
+
+// ── TLS helpers ────────────────────────────────────────────────────────
+
+// genServerTLS produces a self-signed cert/key valid for 127.0.0.1 and
+// returns (server *tls.Config, client *tls.Config). The server config
+// presents the cert; the client config trusts it via RootCAs. ECDSA
+// P-256 is used so the handshake cost in pprof reflects the most common
+// production setup (ECDHE_ECDSA suites).
+func genServerTLS(t *testing.T) (*tls.Config, *tls.Config) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "memdb-pprof"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+
+	srvCfg := &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+	}
+	cliCfg := &tls.Config{
+		RootCAs:    pool,
+		ServerName: "127.0.0.1",
+	}
+	return srvCfg, cliCfg
+}
+
+// startPprofServerTLS is startPprofServer with TLSConfig set on the
+// memdb server.Config so the listener wraps incoming TCP connections in
+// TLS. Mirrors startPprofServer's connect-readiness wait so the test
+// does not race the goroutine that calls ListenAndServe.
+func startPprofServerTLS(t *testing.T, db *memdb.DB, addr string, tlsCfg *tls.Config) *server.Server {
+	t.Helper()
+	srv := server.New(db, server.Config{ListenAddr: addr, TLSConfig: tlsCfg})
+	servErr := make(chan error, 1)
+	go func() { servErr <- srv.ListenAndServe() }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Cleanup(func() {
+		srv.Stop()
+		select {
+		case err := <-servErr:
+			if err != nil {
+				t.Logf("server.ListenAndServe returned: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Logf("server.ListenAndServe did not return within 2s of Stop")
+		}
+	})
+	return srv
+}
+
+// dialSrvTLS is dialSrv over TLS. The server listener is already TLS, so
+// no Postgres SSLRequest is sent — the Postgres startup packet goes
+// straight onto the TLS connection.
+func dialSrvTLS(addr string, cliCfg *tls.Config) (*srvClient, error) {
+	d := &net.Dialer{Timeout: 2 * time.Second}
+	c, err := tls.DialWithDialer(d, "tcp", addr, cliCfg)
+	if err != nil {
+		return nil, err
+	}
+	sc := &srvClient{conn: c, buf: make([]byte, 0, 4096)}
+
+	params := []byte("user\x00memdb\x00\x00")
+	length := 8 + len(params)
+	pkt := make([]byte, length)
+	pkt[0] = byte(length >> 24)
+	pkt[1] = byte(length >> 16)
+	pkt[2] = byte(length >> 8)
+	pkt[3] = byte(length)
+	pkt[4], pkt[5], pkt[6], pkt[7] = 0, 3, 0, 0
+	copy(pkt[8:], params)
+	if _, err := c.Write(pkt); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	for {
+		msgType, _, err := sc.readMsg()
+		if err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		if msgType == 'Z' {
+			return sc, nil
+		}
+		if msgType == 'E' {
+			_ = c.Close()
+			return nil, fmt.Errorf("server rejected startup")
+		}
+	}
 }
 
 // ── compile-time anchors ───────────────────────────────────────────────

@@ -21,6 +21,17 @@ type Config struct {
 	ListenAddr string
 
 	// TLSConfig enables TLS on TCP listeners. Ignored for Unix sockets.
+	//
+	// Performance note: Go 1.24+ enables a hybrid X25519+MLKEM768
+	// post-quantum key exchange by default. Connect-cycle pprof showed
+	// the MLKEM and SHA-3 (Keccak) functions accounting for ~7% of CPU
+	// per handshake; combined with EC field arithmetic the full handshake
+	// runs ~3× slower than plain TCP for short-lived connections (~4.3k
+	// vs ~13k cycles/s on the test hardware). For deployments without a
+	// PQC requirement, set CurvePreferences to []tls.CurveID{tls.X25519,
+	// tls.CurveP256} to recover most of that. For deployments that DO
+	// need PQC, the cleanest mitigation is a connection pool on the
+	// client so the handshake amortises across many queries.
 	TLSConfig *tls.Config
 
 	// Auth is optional. If nil, no authentication is required.
