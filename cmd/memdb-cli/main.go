@@ -1,67 +1,127 @@
-// memdb-cli is a read-only inspection shell for memdb snapshot files,
-// modelled on the sqlite3 CLI but limited to SELECT-style queries.
+// memdb-cli is an inspection / query shell for memdb. It operates
+// in one of two mutually exclusive modes:
+//
+//   - Snapshot mode (-file PATH): opens a snapshot file directly,
+//     unwraps the MDBK envelope, and exposes a sqlite3-style REPL
+//     in read-only mode. Works whether the daemon is running or
+//     not — the daemon writes via atomic rename, so the inode the
+//     CLI opens is a stable point-in-time view. Data may lag the
+//     live in-memory state by up to one flush interval.
+//   - Wire mode (-addr HOST:PORT): connects to a running memdb
+//     server over the PostgreSQL wire protocol. Behaves like a
+//     small psql — full read AND write access (subject to server
+//     auth), point-in-time-correct, with the same REPL/history/
+//     completion as snapshot mode.
 //
 // # Usage
 //
-//	memdb-cli -file /var/lib/myapp/data.db          # interactive REPL
+//	memdb-cli -file /var/lib/myapp/data.db          # snapshot RO
 //	memdb-cli -file /var/lib/myapp/data.db -c "SELECT * FROM users LIMIT 5"
+//	memdb-cli -addr 127.0.0.1:5433 -user memdb      # wire RW
+//	memdb-cli -addr 127.0.0.1:5433 -tls -user memdb -c "INSERT INTO ..."
 //
-// # When the daemon is running
+// # Read-only enforcement (snapshot mode)
 //
-// The snapshot file may be opened safely while `memdb serve` is writing
-// to it: the server replaces the file atomically via os.Rename, so the
-// inode this tool opens is a stable, point-in-time view. The data may
-// lag the live in-memory state by up to one flush interval (default
-// 30s). For absolute freshness, connect via psql against the live
-// PostgreSQL wire-protocol port instead.
+// In snapshot mode memdb-cli opens the unwrapped SQLite payload
+// with `mode=ro&immutable=1` — any INSERT/UPDATE/DELETE/CREATE
+// returns a "readonly database" error from SQLite, which the REPL
+// catches and prints as a friendly "memdb-cli is for inspection
+// only" message. Wire mode does not apply that restriction.
 //
-// # When the daemon is not running
+// # Interactive features
 //
-// Just point -file at the snapshot. The on-disk file is the source of
-// truth in this case.
+// When stdin is a terminal, the REPL is built on github.com/peterh/liner
+// and supports:
 //
-// # Read-only enforcement
+//   - Line editing (left/right, home/end, ctrl-w word delete, etc.)
+//   - History via up/down arrows; ctrl-r reverse search
+//   - Persistent history file at $XDG_STATE_HOME/memdb-cli/history (or
+//     ~/.local/state/memdb-cli/history if XDG_STATE_HOME is unset),
+//     overridable with -history
+//   - Tab completion: meta-commands (.tables/.schema/...), table names
+//     after FROM/JOIN/INTO/UPDATE/.schema/.indexes, and SQL keywords
 //
-// memdb-cli opens the unwrapped SQLite payload with `mode=ro&immutable=1`
-// — any INSERT/UPDATE/DELETE/CREATE returns a "readonly database"
-// error from SQLite, which the REPL catches and prints as a friendly
-// "memdb-cli is for inspection only" message.
+// When stdin is redirected (a pipe or here-doc, e.g.
+// `printf '...' | memdb-cli ...`), liner falls back to a bufio reader
+// automatically — line editing is skipped but everything else works.
 package main
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"encoding/csv"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/peterh/liner"
 	"github.com/voicetel/memdb"
 )
 
 func main() {
 	fs := flag.NewFlagSet("memdb-cli", flag.ExitOnError)
-	file := fs.String("file", "", "path to memdb snapshot file (required)")
+	// Backend selection — exactly one is required.
+	file := fs.String("file", "", "snapshot file path (snapshot mode, read-only). Mutually exclusive with -addr.")
+	addr := fs.String("addr", "", "memdb server address host:port (wire mode, read+write). Mutually exclusive with -file.")
+	user := fs.String("user", "", "username for wire mode (also reads MEMDB_USER env var)")
+	password := fs.String("password", "", "password for wire mode (prefer the MEMDB_PASSWORD env var to avoid leaking via ps)")
+	database := fs.String("database", "memdb", "database name for wire mode (the memdb server ignores this; included for psql compatibility)")
+	useTLS := fs.Bool("tls", false, "require TLS for wire connections")
+	tlsSkipVerify := fs.Bool("tls-skip-verify", false, "skip TLS certificate verification (for self-signed certs only)")
+	connectTimeout := fs.Duration("connect-timeout", 5*time.Second, "wire-mode connect timeout")
+
 	cmd := fs.String("c", "", "execute a single SQL statement and exit (non-interactive)")
 	headers := fs.Bool("headers", true, "print column headers in tabular output")
 	mode := fs.String("mode", "column", "output mode: column|list|line|csv")
 	separator := fs.String("separator", "|", "column separator for list/csv modes (column mode uses fixed-width)")
+	history := fs.String("history", "", "path to history file (default: $XDG_STATE_HOME/memdb-cli/history)")
+	noHistory := fs.Bool("no-history", false, "disable persistent history")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
 	}
-	if *file == "" {
+
+	switch {
+	case *file == "" && *addr == "":
 		fs.Usage()
-		fmt.Fprintln(os.Stderr, "\nmemdb-cli: -file is required")
+		fmt.Fprintln(os.Stderr, "\nmemdb-cli: one of -file (snapshot mode) or -addr (wire mode) is required")
+		os.Exit(1)
+	case *file != "" && *addr != "":
+		fmt.Fprintln(os.Stderr, "memdb-cli: -file and -addr are mutually exclusive")
 		os.Exit(1)
 	}
 
-	db, cleanup, err := openSnapshot(*file)
+	var (
+		db      *sql.DB
+		cleanup func()
+		err     error
+		modeTag string
+	)
+	if *file != "" {
+		db, cleanup, err = openSnapshot(*file)
+		modeTag = "snapshot"
+	} else {
+		db, cleanup, err = openWire(wireOptions{
+			Addr:           *addr,
+			User:           resolveUser(*user),
+			Password:       resolvePassword(*password),
+			Database:       *database,
+			RequireTLS:     *useTLS,
+			SkipVerify:     *tlsSkipVerify,
+			ConnectTimeout: *connectTimeout,
+		})
+		modeTag = "wire"
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "memdb-cli: %v\n", err)
 		os.Exit(1)
@@ -79,7 +139,113 @@ func main() {
 		return
 	}
 
-	repl(db, out)
+	histPath := *history
+	if histPath == "" && !*noHistory {
+		histPath = defaultHistoryPath()
+	}
+	if *noHistory {
+		histPath = ""
+	}
+	repl(db, out, histPath, modeTag)
+}
+
+// resolveUser returns flag if non-empty, else the MEMDB_USER env var.
+// Empty result means the wire client connects with no startup-message
+// "user" parameter — useful when the server has auth disabled.
+func resolveUser(flag string) string {
+	if flag != "" {
+		return flag
+	}
+	return os.Getenv("MEMDB_USER")
+}
+
+// resolvePassword returns flag if non-empty, else the MEMDB_PASSWORD
+// env var. Reading from env keeps the password out of `ps` /
+// /proc/<pid>/cmdline output the same way the server does.
+func resolvePassword(flag string) string {
+	if flag != "" {
+		return flag
+	}
+	return os.Getenv("MEMDB_PASSWORD")
+}
+
+// wireOptions bundles every knob the wire-mode connection consumes.
+// Grouped to keep openWire's signature flat and so future flags
+// (e.g. application_name, sslrootcert) can be added without
+// disturbing call sites.
+type wireOptions struct {
+	Addr           string // host:port
+	User           string
+	Password       string
+	Database       string
+	RequireTLS     bool
+	SkipVerify     bool
+	ConnectTimeout time.Duration
+}
+
+// openWire dials a memdb server over the PostgreSQL wire protocol
+// using lib/pq and returns a *sql.DB ready to issue queries.
+//
+// Mode selection: when -addr is provided, this is the alternative
+// to openSnapshot. Unlike snapshot mode there is NO read-only
+// enforcement here — the server's auth model decides what the
+// client can do, just like psql.
+//
+// TLS: lib/pq's `sslmode` parameter selects the policy. We map
+// -tls / -tls-skip-verify to `verify-full` / `require` and default
+// to `disable` so a plaintext loopback connection works without
+// extra flags (matches the memdb server defaults).
+func openWire(opt wireOptions) (*sql.DB, func(), error) {
+	host, port, err := net.SplitHostPort(opt.Addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse -addr %q: %w", opt.Addr, err)
+	}
+
+	sslmode := "disable"
+	switch {
+	case opt.RequireTLS && opt.SkipVerify:
+		sslmode = "require" // TLS yes, server cert not validated
+	case opt.RequireTLS:
+		sslmode = "verify-full"
+	}
+
+	// lib/pq DSN is a space-separated list of key=value pairs.
+	// connect_timeout is in seconds.
+	parts := []string{
+		"host=" + host,
+		"port=" + port,
+		"sslmode=" + sslmode,
+		fmt.Sprintf("connect_timeout=%d", int(opt.ConnectTimeout.Round(time.Second).Seconds())),
+	}
+	if opt.User != "" {
+		parts = append(parts, "user="+opt.User)
+	}
+	if opt.Password != "" {
+		parts = append(parts, "password="+opt.Password)
+	}
+	if opt.Database != "" {
+		parts = append(parts, "dbname="+opt.Database)
+	}
+	dsn := strings.Join(parts, " ")
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open wire connection: %w", err)
+	}
+	// Single connection — interactive shells don't benefit from a
+	// pool, and a single conn keeps any session-state semantics
+	// (PRAGMA, transactions if added later) coherent.
+	db.SetMaxOpenConns(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), opt.ConnectTimeout)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, nil, fmt.Errorf("connect to %s: %w", opt.Addr, err)
+	}
+
+	cleanup := func() {} // db.Close is already deferred by main
+	return db, cleanup, nil
 }
 
 // openSnapshot unwraps the MDBK envelope to a temp file and opens it
@@ -131,45 +297,93 @@ func openSnapshot(path string) (*sql.DB, func(), error) {
 	return db, cleanup, nil
 }
 
-// repl runs the interactive read-eval-print loop until EOF or .exit/.quit.
+// repl runs the interactive read-eval-print loop until EOF, ctrl-c
+// at an empty prompt, or .exit/.quit.
 //
 // Multi-line input: lines accumulate until a `;` is seen at end (after
 // trimming trailing whitespace). Meta-commands beginning with `.` are
 // always single-line and execute immediately.
-func repl(db *sql.DB, out *printer) {
-	fmt.Println("memdb-cli — read-only snapshot shell. Type .help for commands, .quit to exit.")
-
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1024*1024), 16*1024*1024)
-	var buf strings.Builder
-
-	prompt := func() {
-		if buf.Len() == 0 {
-			fmt.Print("memdb> ")
-		} else {
-			fmt.Print("   ...> ")
-		}
+//
+// The line reader is github.com/peterh/liner — it provides line
+// editing, history (up/down arrows, ctrl-r reverse search), and tab
+// completion when stdin is a terminal. When stdin is redirected
+// (pipe, here-doc), liner falls back to a plain bufio reader so
+// scripted use of the CLI keeps working.
+//
+// historyPath is loaded on entry and rewritten on exit; an empty
+// string disables persistent history.
+//
+// modeTag distinguishes the welcome banner ("snapshot (read-only)"
+// vs "wire") so operators see immediately whether writes will go
+// through. The two modes share everything else.
+func repl(db *sql.DB, out *printer, historyPath, modeTag string) {
+	switch modeTag {
+	case "wire":
+		fmt.Println("memdb-cli — wire mode (read+write). Type .help for commands, .quit to exit.")
+	default:
+		fmt.Println("memdb-cli — snapshot mode (read-only). Type .help for commands, .quit to exit.")
 	}
 
-	prompt()
-	for scanner.Scan() {
-		line := scanner.Text()
+	line := liner.NewLiner()
+	defer line.Close()
+	line.SetCtrlCAborts(true) // ctrl-c on empty prompt → io.EOF, exit cleanly
+	line.SetMultiLineMode(true)
 
-		// Meta-commands only at the start of a fresh statement.
-		if buf.Len() == 0 && strings.HasPrefix(strings.TrimSpace(line), ".") {
-			if done := runMeta(db, strings.TrimSpace(line), out); done {
+	tables := loadTableNames(db) // cached for the completer; schema is static for a snapshot
+	line.SetWordCompleter(makeCompleter(tables))
+
+	if historyPath != "" {
+		if f, err := os.Open(historyPath); err == nil {
+			_, _ = line.ReadHistory(f)
+			f.Close()
+		}
+		// Persist on exit. Best-effort — a write failure should not
+		// mask a successful inspection session.
+		defer func() {
+			if err := writeHistory(historyPath, line); err != nil {
+				fmt.Fprintf(os.Stderr, "memdb-cli: history save failed: %v\n", err)
+			}
+		}()
+	}
+
+	var buf strings.Builder
+	for {
+		prompt := "memdb> "
+		if buf.Len() > 0 {
+			prompt = "   ...> "
+		}
+		input, err := line.Prompt(prompt)
+		if err != nil {
+			// liner returns io.EOF on ctrl-d (and on ctrl-c when
+			// SetCtrlCAborts is true). Either is "done".
+			if errors.Is(err, io.EOF) || errors.Is(err, liner.ErrPromptAborted) {
+				fmt.Println()
 				return
 			}
-			prompt()
+			fmt.Fprintf(os.Stderr, "memdb-cli: input error: %v\n", err)
+			return
+		}
+
+		// Meta-commands only at the start of a fresh statement.
+		if buf.Len() == 0 && strings.HasPrefix(strings.TrimSpace(input), ".") {
+			line.AppendHistory(input)
+			if done := runMeta(db, strings.TrimSpace(input), out); done {
+				return
+			}
 			continue
 		}
 
-		buf.WriteString(line)
+		// Always remember the line as typed, before merging into the
+		// statement buffer — keeps history granular for editing.
+		if strings.TrimSpace(input) != "" {
+			line.AppendHistory(input)
+		}
+
+		buf.WriteString(input)
 		buf.WriteByte('\n')
 
-		// Statement terminator detection: trailing `;` after optional
-		// whitespace.
-		if strings.HasSuffix(strings.TrimRight(line, " \t"), ";") {
+		// Statement terminator: trailing `;` after optional whitespace.
+		if strings.HasSuffix(strings.TrimRight(input, " \t"), ";") {
 			stmt := strings.TrimSpace(buf.String())
 			buf.Reset()
 			if stmt != ";" && stmt != "" {
@@ -178,12 +392,178 @@ func repl(db *sql.DB, out *printer) {
 				}
 			}
 		}
-		prompt()
 	}
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "memdb-cli: input error: %v\n", err)
+}
+
+// writeHistory persists the in-memory history to historyPath via a
+// temp-file + rename, so a crash mid-write cannot corrupt the file
+// and replace good history with a half-flushed truncation.
+func writeHistory(historyPath string, line *liner.State) error {
+	if err := os.MkdirAll(filepath.Dir(historyPath), 0o700); err != nil {
+		return err
 	}
-	fmt.Println()
+	tmp, err := os.CreateTemp(filepath.Dir(historyPath), ".memdb-cli-history-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := line.WriteHistory(tmp); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, historyPath)
+}
+
+// defaultHistoryPath returns the XDG-conformant default for the
+// persistent history file. Falls back to the OS-specific user-state
+// dir, then to /tmp if all else fails — better to keep history
+// somewhere ephemeral than silently lose it.
+func defaultHistoryPath() string {
+	if x := os.Getenv("XDG_STATE_HOME"); x != "" {
+		return filepath.Join(x, "memdb-cli", "history")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "state", "memdb-cli", "history")
+	}
+	return filepath.Join(os.TempDir(), "memdb-cli-history")
+}
+
+// loadTableNames reads the user-table list once at REPL start.
+// Snapshot schema does not change between queries (the CLI is
+// read-only and immutable=1) so a one-shot load is correct;
+// callers that mutate the underlying file should restart the CLI.
+//
+// Best-effort: a failed load returns nil and the completer simply
+// has no table names to suggest — the rest of completion still
+// works.
+func loadTableNames(db *sql.DB) []string {
+	rows, err := db.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err == nil {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
+// metaCommands is the static list of dot-commands the completer
+// proposes. Kept in sync by hand with the runMeta switch — the
+// trailing space disambiguates from prefix matches.
+var metaCommands = []string{
+	".databases", ".echo", ".exit", ".headers", ".help", ".indexes",
+	".indices", ".mode", ".quit", ".read", ".schema", ".separator",
+	".show", ".tables", ".timer", ".version",
+}
+
+// sqlKeywords is a small set of common SQL keywords for the
+// "I don't know what context you're in" fallback case. Kept short
+// on purpose — completion floods are worse than no completion.
+var sqlKeywords = []string{
+	"SELECT", "FROM", "WHERE", "ORDER BY", "GROUP BY", "HAVING",
+	"LIMIT", "OFFSET", "JOIN", "LEFT JOIN", "INNER JOIN", "ON",
+	"AS", "AND", "OR", "NOT", "IN", "LIKE", "IS NULL", "IS NOT NULL",
+	"COUNT(*)", "DISTINCT", "WITH", "UNION", "EXPLAIN", "PRAGMA",
+}
+
+// tableContextWords are the (case-insensitive) tokens whose
+// immediately following word is a table name — the completer
+// switches to table-name suggestions after seeing one of these.
+var tableContextWords = map[string]bool{
+	"from": true, "join": true, "into": true, "update": true,
+	"table": true, ".schema": true, ".indexes": true, ".indices": true,
+}
+
+// makeCompleter returns a liner.WordCompleter that proposes meta-
+// commands, table names, or SQL keywords depending on what comes
+// before the cursor. The closure captures the table list so the
+// completer is independent of the *sql.DB after construction —
+// makes it trivial to unit-test in isolation.
+//
+// Decision tree, applied in order:
+//
+//  1. Word being completed starts with `.`     → meta-commands
+//  2. Previous word is FROM/JOIN/INTO/UPDATE/
+//     TABLE/.schema/.indexes (case-insensitive) → table names
+//  3. Otherwise                                → tables ∪ keywords
+//
+// Empty prefix returns no suggestions — dumping the whole keyword
+// list on every space is noise rather than help.
+func makeCompleter(tables []string) liner.WordCompleter {
+	sort.Strings(tables)
+	return func(line string, pos int) (head string, completions []string, tail string) {
+		if pos > len(line) {
+			pos = len(line)
+		}
+		// Find the start of the word being completed: scan back
+		// from pos until whitespace or an opening delimiter.
+		start := pos
+		for start > 0 {
+			c := line[start-1]
+			if c == ' ' || c == '\t' || c == '(' || c == ',' {
+				break
+			}
+			start--
+		}
+		word := line[start:pos]
+		head = line[:start]
+		tail = line[pos:]
+
+		switch {
+		case strings.HasPrefix(word, "."):
+			completions = matchPrefix(metaCommands, word)
+
+		case tableContextWords[strings.ToLower(previousWord(head))]:
+			completions = matchPrefix(tables, word)
+
+		default:
+			completions = append(completions, matchPrefix(tables, word)...)
+			completions = append(completions, matchPrefix(sqlKeywords, word)...)
+		}
+		return
+	}
+}
+
+// previousWord returns the last whitespace-separated token in s.
+// Used by makeCompleter to detect "the word right before the
+// cursor" without parsing SQL.
+func previousWord(s string) string {
+	s = strings.TrimRight(s, " \t")
+	if s == "" {
+		return ""
+	}
+	i := strings.LastIndexAny(s, " \t\n")
+	if i < 0 {
+		return s
+	}
+	return s[i+1:]
+}
+
+// matchPrefix returns every candidate that case-insensitively
+// starts with prefix. Preserves the candidate's original casing
+// (so SELECT stays SELECT) — readability over consistency.
+func matchPrefix(candidates []string, prefix string) []string {
+	if prefix == "" {
+		return nil
+	}
+	lp := strings.ToLower(prefix)
+	var out []string
+	for _, c := range candidates {
+		if strings.HasPrefix(strings.ToLower(c), lp) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // runMeta dispatches a `.command` line. Returns true if the REPL

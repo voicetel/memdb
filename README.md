@@ -1086,38 +1086,61 @@ memdb snapshot -h
 memdb restore -h
 ```
 
-### Inspecting snapshots with `memdb-cli`
+### `memdb-cli` — inspection and live client
 
-Snapshot files cannot be opened by the `sqlite3` CLI directly: they are
-wrapped in an 8-byte `MDBK` prefix and a 40-byte length+SHA-256 footer
-that surrounds the raw SQLite payload. Use `memdb-cli` instead — it is
-a sqlite3-style read-only inspection shell that strips the wrap on
-the fly and refuses any write attempt:
+`memdb-cli` is a sqlite3 / psql hybrid that operates in either of two
+mutually exclusive modes:
+
+- **Snapshot mode (`-file PATH`)** — opens a snapshot file directly,
+  unwraps the `MDBK` envelope, opens the payload with
+  `mode=ro&immutable=1`, and presents a sqlite3-style REPL. Read-only:
+  any `INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP` is rejected with a clear
+  "inspection only" message. Works whether the daemon is running or
+  not — the daemon writes via atomic rename, so the inode the CLI
+  opens is a stable point-in-time view (data may lag the live state
+  by up to one flush interval).
+- **Wire mode (`-addr HOST:PORT`)** — connects to a running `memdb
+  serve` over the PostgreSQL wire protocol via `lib/pq`. Behaves like
+  a small `psql`: full read+write access (subject to server auth),
+  point-in-time-correct, with the same REPL/history/completion as
+  snapshot mode.
 
 ```bash
-# Single statement (works whether the server is running or not)
+# Snapshot (read-only) — works whether the server is running or not
 memdb-cli -file /var/lib/myapp/data.db -c ".tables"
 memdb-cli -file /var/lib/myapp/data.db -c "SELECT COUNT(*) FROM sessions"
+memdb-cli -file /var/lib/myapp/data.db                # interactive REPL
 
-# Interactive REPL with sqlite3-like meta-commands:
-#   .help .tables .schema [name] .indexes [table] .databases
-#   .mode column|list|line|csv  .separator STR  .headers on|off
-#   .timer on|off  .echo on|off  .show  .read FILE  .quit
-memdb-cli -file /var/lib/myapp/data.db
+# Wire (read+write) — connect to a live server
+memdb-cli -addr 127.0.0.1:5433 -user memdb -c "SELECT * FROM sessions LIMIT 10"
+memdb-cli -addr 127.0.0.1:5433 -user memdb           # interactive REPL
+echo "INSERT INTO sessions(...) VALUES(...);" | memdb-cli -addr 127.0.0.1:5433 -user memdb
+
+# Auth — password also reads the MEMDB_PASSWORD env var (avoids ps leak)
+MEMDB_PASSWORD=secret memdb-cli -addr 127.0.0.1:5433 -user memdb
+
+# TLS — required, with optional skip-verify for self-signed
+memdb-cli -addr edge.internal:5433 -tls -user memdb
+memdb-cli -addr edge.internal:5433 -tls -tls-skip-verify -user memdb
 ```
 
-`memdb-cli` opens the unwrapped payload with `mode=ro&immutable=1`,
-so any INSERT/UPDATE/DELETE/CREATE/DROP returns a clear
-"inspection only" message rather than mutating the file.
+The interactive REPL supports:
 
-For live (up-to-the-second) data inspection, use the PostgreSQL wire
-protocol — it always reads the in-memory state and bypasses the
-snapshot's flush-interval lag:
+- Line editing, history (up/down arrows, ctrl-r reverse search),
+  persistent at `$XDG_STATE_HOME/memdb-cli/history` (override with
+  `-history PATH`, disable with `-no-history`).
+- Tab completion: meta-commands, table names after
+  `FROM`/`JOIN`/`INTO`/`UPDATE`/`.schema`/`.indexes`, and SQL keywords.
+- sqlite3-style meta-commands: `.help`, `.tables`, `.schema [name]`,
+  `.indexes [table]`, `.databases`, `.mode column|list|line|csv`,
+  `.separator STR`, `.headers on|off`, `.timer on|off`, `.echo on|off`,
+  `.show`, `.read FILE`, `.quit` / `.exit`.
+- Output modes: `column` (buffered, fixed-width), `list` (streaming,
+  `|` separated), `line` (one column per line), `csv` (RFC 4180).
 
-```bash
-# Requires the server to be running
-psql -h 127.0.0.1 -p 5433 -U memdb -c "SELECT * FROM sessions LIMIT 10"
-```
+Use `psql` against the wire port if you prefer it — `memdb-cli`
+wire mode is a convenience for users who already have `memdb-cli`
+installed for snapshot inspection.
 
 See the [Snapshot integrity](#snapshot-integrity) section for a full
 explanation of the `MDBK` envelope format.
