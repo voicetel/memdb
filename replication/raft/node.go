@@ -182,6 +182,20 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	if cfg.DataDir == "" {
 		return nil, fmt.Errorf("raft node: DataDir is required")
 	}
+
+	// Clone the caller's TLS config and ensure a ClientSessionCache is set so
+	// outbound dials (transport peer dials and forwarder ConnPool dials) can
+	// resume TLS sessions instead of paying a full handshake every time the
+	// pool drops a stale conn or rebuilds after a leader change. Cloning
+	// rather than mutating preserves the caller's struct — Config docs are
+	// explicit that callers must not mutate a Config in use, and we treat
+	// the input the same way. Idle pool windows (30s) and leader rotations
+	// are exactly when cold dials happen, so the saving is on the slow path
+	// rather than the steady state.
+	cfg.TLSConfig = cfg.TLSConfig.Clone()
+	if cfg.TLSConfig.ClientSessionCache == nil {
+		cfg.TLSConfig.ClientSessionCache = tls.NewLRUClientSessionCache(0)
+	}
 	// Peers must always be provided — even on restart they are used to validate
 	// the caller's intent, and on first boot they define the cluster membership.
 	if len(cfg.Peers) == 0 {

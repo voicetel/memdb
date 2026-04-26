@@ -963,6 +963,9 @@ Build and install the CLI with `make install`, then:
 # Start the PostgreSQL wire-protocol server
 memdb serve --file /var/lib/myapp/data.db --addr 127.0.0.1:5433 --flush 30s
 
+# Standalone with explicit durability (default: wal). none|wal|sync.
+memdb serve --file /var/lib/myapp/data.db --durability sync
+
 # Start the server with pprof on loopback (:6060)
 memdb serve --file /var/lib/myapp/data.db --pprof 127.0.0.1:6060
 
@@ -972,6 +975,36 @@ memdb snapshot --file /var/lib/myapp/data.db
 # Restore a snapshot file to a new location
 memdb restore --from /var/lib/myapp/data.db --to /var/lib/myapp/data-copy.db
 ```
+
+### Clustered serve (Raft replication)
+
+Pass `-raft-node-id` to enable replication; the remaining `-raft-*` flags
+configure cluster membership and inter-node mutual TLS. Each node runs the
+same binary with its own identity. Cluster size must be odd (1, 3, 5, 7) —
+even sizes are rejected at first bootstrap.
+
+```bash
+# Three-node cluster — run this on node-1, vary -raft-node-id and -raft-bind on the others.
+memdb serve \
+  --file /var/lib/memdb/data.db --addr 0.0.0.0:5433 \
+  --raft-node-id node-1 \
+  --raft-bind 10.0.0.1:7000 --raft-forward-bind 10.0.0.1:7001 \
+  --raft-peers 'node-1=10.0.0.1:7000,node-2=10.0.0.2:7000,node-3=10.0.0.3:7000' \
+  --raft-forward-peers 'node-1=10.0.0.1:7001,node-2=10.0.0.2:7001,node-3=10.0.0.3:7001' \
+  --raft-data-dir /var/lib/memdb/raft \
+  --raft-tls-cert /etc/memdb/tls/cert.pem \
+  --raft-tls-key  /etc/memdb/tls/key.pem \
+  --raft-tls-ca   /etc/memdb/tls/ca.pem
+```
+
+When `-raft-node-id` is set, `-durability` defaults to `none` because Raft's
+log is already the durability layer — keeping memdb's WAL on top would be a
+redundant per-write fsync. Override with `--durability wal` to opt in.
+
+Followers transparently forward writes to the leader over the
+`-raft-forward-bind` port; clients can connect to any node. Outbound
+inter-node TLS dials reuse session tickets, so handshakes after a leader
+change or idle drop are 1-RTT PSK rather than full asymmetric.
 
 Each sub-command accepts `-h` for flag details:
 

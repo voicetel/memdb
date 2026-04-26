@@ -32,12 +32,16 @@ func main() {
 	serveFile := serveCmd.String("file", "memdb.db", "path to SQLite snapshot file")
 	serveAddr := serveCmd.String("addr", "127.0.0.1:5433", "listen address (TCP or unix://path)")
 	serveFlush := serveCmd.Duration("flush", 30*time.Second, "flush interval")
+	serveDurability := serveCmd.String("durability", "",
+		"durability mode: none|wal|sync. Default: wal standalone, none with raft "+
+			"(raft's log is already durable, so memdb's WAL is redundant)")
 	servePprof := serveCmd.String("pprof", "",
 		"enable net/http/pprof on the given address (e.g. 127.0.0.1:6060); empty disables")
 	servePprofMutex := serveCmd.Int("pprof-mutex-fraction", 0,
 		"mutex profile sampling fraction (see runtime.SetMutexProfileFraction); 0 disables")
 	servePprofBlock := serveCmd.Int("pprof-block-rate", 0,
 		"block profile sampling rate in nanoseconds (see runtime.SetBlockProfileRate); 0 disables")
+	serveRaft := registerRaftFlags(serveCmd)
 
 	snapCmd := flag.NewFlagSet("snapshot", flag.ExitOnError)
 	snapFile := snapCmd.String("file", "memdb.db", "path to SQLite snapshot file")
@@ -57,8 +61,8 @@ func main() {
 			slog.Error("serve parse flags", "error", err)
 			os.Exit(1)
 		}
-		runServe(*serveFile, *serveAddr, *serveFlush,
-			*servePprof, *servePprofMutex, *servePprofBlock)
+		runServe(*serveFile, *serveAddr, *serveFlush, *serveDurability,
+			*servePprof, *servePprofMutex, *servePprofBlock, serveRaft)
 
 	case "snapshot":
 		if err := snapCmd.Parse(os.Args[2:]); err != nil {
@@ -84,8 +88,54 @@ func main() {
 	}
 }
 
-func runServe(file, addr string, flush time.Duration,
-	pprofAddr string, pprofMutex, pprofBlock int) {
+// resolveDurability maps the -durability CLI flag to a memdb.DurabilityMode.
+// An empty flag selects DurabilityNone in raft mode (Raft's log is already
+// the durability layer; memdb's WAL would be a redundant per-write fsync)
+// and DurabilityWAL standalone (the safer default for a single-node DB).
+func resolveDurability(flag string, raftEnabled bool) (memdb.DurabilityMode, error) {
+	switch strings.ToLower(flag) {
+	case "":
+		if raftEnabled {
+			return memdb.DurabilityNone, nil
+		}
+		return memdb.DurabilityWAL, nil
+	case "none":
+		return memdb.DurabilityNone, nil
+	case "wal":
+		return memdb.DurabilityWAL, nil
+	case "sync":
+		return memdb.DurabilitySync, nil
+	default:
+		return 0, fmt.Errorf("invalid -durability %q (want none|wal|sync)", flag)
+	}
+}
+
+func durabilityName(m memdb.DurabilityMode) string {
+	switch m {
+	case memdb.DurabilityNone:
+		return "none"
+	case memdb.DurabilityWAL:
+		return "wal"
+	case memdb.DurabilitySync:
+		return "sync"
+	default:
+		return "unknown"
+	}
+}
+
+func runServe(file, addr string, flush time.Duration, durability string,
+	pprofAddr string, pprofMutex, pprofBlock int, raftCfg *raftFlags) {
+	if err := raftCfg.validate(); err != nil {
+		slog.Error("raft flags", "error", err)
+		os.Exit(1)
+	}
+
+	durabilityMode, err := resolveDurability(durability, raftCfg.enabled())
+	if err != nil {
+		slog.Error("durability flag", "error", err)
+		os.Exit(1)
+	}
+
 	// If using a Unix socket, remove any stale socket file from a previous run.
 	if strings.HasPrefix(addr, "unix://") {
 		path := strings.TrimPrefix(addr, "unix://")
@@ -118,19 +168,51 @@ func runServe(file, addr string, flush time.Duration,
 		}()
 	}
 
-	db, err := memdb.Open(memdb.Config{
+	// nodeExec is assigned after the Raft node is built. The OnExec closure
+	// captures it by reference so memdb.Open can be called before the node
+	// exists — ListenAndServe only starts after assignment, so the nil
+	// window is never observable to a concurrent caller.
+	var nodeExec func(sql string, args ...any) error
+	memCfg := memdb.Config{
 		FilePath:      file,
 		FlushInterval: flush,
-		Durability:    memdb.DurabilityWAL,
+		Durability:    durabilityMode,
 		OnFlushError: func(err error) {
 			slog.Error("flush error", "error", err)
 		},
-	})
+	}
+	if raftCfg.enabled() {
+		memCfg.OnExec = func(sql string, args []any) error {
+			return nodeExec(sql, args...)
+		}
+	}
+
+	db, err := memdb.Open(memCfg)
 	if err != nil {
 		slog.Error("open failed", "error", err)
 		os.Exit(1)
 	}
 	defer db.Close()
+
+	if raftCfg.enabled() {
+		node, err := buildRaftNode(db, *raftCfg, slog.Default())
+		if err != nil {
+			slog.Error("raft start failed", "error", err)
+			os.Exit(1)
+		}
+		nodeExec = node.Exec
+		defer func() {
+			if err := node.Shutdown(); err != nil {
+				slog.Warn("raft shutdown error", "error", err)
+			}
+		}()
+		slog.Info("memdb raft enabled",
+			"nodeID", raftCfg.NodeID,
+			"bind", raftCfg.BindAddr,
+			"forwardBind", raftCfg.ForwardBindAddr,
+			"peers", raftCfg.Peers,
+		)
+	}
 
 	srv := server.New(db, server.Config{ListenAddr: addr})
 
@@ -142,7 +224,9 @@ func runServe(file, addr string, flush time.Duration,
 		srv.Stop()
 	}()
 
-	slog.Info("memdb listening", "addr", addr, "file", file, "flush", flush)
+	slog.Info("memdb listening",
+		"addr", addr, "file", file, "flush", flush,
+		"durability", durabilityName(durabilityMode))
 	if err := srv.ListenAndServe(); err != nil {
 		// Write directly to stderr so a port-conflict or bind error is always
 		// visible in the terminal, even when syslog is the default handler.
@@ -237,5 +321,8 @@ Commands:
   restore     Copy a snapshot file to a new location
 
 Run 'memdb <command> -h' for flag details.
+
+Replication: pass -raft-node-id (and the other -raft-* flags) to 'serve'
+to join a Raft cluster. See 'memdb serve -h' for the full list.
 `)
 }

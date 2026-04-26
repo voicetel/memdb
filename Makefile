@@ -443,6 +443,14 @@ pprof-raft: dirs ## Capture CPU/heap profile of the Raft Apply path (3-node clus
 		$(GO) test -v -timeout 120s -run "TestPProf_Raft_" ./replication/raft/...
 	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_raft_*$(NC)"
 
+.PHONY: pprof-raft-memdb
+pprof-raft-memdb: dirs ## Capture CPU/heap profile of the full Raft+memdb apply path (3-node cluster, real *memdb.DB FSMs)
+	@mkdir -p $(COVERAGE_DIR)/pprof
+	@echo -e "$(BLUE)Capturing Raft+memdb pprof profiles into $(COVERAGE_DIR)/pprof...$(NC)"
+	MEMDB_PPROF=1 MEMDB_PPROF_DIR=$(COVERAGE_DIR)/pprof \
+		$(GO) test -v -timeout 120s -run "TestPProf_Raft_MemDB$$" ./replication/raft/...
+	@echo -e "$(GREEN)✓ Profiles: $(COVERAGE_DIR)/pprof/pprof_raft_memdb.*$(NC)"
+
 .PHONY: pprof-view
 pprof-view: ## Open the last captured CPU profile in the pprof web UI (PROF=<path>)
 	@if [ -z "$(PROF)" ]; then \
