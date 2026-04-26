@@ -46,31 +46,45 @@ func copyMemToWriter(ctx context.Context, d *DB, w io.Writer, stepPages int) err
 	return err
 }
 
-// copyReaderToMem restores the in-memory DB from r using the SQLite Online
-// Backup API: stream r → temp file → backup into memory.
-func copyReaderToMem(ctx context.Context, d *DB, r io.Reader, stepPages int) error {
+// restoreVerifiedSnapshot streams a wrapped snapshot from r through
+// verifyAndStreamPayload directly into a temp file (combining the
+// verification and the temp-file staging that copyReaderToMem would do
+// in two passes), then loads the verified payload into d.mem via the
+// SQLite Online Backup API.
+//
+// Returns isLegacy=true when r contained an unwrapped raw SQLite file
+// (no "MDBK" prefix); the caller decides whether to log a warning. On
+// verification failure (length or hash mismatch, truncated footer)
+// returns ErrSnapshotCorrupt without touching d.mem.
+//
+// Memory is O(1) regardless of snapshot size — the verifier uses a
+// 64 KiB sliding window and writes the verified payload straight to
+// disk; the temp file is then handed to the SQLite backup API.
+func restoreVerifiedSnapshot(ctx context.Context, d *DB, r io.Reader) (isLegacy bool, err error) {
 	tmp, err := os.CreateTemp("", ".memdb-restore-*.db")
 	if err != nil {
-		return fmt.Errorf("memdb: restore temp: %w", err)
+		return false, fmt.Errorf("memdb: restore temp: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 
-	if _, err := io.Copy(tmp, r); err != nil {
-		tmp.Close()
-		return fmt.Errorf("memdb: restore write temp: %w", err)
+	isLegacy, verr := verifyAndStreamPayload(r, tmp)
+	if cerr := tmp.Close(); cerr != nil && verr == nil {
+		verr = cerr
 	}
-	tmp.Close()
+	if verr != nil {
+		return isLegacy, verr
+	}
 
 	fileDB, err := openFileDB(tmpName)
 	if err != nil {
-		return err
+		return isLegacy, err
 	}
 	defer fileDB.Close()
 
-	return withRawConn(ctx, fileDB, func(fileConn *sqlite3.SQLiteConn) error {
+	return isLegacy, withRawConn(ctx, fileDB, func(fileConn *sqlite3.SQLiteConn) error {
 		return withRawConn(ctx, d.mem, func(memConn *sqlite3.SQLiteConn) error {
-			return copyDB(ctx, fileConn, memConn, stepPages)
+			return copyDB(ctx, fileConn, memConn, d.cfg.BackupStepPages)
 		})
 	})
 }

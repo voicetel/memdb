@@ -1,17 +1,20 @@
-# memdb v1.6.1 — Benchmark Report
+# memdb v1.6.2 — Benchmark Report
 
 Consolidated results from the full benchmark suite and the pprof-driven
 throughput scenarios. All numbers captured in a single session against the
-commit tagged `v1.6.1` after the second-sweep allocation cleanups; see the
+commit tagged `v1.6.2` after the streaming snapshot writer landed; see the
 Setup section for the exact environment.
 
 > **Headline change vs the v1.5.0 baseline** — repeated `Exec`/`Query`
 > calls now skip per-call Prepare/Close on the writer (prepared-statement
 > cache added in v1.6.0), the Raft and WAL hot paths share the same binary
-> codec with no `encoding/gob`, and a second-sweep pass replaced JSON in
-> the Raft on-disk log with a binary codec, swapped two more per-request
+> codec with no `encoding/gob`, a second-sweep pass replaced JSON in the
+> Raft on-disk log with a binary codec, swapped two more per-request
 > allocations for reusable buffers (server reader, replica pool checkout),
-> and pinned `CompressedBackend` to `zstd.SpeedFastest`.
+> pinned `CompressedBackend` to `zstd.SpeedFastest`, and v1.6.2 moved the
+> snapshot SHA-256 from a header buffer to a streaming footer (B/op
+> constant regardless of payload size; **−98 %** at 10k rows, **−39 %**
+> wall time).
 >
 > | Scenario | v1.5.0 | v1.6.0 | v1.6.1 | v1.5→v1.6.1 |
 > |---|---:|---:|---:|---:|
@@ -54,7 +57,7 @@ Setup section for the exact environment.
 | CPU | 12th Gen Intel(R) Core(TM) i7-1280P (20 threads) |
 | Go | go1.24.4 linux/amd64 |
 | SQLite driver | github.com/mattn/go-sqlite3 (cgo) |
-| Commit | v1.6.1 |
+| Commit | v1.6.2 |
 | `-benchtime` | 5 s per bench |
 | `-cpu` | default (GOMAXPROCS=20) unless noted |
 
@@ -64,6 +67,47 @@ timings reflect only the operation under measurement, not periodic I/O.
 ---
 
 ## What changed since v1.5.0
+
+### v1.6.2 — streaming snapshot writer
+
+The flush path previously buffered the entire serialised SQLite payload in
+a `bytes.Buffer` so SHA-256 could be computed before writing the integrity
+header. For multi-MiB databases this allocated ~2× the payload size on
+every flush interval — measured at 2.0 MiB B/op for a 10k-row snapshot
+and growing linearly with dataset size, dwarfing all other allocations
+on the flush path.
+
+Moved the integrity wrap from header to footer
+(`[magic][version][...payload...][payloadLen][sha256]`). The writer
+streams payload bytes straight to dst through an incremental
+`sha256.New()` (O(1) memory). The reader uses a 40-byte sliding window
+via `bufio.Reader.Peek(64KiB)`: every iteration emits everything except
+the trailing 40 bytes; the final `Peek` (returning `io.EOF`) holds the
+footer in its tail. Restore stays O(1) memory too.
+
+| Scenario | v1.6.1 | v1.6.2 | Change |
+|---|---:|---:|---:|
+| `BenchmarkFlush/rows=100` time | 113.7 µs | 106.1 µs | **−6.7 %** |
+| `BenchmarkFlush/rows=1000` time | 239.2 µs | 178.4 µs | **−25.4 %** |
+| `BenchmarkFlush/rows=10000` time | 1369.2 µs | 829.9 µs | **−39.4 %** |
+| `BenchmarkFlush/rows=100` B/op | 47.9 KiB | 36.1 KiB | **−24.7 %** |
+| `BenchmarkFlush/rows=1000` B/op | 260.0 KiB | 36.1 KiB | **−86.1 %** |
+| `BenchmarkFlush/rows=10000` B/op | 2053.0 KiB | 36.1 KiB | **−98.2 %** |
+
+Flush B/op is now **constant** regardless of payload size — the headline
+property of the streaming wrap. The wall-time win grows with dataset
+size because removing the buffer-and-hash pass also eliminates a
+linear-in-N allocation, copy, and GC sweep per flush. **Wire-format
+break** — v1.6.1 snapshots cannot be read by v1.6.2; flush before
+upgrade is not preserved across this version.
+
+A WAL group-commit prototype was also evaluated this cycle and reverted:
+on consumer NVMe (~540 ns fsync) the cond-variable bookkeeping costs
+more than the fsyncs it saves (`BenchmarkWAL_Append_Parallel-8` regressed
++25 %). It would still be a win on cloud SSDs and spinning disks, but
+without runtime detection of fsync latency the safer default is to keep
+the simple `Write+Sync`-under-mu path. `BenchmarkWAL_Append_Parallel`
+was retained as a regression guard for any future WAL work.
 
 ### v1.6.1 — second-sweep allocation cleanups
 

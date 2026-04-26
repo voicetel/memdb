@@ -1099,18 +1099,22 @@ func TestSnapshot_Legacy_NoChecksum(t *testing.T) {
 	}
 	db.Close()
 
-	// Strip the 44-byte checksum header, leaving a raw SQLite file.
-	// This simulates a snapshot written by a pre-checksum version of memdb.
+	// Strip the snapshot wrapping ([magic][version] prefix at the front,
+	// [payloadLen][sha256] footer at the back), leaving a raw SQLite
+	// file. This simulates a snapshot written by some other tool — or
+	// by a pre-wrapping version of memdb — that begins directly with
+	// the SQLite header bytes.
 	path := cfg.FilePath
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	const headerLen = 40 // snapHeaderLen: magic(4) + version(4) + sha256(32)
-	if len(data) < headerLen {
-		t.Skipf("snapshot too small (%d bytes) to strip header", len(data))
+	const prefixLen = 8  // snapPrefixLen: magic(4) + version(4)
+	const footerLen = 40 // snapFooterLen: payloadLen(8) + sha256(32)
+	if len(data) < prefixLen+footerLen {
+		t.Skipf("snapshot too small (%d bytes) to strip wrapping", len(data))
 	}
-	raw := data[headerLen:] // payload only — pure SQLite bytes
+	raw := data[prefixLen : len(data)-footerLen] // payload only — pure SQLite bytes
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -1156,5 +1160,114 @@ func TestDB_WithTx_OnClosedDB(t *testing.T) {
 	})
 	if !errors.Is(err, memdb.ErrClosed) {
 		t.Errorf("expected ErrClosed from WithTx on closed DB, got %v", err)
+	}
+}
+
+// ── Snapshot footer integrity ─────────────────────────────────────────────────
+
+// writeSnapshotForCorruption flushes a small snapshot to disk and returns
+// the resulting file path. The caller mutates the file in place and then
+// reopens to confirm the verifier rejects the tampered bytes.
+func writeSnapshotForCorruption(t *testing.T) (cfg memdb.Config, path string) {
+	t.Helper()
+	cfg = extraTestConfig(t)
+	db := mustOpen(t, cfg)
+	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES ('integrity', 'check')`); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	db.Close()
+	return cfg, cfg.FilePath
+}
+
+// TestSnapshot_Footer_HashMismatch flips a byte inside the trailing
+// SHA-256 and verifies the verifier returns ErrSnapshotCorrupt.
+func TestSnapshot_Footer_HashMismatch(t *testing.T) {
+	cfg, path := writeSnapshotForCorruption(t)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// SHA-256 lives in the last 32 bytes of the file. Flip the high
+	// bit of the last byte — guaranteed to change the digest.
+	data[len(data)-1] ^= 0x80
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err = memdb.Open(cfg)
+	if err == nil {
+		t.Fatal("Open succeeded on corrupted snapshot, want ErrSnapshotCorrupt")
+	}
+	if !errors.Is(err, memdb.ErrSnapshotCorrupt) {
+		t.Errorf("Open error = %v, want ErrSnapshotCorrupt in chain", err)
+	}
+	if !strings.Contains(err.Error(), "SHA-256 mismatch") {
+		t.Errorf("Open error = %v, want message to mention SHA-256 mismatch", err)
+	}
+}
+
+// TestSnapshot_Footer_LengthMismatch flips a byte inside the trailing
+// payload-length field and verifies the verifier rejects the snapshot.
+// The length field lives at bytes [-40 .. -32] from EOF.
+func TestSnapshot_Footer_LengthMismatch(t *testing.T) {
+	cfg, path := writeSnapshotForCorruption(t)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// payloadLen is the 8 bytes immediately before the SHA-256.
+	// Index -40 is the high byte of the big-endian uint64; flipping a
+	// low bit there makes the claimed length differ by exactly 2^56.
+	data[len(data)-40] ^= 0x01
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err = memdb.Open(cfg)
+	if err == nil {
+		t.Fatal("Open succeeded on corrupted length, want ErrSnapshotCorrupt")
+	}
+	if !errors.Is(err, memdb.ErrSnapshotCorrupt) {
+		t.Errorf("Open error = %v, want ErrSnapshotCorrupt in chain", err)
+	}
+	if !strings.Contains(err.Error(), "payload length mismatch") {
+		t.Errorf("Open error = %v, want message to mention payload length mismatch", err)
+	}
+}
+
+// TestSnapshot_Footer_Truncated drops the trailing footer entirely —
+// the resulting file is just [magic][version][partial payload] and the
+// verifier must report a truncated footer rather than a hash mismatch.
+func TestSnapshot_Footer_Truncated(t *testing.T) {
+	cfg, path := writeSnapshotForCorruption(t)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(data) <= 48 {
+		t.Skipf("snapshot too small (%d bytes) to truncate footer meaningfully", len(data))
+	}
+	// Drop a few bytes off the end so the file no longer contains a
+	// complete footer; the verifier should still see the magic+version
+	// at the front but find < 40 bytes after the last full peek.
+	truncated := data[:len(data)-10]
+	if err := os.WriteFile(path, truncated, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err = memdb.Open(cfg)
+	if err == nil {
+		t.Fatal("Open succeeded on truncated snapshot, want ErrSnapshotCorrupt")
+	}
+	if !errors.Is(err, memdb.ErrSnapshotCorrupt) {
+		t.Errorf("Open error = %v, want ErrSnapshotCorrupt in chain", err)
 	}
 }

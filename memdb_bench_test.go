@@ -546,6 +546,42 @@ func BenchmarkWAL_Append(b *testing.B) {
 	}
 }
 
+// BenchmarkWAL_Append_Parallel measures concurrent Append calls hitting
+// the WAL directly (bypassing the SQLite writer-connection mutex that
+// would otherwise serialise upstream of the WAL in a full Exec path).
+//
+// Group commit shows here as amortised fsync cost: N writers in flight
+// fan in to ~1 fsync per batch window, so per-op latency drops as
+// concurrency rises while raw fsync per call would stay flat.
+func BenchmarkWAL_Append_Parallel(b *testing.B) {
+	f, err := os.CreateTemp(b.TempDir(), "memdb-wal-parallel-*.wal")
+	if err != nil {
+		b.Fatal(err)
+	}
+	f.Close()
+
+	wal, err := memdb.OpenWAL(f.Name())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { wal.Close() })
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		entry := memdb.WALEntry{
+			Timestamp: time.Now().UnixNano(),
+			SQL:       `INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+			Args:      []any{"bench-key", "bench-val"},
+		}
+		for pb.Next() {
+			entry.Seq = wal.NextSeq()
+			if err := wal.Append(entry); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 // BenchmarkWAL_Replay measures the cost of reading and decoding a pre-filled WAL.
 func BenchmarkWAL_Replay(b *testing.B) {
 	for _, n := range []int{100, 1_000, 10_000} {
