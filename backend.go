@@ -116,6 +116,25 @@ func (s *snapshotWriter) Finish() error {
 	return nil
 }
 
+// UnwrapSnapshot reads a memdb snapshot from r, verifies its MDBK
+// integrity wrap, and writes the raw SQLite payload bytes to dst as
+// they stream. The result is a vanilla SQLite database file that can
+// be opened by any SQLite tool (the sqlite3 CLI, DB Browser, etc.).
+//
+// If r contains a legacy unwrapped snapshot — raw SQLite bytes
+// without the MDBK header — the bytes are passed through unchanged
+// and isLegacy is true so the caller may warn or upgrade the file.
+//
+// Returns ErrSnapshotCorrupt for a wrapped snapshot whose footer
+// indicates a length or hash mismatch, or whose footer is truncated.
+//
+// Memory is O(1) regardless of snapshot size: the caller may pass an
+// arbitrarily large stream without buffering it. This is the public
+// entry point used by external tooling such as cmd/memdb-cli.
+func UnwrapSnapshot(r io.Reader, dst io.Writer) (isLegacy bool, err error) {
+	return verifyAndStreamPayload(r, dst)
+}
+
 // verifyAndStreamPayload reads a wrapped snapshot from r, verifies its
 // integrity, and writes the raw SQLite payload bytes to dst as it streams.
 // Memory is O(1) — only a 64 KiB read buffer plus the running SHA-256 state.

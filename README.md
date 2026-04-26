@@ -889,19 +889,25 @@ syntax (`OPERATOR(pg_catalog.~)`, `::regtype::text` casts) that SQLite cannot
 parse. These are issued by the `psql` client itself, not by application code,
 and the server returns an error for them.
 
-**For administrator introspection use the CLI instead:**
+**For administrator introspection use `memdb-cli` instead:**
 
 ```bash
-# List tables in a snapshot
-memdb snapshot --file /var/lib/myapp/data.db   # ensure snapshot is current
-dd if=/var/lib/myapp/data.db bs=1 skip=40 of=/tmp/inspect.db
-sqlite3 /tmp/inspect.db ".tables"
-sqlite3 /tmp/inspect.db ".schema users"
+# Inspect the snapshot file directly (works while the server is
+# running — the snapshot is replaced atomically via rename, so the
+# inode opened by memdb-cli is a stable point-in-time view; data may
+# lag the live in-memory state by up to one flush interval).
+memdb-cli -file /var/lib/myapp/data.db -c ".tables"
+memdb-cli -file /var/lib/myapp/data.db -c ".schema users"
+memdb-cli -file /var/lib/myapp/data.db                # interactive REPL
 
-# Query live data while the server is running
+# Query live (up-to-the-second) data via the wire protocol
 psql -h 127.0.0.1 -p 5433 -U memdb -c "SELECT * FROM users LIMIT 10"
 psql -h 127.0.0.1 -p 5433 -U memdb -c "SELECT name FROM sqlite_master WHERE type='table'"
 ```
+
+`memdb-cli` is read-only — INSERT/UPDATE/DELETE/CREATE/DROP are
+rejected with a clear "inspection only" message. To write, use psql
+against the running server.
 
 `SELECT name FROM sqlite_master WHERE type='table'` is the portable
 alternative to `\dt` and works correctly through the memdb server because it
@@ -1080,24 +1086,33 @@ memdb snapshot -h
 memdb restore -h
 ```
 
-### Inspecting snapshots with sqlite3
+### Inspecting snapshots with `memdb-cli`
 
-Snapshot files are not directly openable by the `sqlite3` CLI because they
-start with a 40-byte `MDBK` integrity header rather than the SQLite magic
-bytes. Strip the header first:
+Snapshot files cannot be opened by the `sqlite3` CLI directly: they are
+wrapped in an 8-byte `MDBK` prefix and a 40-byte length+SHA-256 footer
+that surrounds the raw SQLite payload. Use `memdb-cli` instead — it is
+a sqlite3-style read-only inspection shell that strips the wrap on
+the fly and refuses any write attempt:
 
 ```bash
-# Force a flush so the snapshot is up to date
-memdb snapshot --file /var/lib/myapp/data.db
+# Single statement (works whether the server is running or not)
+memdb-cli -file /var/lib/myapp/data.db -c ".tables"
+memdb-cli -file /var/lib/myapp/data.db -c "SELECT COUNT(*) FROM sessions"
 
-# Strip the MDBK header and open with sqlite3
-dd if=/var/lib/myapp/data.db bs=1 skip=40 of=/tmp/inspect.db
-sqlite3 /tmp/inspect.db ".tables"
-sqlite3 /tmp/inspect.db "SELECT COUNT(*) FROM sessions"
+# Interactive REPL with sqlite3-like meta-commands:
+#   .help .tables .schema [name] .indexes [table] .databases
+#   .mode column|list|line|csv  .separator STR  .headers on|off
+#   .timer on|off  .echo on|off  .show  .read FILE  .quit
+memdb-cli -file /var/lib/myapp/data.db
 ```
 
-For live data inspection without touching the snapshot file at all, use the
-PostgreSQL wire protocol — it always reads the in-memory state:
+`memdb-cli` opens the unwrapped payload with `mode=ro&immutable=1`,
+so any INSERT/UPDATE/DELETE/CREATE/DROP returns a clear
+"inspection only" message rather than mutating the file.
+
+For live (up-to-the-second) data inspection, use the PostgreSQL wire
+protocol — it always reads the in-memory state and bypasses the
+snapshot's flush-interval lag:
 
 ```bash
 # Requires the server to be running
@@ -1105,7 +1120,7 @@ psql -h 127.0.0.1 -p 5433 -U memdb -c "SELECT * FROM sessions LIMIT 10"
 ```
 
 See the [Snapshot integrity](#snapshot-integrity) section for a full
-explanation of the `MDBK` header format.
+explanation of the `MDBK` envelope format.
 
 ### Makefile reference
 
@@ -1444,27 +1459,27 @@ $ sqlite3 /var/lib/myapp/data.db ".tables"
 Error: file is not a database
 ```
 
-To inspect a snapshot with `sqlite3`, strip the 40-byte header first:
+To inspect a snapshot, use `memdb-cli` — it transparently unwraps
+the MDBK envelope and exposes a sqlite3-style REPL in read-only mode:
 
 ```bash
-# Strip the MDBK header — the remainder is a valid SQLite 3 database.
-dd if=/var/lib/myapp/data.db bs=1 skip=40 of=/tmp/inspect.db
-
-sqlite3 /tmp/inspect.db ".tables"
-sqlite3 /tmp/inspect.db "SELECT * FROM your_table LIMIT 10"
+memdb-cli -file /var/lib/myapp/data.db -c ".tables"
+memdb-cli -file /var/lib/myapp/data.db -c "SELECT * FROM your_table LIMIT 10"
+memdb-cli -file /var/lib/myapp/data.db                # interactive REPL
 ```
 
-> **Note:** the stripped file is a read-only copy for inspection. Write
-> changes to it and then try to load it via memdb — the missing integrity
-> header means memdb will treat it as a legacy snapshot and accept it, but
-> you lose checksum protection. For production inspection prefer connecting
-> via the PostgreSQL wire protocol instead (`psql -h 127.0.0.1 -p 5433`),
-> which always reads the live in-memory state rather than the on-disk
+> **Note:** `memdb-cli` enforces read-only access at the SQLite layer
+> (`mode=ro&immutable=1`). Writes are rejected with a clear "inspection
+> only" message. For live (up-to-the-second) data, connect via the
+> PostgreSQL wire protocol instead (`psql -h 127.0.0.1 -p 5433`),
+> which always reads the in-memory state rather than the on-disk
 > snapshot.
 
-The `memdb restore` subcommand can copy a snapshot to a new location while
-preserving the header, or you can use `dd` to produce a header-free file
-for archiving and third-party tooling.
+The `memdb restore` subcommand copies a snapshot file to a new location
+preserving the wrap. To produce a vanilla SQLite file for archiving or
+third-party tooling, pipe the raw payload out of the snapshot via
+`memdb.UnwrapSnapshot` from a small Go program — the wrap format is
+described in the [Snapshot integrity](#snapshot-integrity) section.
 
 ### Lifecycle
 
@@ -1630,14 +1645,15 @@ has a doc comment citing its source so the audit trail stays clear. The
 - Datasets that do not fit in RAM
 - Multi-process write-heavy workloads without the replication layer
 - Serverless or ephemeral container environments without persistent volume mounts
-- Workflows that require opening the database file directly with the `sqlite3`
-  CLI or other SQLite tooling — snapshot files include a 40-byte `MDBK`
-  integrity header that those tools do not understand (a `dd skip=40`
-  workaround exists; see [Inspecting snapshots with sqlite3](#inspecting-snapshots-with-sqlite3))
+- Workflows that require opening the database file directly with the
+  `sqlite3` CLI or other SQLite tooling — snapshot files are wrapped with
+  an 8-byte `MDBK` prefix and a 40-byte length+SHA-256 footer that
+  third-party tools do not understand. Use the bundled `memdb-cli` for
+  inspection (see [Inspecting snapshots with memdb-cli](#inspecting-snapshots-with-memdb-cli))
 - Administrator schema-browsing via `psql` backslash commands (`\d`, `\dt`,
   `\di`) — these generate `pg_catalog` queries with PostgreSQL-specific syntax
-  that SQLite cannot execute; use `sqlite3` on the stripped snapshot or
-  `SELECT name FROM sqlite_master` instead (see
+  that SQLite cannot execute; use `memdb-cli` against the snapshot or
+  `SELECT name FROM sqlite_master` over the wire instead (see
   [Protocol compatibility](#protocol-compatibility))
 
 ---
@@ -1697,7 +1713,8 @@ memdb/
 ├── BENCHMARKS.md           # v1.6.1 benchmark report with pprof analysis
 ├── Makefile                # Build, test, lint, benchmark, profiling, release
 └── cmd/
-    └── memdb/              # CLI: serve [--pprof], snapshot, restore
+    ├── memdb/              # Server CLI: serve [--pprof], snapshot, restore
+    └── memdb-cli/          # Read-only inspection shell (sqlite3-style REPL on snapshot files)
 ```
 
 ---

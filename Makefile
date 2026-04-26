@@ -6,11 +6,13 @@ SHELL := /bin/bash
 # VARIABLES
 # ============================================================================
 
-BINARY_NAME    := memdb
-GO             := go
-BUILD_DIR      := ./build
-CMD_DIR        := ./cmd/memdb
-INSTALL_DIR    := /usr/local/bin
+BINARY_NAME      := memdb
+CLI_BINARY_NAME  := memdb-cli
+GO               := go
+BUILD_DIR        := ./build
+CMD_DIR          := ./cmd/memdb
+CLI_CMD_DIR      := ./cmd/memdb-cli
+INSTALL_DIR      := /usr/local/bin
 
 # Test variables
 TEST_TIMEOUT       := 60s
@@ -71,21 +73,28 @@ dirs:
 # ============================================================================
 
 .PHONY: build
-build: dirs ## Build the memdb CLI binary
+build: dirs ## Build both binaries (memdb server and memdb-cli inspection shell)
 	@echo -e "$(BLUE)Building $(BINARY_NAME)...$(NC)"
 	@echo "  Version : $(VERSION)"
 	@echo "  OS/Arch : $(GOOS)/$(GOARCH)"
 	@echo "  Commit  : $(GIT_COMMIT)"
 	$(GO) build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)
 	@echo -e "$(GREEN)✓ Build complete: $(BUILD_DIR)/$(BINARY_NAME)$(NC)"
+	@echo -e "$(BLUE)Building $(CLI_BINARY_NAME)...$(NC)"
+	$(GO) build $(LDFLAGS) -o $(BUILD_DIR)/$(CLI_BINARY_NAME) $(CLI_CMD_DIR)
+	@echo -e "$(GREEN)✓ Build complete: $(BUILD_DIR)/$(CLI_BINARY_NAME)$(NC)"
 
 .PHONY: build-prod
-build-prod: dirs ## Build optimised production binary (stripped)
+build-prod: dirs ## Build optimised production binaries (stripped)
 	@echo -e "$(BLUE)Building production $(BINARY_NAME)...$(NC)"
 	CGO_ENABLED=1 $(GO) build $(LDFLAGS) \
 		-o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)
 	@echo -e "$(GREEN)✓ Production build complete: $(BUILD_DIR)/$(BINARY_NAME)$(NC)"
 	@echo "  Size: $$(du -h $(BUILD_DIR)/$(BINARY_NAME) | cut -f1)"
+	CGO_ENABLED=1 $(GO) build $(LDFLAGS) \
+		-o $(BUILD_DIR)/$(CLI_BINARY_NAME) $(CLI_CMD_DIR)
+	@echo -e "$(GREEN)✓ Production build complete: $(BUILD_DIR)/$(CLI_BINARY_NAME)$(NC)"
+	@echo "  Size: $$(du -h $(BUILD_DIR)/$(CLI_BINARY_NAME) | cut -f1)"
 
 .PHONY: build-all
 build-all: build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64 ## Build for all supported platforms
@@ -98,6 +107,9 @@ build-linux-amd64: dirs
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=1 \
 		$(GO) build $(LDFLAGS) \
 		-o $(BUILD_DIR)/linux-amd64/$(BINARY_NAME) $(CMD_DIR)
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=1 \
+		$(GO) build $(LDFLAGS) \
+		-o $(BUILD_DIR)/linux-amd64/$(CLI_BINARY_NAME) $(CLI_CMD_DIR)
 	@echo -e "$(GREEN)✓ linux/amd64 done$(NC)"
 
 .PHONY: build-linux-arm64
@@ -107,6 +119,9 @@ build-linux-arm64: dirs
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=1 \
 		$(GO) build $(LDFLAGS) \
 		-o $(BUILD_DIR)/linux-arm64/$(BINARY_NAME) $(CMD_DIR)
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=1 \
+		$(GO) build $(LDFLAGS) \
+		-o $(BUILD_DIR)/linux-arm64/$(CLI_BINARY_NAME) $(CLI_CMD_DIR)
 	@echo -e "$(GREEN)✓ linux/arm64 done$(NC)"
 
 .PHONY: build-darwin-amd64
@@ -116,6 +131,9 @@ build-darwin-amd64: dirs
 	GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 \
 		$(GO) build $(LDFLAGS) \
 		-o $(BUILD_DIR)/darwin-amd64/$(BINARY_NAME) $(CMD_DIR)
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 \
+		$(GO) build $(LDFLAGS) \
+		-o $(BUILD_DIR)/darwin-amd64/$(CLI_BINARY_NAME) $(CLI_CMD_DIR)
 	@echo -e "$(GREEN)✓ darwin/amd64 done$(NC)"
 
 .PHONY: build-darwin-arm64
@@ -125,6 +143,9 @@ build-darwin-arm64: dirs
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
 		$(GO) build $(LDFLAGS) \
 		-o $(BUILD_DIR)/darwin-arm64/$(BINARY_NAME) $(CMD_DIR)
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
+		$(GO) build $(LDFLAGS) \
+		-o $(BUILD_DIR)/darwin-arm64/$(CLI_BINARY_NAME) $(CLI_CMD_DIR)
 	@echo -e "$(GREEN)✓ darwin/arm64 done$(NC)"
 
 # ============================================================================
