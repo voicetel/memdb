@@ -791,14 +791,18 @@ Run memdb as a standalone server that any PostgreSQL client can connect to:
 ```go
 import "github.com/voicetel/memdb/server"
 
+// Recommended: SCRAM-SHA-256, what modern PG drivers prefer.
 srv := server.New(db, server.Config{
 	ListenAddr: "127.0.0.1:5433",
 	TLSConfig:  tlsCfg,
-	Auth: server.BasicAuth{
-		Username: "memdb",
-		Password: os.Getenv("MEMDB_PASSWORD"),
-	},
+	Auth:       server.NewScramAuth("memdb", os.Getenv("MEMDB_PASSWORD")),
 })
+
+// Cleartext fallback for older clients (still constant-time compared).
+// srv := server.New(db, server.Config{
+//     Auth: server.BasicAuth{Username: "memdb", Password: os.Getenv("MEMDB_PASSWORD")},
+// })
+
 srv.ListenAndServe()
 ```
 
@@ -829,6 +833,22 @@ srv := server.New(db, server.Config{
 `Config.Logger` accepts a `*slog.Logger` for structured logging from the server, including panics recovered from connection handlers (logged at `ERROR` level).
 
 `BasicAuth` uses constant-time comparison (`crypto/subtle.ConstantTimeCompare`) to prevent timing attacks.
+
+`NewScramAuth` implements SCRAM-SHA-256 (RFC 5802) — what psql ≥ 10 and pgx prefer. PBKDF2 runs once at construction; per-connection auth then only does HMAC-SHA-256 + SHA-256, which are microsecond-scale. The plaintext password is never retained, only the SCRAM-derived `StoredKey` and `ServerKey`.
+
+From the CLI:
+
+```bash
+# SCRAM (recommended)
+memdb serve --auth-user alice --auth-method scram \
+            --auth-password "$(cat /etc/memdb/password)"
+
+# Or pass the password via env so it does not appear in `ps` output
+MEMDB_AUTH_PASSWORD=hunter2 memdb serve --auth-user alice --auth-method scram
+
+# Cleartext (only over TLS, please)
+memdb serve --auth-user alice --auth-method cleartext --auth-password ...
+```
 
 ### Protocol compatibility
 

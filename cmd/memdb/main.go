@@ -41,6 +41,12 @@ func main() {
 		"mutex profile sampling fraction (see runtime.SetMutexProfileFraction); 0 disables")
 	servePprofBlock := serveCmd.Int("pprof-block-rate", 0,
 		"block profile sampling rate in nanoseconds (see runtime.SetBlockProfileRate); 0 disables")
+	serveAuthUser := serveCmd.String("auth-user", "",
+		"username required for client connections; empty disables auth")
+	serveAuthPassword := serveCmd.String("auth-password", "",
+		"password for -auth-user (also reads MEMDB_AUTH_PASSWORD env var if flag is empty)")
+	serveAuthMethod := serveCmd.String("auth-method", "scram",
+		"auth method: scram (SCRAM-SHA-256, recommended) or cleartext")
 	serveRaft := registerRaftFlags(serveCmd)
 
 	snapCmd := flag.NewFlagSet("snapshot", flag.ExitOnError)
@@ -62,7 +68,9 @@ func main() {
 			os.Exit(1)
 		}
 		runServe(*serveFile, *serveAddr, *serveFlush, *serveDurability,
-			*servePprof, *servePprofMutex, *servePprofBlock, serveRaft)
+			*servePprof, *servePprofMutex, *servePprofBlock,
+			*serveAuthUser, *serveAuthPassword, *serveAuthMethod,
+			serveRaft)
 
 	case "snapshot":
 		if err := snapCmd.Parse(os.Args[2:]); err != nil {
@@ -85,6 +93,32 @@ func main() {
 	default:
 		usage()
 		os.Exit(1)
+	}
+}
+
+// buildAuthenticator constructs the server.Authenticator from the
+// -auth-* flags. Returns nil when -auth-user is empty (auth disabled).
+//
+// The password is read from MEMDB_AUTH_PASSWORD when -auth-password is
+// empty, so deployments can avoid leaking it through `ps`/`/proc/<pid>/cmdline`
+// while still configuring it declaratively (e.g. via systemd EnvironmentFile).
+func buildAuthenticator(user, password, method string) (server.Authenticator, error) {
+	if user == "" {
+		return nil, nil
+	}
+	if password == "" {
+		password = os.Getenv("MEMDB_AUTH_PASSWORD")
+	}
+	if password == "" {
+		return nil, fmt.Errorf("auth-user %q requires -auth-password or MEMDB_AUTH_PASSWORD env var", user)
+	}
+	switch strings.ToLower(method) {
+	case "scram", "":
+		return server.NewScramAuth(user, password), nil
+	case "cleartext":
+		return server.BasicAuth{Username: user, Password: password}, nil
+	default:
+		return nil, fmt.Errorf("invalid -auth-method %q (want scram|cleartext)", method)
 	}
 }
 
@@ -124,7 +158,9 @@ func durabilityName(m memdb.DurabilityMode) string {
 }
 
 func runServe(file, addr string, flush time.Duration, durability string,
-	pprofAddr string, pprofMutex, pprofBlock int, raftCfg *raftFlags) {
+	pprofAddr string, pprofMutex, pprofBlock int,
+	authUser, authPassword, authMethod string,
+	raftCfg *raftFlags) {
 	if err := raftCfg.validate(); err != nil {
 		slog.Error("raft flags", "error", err)
 		os.Exit(1)
@@ -133,6 +169,12 @@ func runServe(file, addr string, flush time.Duration, durability string,
 	durabilityMode, err := resolveDurability(durability, raftCfg.enabled())
 	if err != nil {
 		slog.Error("durability flag", "error", err)
+		os.Exit(1)
+	}
+
+	authenticator, err := buildAuthenticator(authUser, authPassword, authMethod)
+	if err != nil {
+		slog.Error("auth flags", "error", err)
 		os.Exit(1)
 	}
 
@@ -214,7 +256,7 @@ func runServe(file, addr string, flush time.Duration, durability string,
 		)
 	}
 
-	srv := server.New(db, server.Config{ListenAddr: addr})
+	srv := server.New(db, server.Config{ListenAddr: addr, Auth: authenticator})
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

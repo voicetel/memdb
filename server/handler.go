@@ -151,28 +151,61 @@ func (h *handler) handleStartup() error {
 	}
 
 	if h.cfg.Auth != nil {
-		if err := h.writeRaw([]byte{'R', 0, 0, 0, 8, 0, 0, 0, 3}); err != nil {
-			return err
-		}
-		if err := h.bufW.Flush(); err != nil {
-			return err
-		}
+		// Dispatch on Auth concrete type. SCRAM is a multi-round SASL
+		// exchange, so it can't fit the single-shot Authenticator
+		// interface. Detecting *ScramAuth here keeps the interface lean
+		// while letting BasicAuth (cleartext) keep working unchanged.
+		switch a := h.cfg.Auth.(type) {
+		case *ScramAuth:
+			user := h.startupUser
+			if user == "" {
+				user = "memdb"
+			}
+			// Verify the announced startup user matches what was
+			// configured before doing the expensive SCRAM exchange. A
+			// mismatch can never authenticate, and rejecting up front
+			// avoids burning HMAC cycles on bad input.
+			if user != a.Username() {
+				_ = h.sendError("authentication failed")
+				_ = h.bufW.Flush()
+				return fmt.Errorf("auth: unknown user %q", user)
+			}
+			if err := h.sendAuthSASLAdvert(); err != nil {
+				return err
+			}
+			if err := h.bufW.Flush(); err != nil {
+				return err
+			}
+			if err := h.runScramExchange(a); err != nil {
+				_ = h.sendError("authentication failed")
+				_ = h.bufW.Flush()
+				return err
+			}
 
-		msgType, body, err := h.readMessage()
-		if err != nil || msgType != 'p' {
-			_ = h.sendError("authentication failed")
-			_ = h.bufW.Flush()
-			return fmt.Errorf("auth: expected password message")
-		}
-		password := trimTrailingNUL(body)
-		user := h.startupUser
-		if user == "" {
-			user = "memdb" // default if client didn't send username
-		}
-		if !h.cfg.Auth.Authenticate(user, password) {
-			_ = h.sendError("authentication failed")
-			_ = h.bufW.Flush()
-			return fmt.Errorf("auth: invalid credentials")
+		default:
+			// AuthenticationCleartextPassword (subtype 3).
+			if err := h.writeRaw([]byte{'R', 0, 0, 0, 8, 0, 0, 0, 3}); err != nil {
+				return err
+			}
+			if err := h.bufW.Flush(); err != nil {
+				return err
+			}
+			msgType, body, err := h.readMessage()
+			if err != nil || msgType != 'p' {
+				_ = h.sendError("authentication failed")
+				_ = h.bufW.Flush()
+				return fmt.Errorf("auth: expected password message")
+			}
+			password := trimTrailingNUL(body)
+			user := h.startupUser
+			if user == "" {
+				user = "memdb"
+			}
+			if !h.cfg.Auth.Authenticate(user, password) {
+				_ = h.sendError("authentication failed")
+				_ = h.bufW.Flush()
+				return fmt.Errorf("auth: invalid credentials")
+			}
 		}
 	}
 
