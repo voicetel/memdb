@@ -753,6 +753,22 @@ if err := node.Shutdown(); err != nil {
 }
 ```
 
+### Example: 3-node cluster + PG wire
+
+[`examples/cluster`](examples/cluster) brings up three Raft nodes in a
+single process, each serving the PostgreSQL wire protocol on its own
+port. Connect any standard PG client to any node — writes are
+forwarded to the leader, replicated under consensus, and applied on
+every node before the response returns. Self-generates a TLS cert at
+startup so there's no setup.
+
+```bash
+go run ./examples/cluster
+psql -h 127.0.0.1 -p 5433 -U memdb -d memdb -c 'CREATE TABLE kv(k TEXT, v TEXT)'
+psql -h 127.0.0.1 -p 5434 -U memdb -d memdb -c "INSERT INTO kv VALUES ('a','1')"
+psql -h 127.0.0.1 -p 5435 -U memdb -d memdb -c 'SELECT * FROM kv'
+```
+
 ### Replication Testing
 
 The `replication/raft` package ships with an extensive end-to-end integrity
