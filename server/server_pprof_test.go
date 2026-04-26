@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -788,6 +789,121 @@ func TestPProf_Server_Allocs(t *testing.T) {
 		"  diff with: go tool pprof -base %s %s",
 		iters, clients, elapsed, float64(iters)/elapsed.Seconds(),
 		beforePath, afterPath)
+}
+
+// ── TestPProf_Server_Extended_Select ───────────────────────────────────
+
+// TestPProf_Server_Extended_Select captures CPU and heap profiles of the
+// extended-query path (Parse / Bind / Describe / Execute / Sync) on a
+// parameterised SELECT. This is the path pgx and lib/pq use for any
+// query with arguments — a separate scenario from the simple-query
+// profile because the per-query work is meaningfully different (more
+// messages on the wire, server-side prepared-statement bookkeeping,
+// per-cell format-code switching for binary results).
+func TestPProf_Server_Extended_Select(t *testing.T) {
+	dir := srvPprofOutputDir(t)
+
+	db := srvPprofDB(t)
+	const seed = 1000
+	seedRows(t, db, seed)
+
+	addr := srvPickAddr(t)
+	startPprofServer(t, db, addr)
+
+	cpuPath := filepath.Join(dir, "pprof_server_extended_select.cpu.prof")
+	heapPath := filepath.Join(dir, "pprof_server_extended_select.heap.prof")
+
+	const (
+		clients      = 16
+		workDuration = 3 * time.Second
+	)
+
+	var iters int64
+	var elapsed time.Duration
+	err := profiling.CaptureCPUProfile(cpuPath, func() error {
+		iters, elapsed = runClients(t, addr, clients, workDuration,
+			func(sc *srvClient, iter int) error {
+				key := fmt.Sprintf("seed-%06d", iter%seed)
+				return sc.extendedQuery(`SELECT key, value FROM kv WHERE key = $1`, key)
+			})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CaptureCPUProfile: %v", err)
+	}
+	if err := profiling.CaptureHeapProfile(heapPath, func() error { return nil }); err != nil {
+		t.Fatalf("CaptureHeapProfile: %v", err)
+	}
+
+	t.Logf("extended select: %d queries across %d clients in %s (%.0f q/s)  cpu=%s  heap=%s",
+		iters, clients, elapsed, float64(iters)/elapsed.Seconds(), cpuPath, heapPath)
+}
+
+// extendedQuery runs one Parse/Bind/Describe/Execute/Sync cycle against
+// the unnamed prepared statement and portal, supplying a single
+// text-format string parameter. Returns nil on AuthOk + ReadyForQuery,
+// or an error wrapping the server's ErrorResponse text.
+func (sc *srvClient) extendedQuery(query string, arg string) error {
+	// Parse: name="" + query\0 + nParams=0 (server infers $N count)
+	parseBody := []byte{0}
+	parseBody = append(parseBody, query...)
+	parseBody = append(parseBody, 0, 0, 0)
+	if err := sc.send('P', parseBody); err != nil {
+		return err
+	}
+
+	// Bind: portal="" stmt="" nFmt=0 nParams=1 [len=N value] nResultFormats=0
+	bindBody := []byte{0, 0, 0, 0, 0, 1}
+	var lb [4]byte
+	binary.BigEndian.PutUint32(lb[:], uint32(len(arg)))
+	bindBody = append(bindBody, lb[:]...)
+	bindBody = append(bindBody, arg...)
+	bindBody = append(bindBody, 0, 0)
+	if err := sc.send('B', bindBody); err != nil {
+		return err
+	}
+
+	// Describe portal "" — exercises the first-row-peek path.
+	if err := sc.send('D', []byte{'P', 0}); err != nil {
+		return err
+	}
+
+	// Execute portal "" with no row limit.
+	if err := sc.send('E', []byte{0, 0, 0, 0, 0, 0}); err != nil {
+		return err
+	}
+
+	// Sync.
+	if err := sc.send('S', nil); err != nil {
+		return err
+	}
+
+	for {
+		mt, body, err := sc.readMsg()
+		if err != nil {
+			return err
+		}
+		switch mt {
+		case '1', '2', 't', 'T', 'D', 'C', 'I', 'n':
+			// Parse/Bind/Describe/Data/Complete responses — drain.
+		case 'E':
+			return fmt.Errorf("server error: %q", body)
+		case 'Z':
+			return nil
+		}
+	}
+}
+
+func (sc *srvClient) send(msgType byte, body []byte) error {
+	totalLen := uint32(4 + len(body))
+	pkt := make([]byte, 0, 1+totalLen)
+	pkt = append(pkt, msgType)
+	var lb [4]byte
+	binary.BigEndian.PutUint32(lb[:], totalLen)
+	pkt = append(pkt, lb[:]...)
+	pkt = append(pkt, body...)
+	_, err := sc.conn.Write(pkt)
+	return err
 }
 
 // ── TLS helpers ────────────────────────────────────────────────────────

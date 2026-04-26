@@ -22,6 +22,7 @@ Think Redis RDB+AOF semantics with full SQL query power — in a single Go impor
 - **Change notifications** — `OnChange` hook via SQLite update hook for cache invalidation and audit
 - **Panic-safe callbacks** — `OnChange`, `OnFlushError`, `OnFlushComplete`, and background goroutines recover panics so a misbehaving callback cannot crash the process.
 - **Raft replication** — strong-consistency multi-node replication via `hashicorp/raft` over mutual TLS; any node accepts writes and transparently forwards to the leader
+- **PostgreSQL Extended Query protocol** — `Parse`/`Bind`/`Describe`/`Execute` with server-side prepared statements, parameterised queries (`$1`, `$2`, ...), and binary result format for the common scalar types. Compatible with `pgx`, `lib/pq`, `sqlx`, GORM, and other `database/sql`-based ORMs.
 - **Structured logging** — `log/slog` throughout with syslog, JSON, and text handlers; `hclog` bridge routes Raft internals through the same pipeline
 - **PostgreSQL wire protocol** — optional server mode accepts any Postgres client or ORM; SSL negotiation, correct `ErrorResponse` severity field
 - **ORM compatible** — exposes `*sql.DB` for use with `sqlx`, `bun`, `ent`, `sqlc`, GORM, and others
@@ -852,8 +853,7 @@ memdb serve --auth-user alice --auth-method cleartext --auth-password ...
 
 ### Protocol compatibility
 
-The server implements the PostgreSQL Simple Query protocol. All DML and DDL
-that application code needs works out of the box:
+The server implements the PostgreSQL Simple Query protocol **and** the Extended Query protocol (Parse / Bind / Describe / Execute / Sync / Close / Flush). Parameterised queries with `$1`-style placeholders, server-side prepared statements, and binary result-format codes for the basic scalar types are all supported, so `pgx` (default `QueryExecModeCacheStatement` with binary format), `lib/pq` (extended query, prepared statements), and any ORM that builds on `database/sql` work without configuration.
 
 | Statement | Supported |
 |---|---|
@@ -862,6 +862,9 @@ that application code needs works out of the box:
 | `CREATE TABLE` / `CREATE INDEX` / `DROP` | ✅ |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | ✅ via the underlying SQLite connection |
 | `PRAGMA` | ✅ |
+| Parameterised queries (`$1`, `$2`, ...) | ✅ extended query |
+| Server-side prepared statements | ✅ extended query |
+| Binary result format (int4 / int8 / float4 / float8 / bool / bytea) | ✅ |
 
 **Administrator schema-browsing commands are not supported.** When an
 operator connects with `psql` and types `\d tablename`, psql internally
@@ -888,10 +891,37 @@ psql -h 127.0.0.1 -p 5433 -U memdb -c "SELECT name FROM sqlite_master WHERE type
 alternative to `\dt` and works correctly through the memdb server because it
 is plain SQL, not a psql client command.
 
-> **Note:** Extended Query protocol (prepared statements with `$1` placeholders,
-> `Parse`/`Bind`/`Execute` message flow) is also not implemented. Applications
-> that require extended protocol should use the library API directly rather
-> than the wire-protocol server.
+> **Caveats on the wire layer:** channel-binding (`SCRAM-SHA-256-PLUS`),
+> `LISTEN`/`NOTIFY`, `COPY`, and binary parameter format are not implemented —
+> the server accepts only text-format parameters in `Bind`. Result rows come
+> back in whatever format the client requested (text or binary) for the
+> common scalar types; everything else falls through to text. Drivers that
+> assume binary format for an exotic type may need their text-format mode
+> enabled (`pgx.QueryExecModeExec`, lib/pq's default).
+
+### Example: REST + PG-wire over one DB
+
+[`examples/restapi`](examples/restapi) is a self-contained demo of the
+library shape memdb is designed for: a single Go process embeds the
+database (no out-of-process server, no extra hop) and exposes the same
+data over **both** an HTTP/JSON CRUD API and the PostgreSQL wire protocol.
+A row written via `curl -X POST /todos` is immediately visible to
+`psql ... SELECT *`, and vice versa. The point is to show that
+embedding doesn't have to mean giving up the Postgres tooling ecosystem
+(psql, pgx, lib/pq, BI tools) for ad-hoc operator queries.
+
+```bash
+go run ./examples/restapi -file /tmp/todos.db
+
+# REST
+curl -X POST localhost:8080/todos -d '{"title":"buy milk"}'
+
+# Same data via psql
+psql -h 127.0.0.1 -p 5433 -U memdb -d memdb -c 'SELECT * FROM todos'
+```
+
+See [`examples/restapi/README.md`](examples/restapi/README.md) for the
+full walkthrough including pgx and lib/pq usage.
 
 ---
 

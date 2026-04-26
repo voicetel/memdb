@@ -2,11 +2,13 @@ package server
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/voicetel/memdb"
@@ -42,6 +44,18 @@ type handler struct {
 	// buildTag helper that materialised the tag string — together
 	// accounting for ~20 MB of churn per 3 s INSERT pprof run.
 	cmdBuf []byte
+
+	// Extended Query Protocol state. Populated by Parse / Bind messages,
+	// drained by Execute. Both maps key the empty string ("") to the
+	// "unnamed" statement / portal — the common case for drivers that
+	// don't reuse server-side prep, including pgx and lib/pq for one-shot
+	// parameterised queries. inErrorState tracks whether the connection
+	// is currently in the failed-extended-query state where every message
+	// up to the next Sync is silently discarded (per RFC: "the server
+	// will simply skip everything until it finds a Sync message").
+	prepared     map[string]*preparedStmt
+	portals      map[string]*portal
+	inErrorState bool
 }
 
 // writeBufSize is the bufio.Writer buffer size for each client connection.
@@ -53,11 +67,13 @@ const writeBufSize = 32 * 1024
 
 func newHandler(db *memdb.DB, cfg Config, conn net.Conn) *handler {
 	return &handler{
-		db:   db,
-		cfg:  cfg,
-		conn: conn,
-		bufR: bufio.NewReaderSize(conn, 4096),
-		bufW: bufio.NewWriterSize(conn, writeBufSize),
+		db:       db,
+		cfg:      cfg,
+		conn:     conn,
+		bufR:     bufio.NewReaderSize(conn, 4096),
+		bufW:     bufio.NewWriterSize(conn, writeBufSize),
+		prepared: make(map[string]*preparedStmt),
+		portals:  make(map[string]*portal),
 	}
 }
 
@@ -81,10 +97,60 @@ func (h *handler) serve() {
 		// Reset deadline for the write/response.
 		_ = h.conn.SetWriteDeadline(time.Now().Add(idleTimeout))
 
+		// Extended-query error state: per the protocol, after an error
+		// in extended-query mode the server "will simply skip everything
+		// until it finds a Sync message", at which point the connection
+		// returns to the idle state. We honour that by short-circuiting
+		// everything other than Sync / Terminate while inErrorState is
+		// set. Without this, a Bind that follows a failed Parse would
+		// emit a confusing second error.
+		if h.inErrorState && msgType != 'S' && msgType != 'X' {
+			continue
+		}
+
 		switch msgType {
 		case 'Q': // Simple Query
 			query := trimTrailingNUL(body)
 			if err := h.handleSimpleQuery(query); err != nil {
+				return
+			}
+
+		case 'P': // Parse
+			if err := h.handleParse(body); err != nil {
+				return
+			}
+
+		case 'B': // Bind
+			if err := h.handleBind(body); err != nil {
+				return
+			}
+
+		case 'D': // Describe (statement or portal)
+			if err := h.handleDescribe(body); err != nil {
+				return
+			}
+
+		case 'E': // Execute (extended query — distinct from outgoing
+			//          ErrorResponse, which is also 'E' but server→client)
+			if err := h.handleExecute(body); err != nil {
+				return
+			}
+
+		case 'S': // Sync
+			if err := h.handleSync(); err != nil {
+				return
+			}
+
+		case 'C': // Close (statement or portal)
+			if err := h.handleClose(body); err != nil {
+				return
+			}
+
+		case 'H': // Flush — push buffered output to the client without
+			//          changing extended-query state. Used by clients that
+			//          want to read partial results (e.g. progressively
+			//          consume a query that returns many rows).
+			if err := h.bufW.Flush(); err != nil {
 				return
 			}
 
@@ -93,6 +159,7 @@ func (h *handler) serve() {
 
 		default:
 			_ = h.sendError(fmt.Sprintf("unsupported message type: %c", msgType))
+			_ = h.bufW.Flush()
 		}
 	}
 }
@@ -397,7 +464,8 @@ func (h *handler) handleSelect(query string) error {
 	}
 
 	if len(cols) > 0 {
-		if err := h.sendRowDescription(cols); err != nil {
+		colTypes, _ := rows.ColumnTypes()
+		if err := h.sendRowDescriptionTyped(cols, colTypes); err != nil {
 			return err
 		}
 	}
@@ -550,9 +618,20 @@ func (h *handler) readMessage() (byte, []byte, error) {
 	return msgType, h.readBuf, nil
 }
 
-func (h *handler) sendRowDescription(cols []string) error {
+// sendRowDescriptionWithOIDs emits a 'T' RowDescription using
+// caller-supplied per-column OIDs and format codes. Used by the
+// extended-query path when first-row peeking has resolved types that
+// SQLite couldn't statically describe.
+//
+// formats may be nil (all-text), single-element (applied to every
+// column), or column-aligned. The per-column format here MUST agree
+// with what streamPortalRows actually emits — pgx relies on the
+// RowDescription's format field to decide between text and binary
+// decode for each cell. If the two disagree, pgx text-decodes our
+// binary bytes and produces strconv.ParseInt errors on integer
+// columns.
+func (h *handler) sendRowDescriptionWithOIDs(cols []string, oids []uint32, formats []int16) error {
 	fieldCount := len(cols)
-	// Per-column fixed overhead: name + NUL (1) + 4 + 2 + 4 + 2 + 4 + 2 = 19 bytes.
 	size := 1 + 4 + 2
 	for _, col := range cols {
 		size += len(col) + 1 + 4 + 2 + 4 + 2 + 4 + 2
@@ -563,10 +642,71 @@ func (h *handler) sendRowDescription(cols []string) error {
 	buf[pos] = byte(fieldCount >> 8)
 	buf[pos+1] = byte(fieldCount)
 	pos += 2
-	for _, col := range cols {
+	for i, col := range cols {
 		copy(buf[pos:], col)
 		pos += len(col)
-		buf[pos] = 0 // null terminator
+		buf[pos] = 0
+		pos++
+		buf[pos], buf[pos+1], buf[pos+2], buf[pos+3] = 0, 0, 0, 0
+		pos += 4
+		buf[pos], buf[pos+1] = 0, 0
+		pos += 2
+		oid := uint32(25)
+		if i < len(oids) {
+			oid = oids[i]
+		}
+		binary.BigEndian.PutUint32(buf[pos:pos+4], oid)
+		pos += 4
+		buf[pos], buf[pos+1] = 0xff, 0xff
+		pos += 2
+		buf[pos], buf[pos+1], buf[pos+2], buf[pos+3] = 0xff, 0xff, 0xff, 0xff
+		pos += 4
+		var f int16
+		switch len(formats) {
+		case 0:
+			f = 0
+		case 1:
+			f = formats[0]
+		default:
+			if i < len(formats) {
+				f = formats[i]
+			}
+		}
+		binary.BigEndian.PutUint16(buf[pos:pos+2], uint16(f))
+		pos += 2
+	}
+	binary.BigEndian.PutUint32(buf[1:5], uint32(size-1))
+	return h.writeRaw(buf)
+}
+
+// sendRowDescriptionTyped emits a 'T' RowDescription, picking a
+// per-column type OID from colTypes when available. Drivers like pgx
+// strictly enforce text-→Go-type conversions based on the advertised
+// OID — telling the client a column is OID 25 (text) and then handing
+// it text "42" makes pgx refuse to scan into an *int. Mapping the
+// SQLite type to a real PG OID (20/int8 for INTEGER, 701/float8 for
+// REAL, 17/bytea for BLOB) lets pgx parse text values into the
+// expected Go types.
+//
+// Pass nil colTypes to keep the legacy "everything is text" behaviour;
+// the simple-query path uses this for compatibility with pre-typed
+// callers.
+func (h *handler) sendRowDescriptionTyped(cols []string, colTypes []*sql.ColumnType) error {
+	fieldCount := len(cols)
+	size := 1 + 4 + 2
+	for _, col := range cols {
+		size += len(col) + 1 + 4 + 2 + 4 + 2 + 4 + 2
+	}
+	buf := make([]byte, size)
+	buf[0] = 'T'
+	pos := 5
+	buf[pos] = byte(fieldCount >> 8)
+	buf[pos+1] = byte(fieldCount)
+	pos += 2
+	for i, col := range cols {
+		copy(buf[pos:], col)
+		pos += len(col)
+		buf[pos] = 0
 		pos++
 		// table OID = 0
 		buf[pos], buf[pos+1], buf[pos+2], buf[pos+3] = 0, 0, 0, 0
@@ -574,8 +714,11 @@ func (h *handler) sendRowDescription(cols []string) error {
 		// attr number = 0
 		buf[pos], buf[pos+1] = 0, 0
 		pos += 2
-		// data type OID (25 = text)
-		buf[pos], buf[pos+1], buf[pos+2], buf[pos+3] = 0, 0, 0, 25
+		oid := uint32(25) // default: text
+		if i < len(colTypes) && colTypes[i] != nil {
+			oid = pgOIDFromSQLite(colTypes[i].DatabaseTypeName())
+		}
+		binary.BigEndian.PutUint32(buf[pos:pos+4], oid)
 		pos += 4
 		// type size = -1 (variable)
 		buf[pos], buf[pos+1] = 0xff, 0xff
@@ -589,6 +732,32 @@ func (h *handler) sendRowDescription(cols []string) error {
 	}
 	binary.BigEndian.PutUint32(buf[1:5], uint32(size-1))
 	return h.writeRaw(buf)
+}
+
+// pgOIDFromSQLite maps a SQLite type-affinity name (as returned by
+// (*sql.ColumnType).DatabaseTypeName) to a PostgreSQL type OID. We pick
+// types that match SQLite's runtime affinities and are universally
+// understood by PG drivers — int8/float8/bytea/text. Everything we
+// don't recognise falls back to text (OID 25) which is always safe
+// because every Go value also has a string representation.
+func pgOIDFromSQLite(name string) uint32 {
+	switch strings.ToUpper(name) {
+	case "INTEGER", "INT", "INT4", "INT8", "BIGINT", "SMALLINT":
+		return 20 // int8
+	case "REAL", "FLOAT", "DOUBLE", "DOUBLE PRECISION", "NUMERIC", "DECIMAL":
+		return 701 // float8
+	case "BLOB", "BYTEA":
+		return 17 // bytea
+	case "BOOL", "BOOLEAN":
+		return 16 // bool
+	case "":
+		// SQLite returns "" for expression columns ("SELECT 1+1")
+		// where it can't statically determine the type. text is
+		// the safest default — every driver handles it.
+		return 25
+	default:
+		return 25 // text
+	}
 }
 
 // sendDataRowInto serialises row into rb.wire (growing it as needed) and
