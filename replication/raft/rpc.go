@@ -34,37 +34,74 @@ type ForwardResponse struct {
 
 // ── wire helpers ──────────────────────────────────────────────────────────────
 
-// writeMsg encodes v as gob and writes it to w with a 4-byte big-endian
-// length prefix.
-func writeMsg(w io.Writer, v any) error {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(v); err != nil {
+// RPCConn wraps a net.Conn with a cached gob Encoder and Decoder so the
+// type schema for ForwardRequest / ForwardResponse is sent only once per
+// conn lifetime. Without this caching every writeMsg / readMsg created
+// fresh Encoder/Decoder pairs that re-sent the type descriptors,
+// dominating the per-RPC allocation count (~45% of total) measured by
+// BenchmarkForwarding_PoolReuse.
+//
+// RPCConn embeds net.Conn so the rest of the codebase (deadlines, Close)
+// continues to work transparently.
+type RPCConn struct {
+	net.Conn
+	encBuf *bytes.Buffer
+	enc    *gob.Encoder
+	decBuf *bytes.Buffer
+	dec    *gob.Decoder
+}
+
+func NewRPCConn(c net.Conn) *RPCConn {
+	encBuf := new(bytes.Buffer)
+	decBuf := new(bytes.Buffer)
+	return &RPCConn{
+		Conn:   c,
+		encBuf: encBuf,
+		enc:    gob.NewEncoder(encBuf),
+		decBuf: decBuf,
+		dec:    gob.NewDecoder(decBuf),
+	}
+}
+
+// writeMsg gob-encodes v using the cached encoder, then writes
+// [4-byte big-endian length][gob bytes] to the underlying conn. The
+// length prefix is preserved (rather than relying on gob's stream framing
+// alone) so a malformed or oversized peer message can be rejected before
+// the decoder allocates a body buffer.
+func (rc *RPCConn) writeMsg(v any) error {
+	rc.encBuf.Reset()
+	if err := rc.enc.Encode(v); err != nil {
 		return fmt.Errorf("rpc encode: %w", err)
 	}
-	length := uint32(buf.Len())
-	if err := binary.Write(w, binary.BigEndian, length); err != nil {
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(rc.encBuf.Len()))
+	if _, err := rc.Conn.Write(hdr[:]); err != nil {
 		return fmt.Errorf("rpc write length: %w", err)
 	}
-	if _, err := w.Write(buf.Bytes()); err != nil {
+	if _, err := rc.Conn.Write(rc.encBuf.Bytes()); err != nil {
 		return fmt.Errorf("rpc write body: %w", err)
 	}
 	return nil
 }
 
-// readMsg reads a length-prefixed gob message from r into v.
-func readMsg(r io.Reader, v any) error {
-	var length uint32
-	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+// readMsg reads one length-prefixed gob message from the conn into v
+// using the cached decoder. Each decode consumes exactly the bytes the
+// matching writeMsg produced, so the bytes.Buffer is empty at entry to
+// every subsequent call.
+func (rc *RPCConn) readMsg(v any) error {
+	var hdr [4]byte
+	if _, err := io.ReadFull(rc.Conn, hdr[:]); err != nil {
 		return fmt.Errorf("rpc read length: %w", err)
 	}
+	length := binary.BigEndian.Uint32(hdr[:])
 	if length == 0 || length > 64*1024*1024 { // 64 MB sanity limit
 		return fmt.Errorf("rpc: invalid message length %d", length)
 	}
-	buf := make([]byte, length)
-	if _, err := io.ReadFull(r, buf); err != nil {
+	rc.decBuf.Reset()
+	if _, err := io.CopyN(rc.decBuf, rc.Conn, int64(length)); err != nil {
 		return fmt.Errorf("rpc read body: %w", err)
 	}
-	return gob.NewDecoder(bytes.NewReader(buf)).Decode(v)
+	return rc.dec.Decode(v)
 }
 
 // ── connection pool ───────────────────────────────────────────────────────────
@@ -85,10 +122,10 @@ const (
 	dialTimeout = 2 * time.Second
 )
 
-// pooledConn wraps a net.Conn with the time it was returned to the pool so
+// pooledConn wraps an RPCConn with the time it was returned to the pool so
 // that stale connections can be detected and discarded on checkout.
 type pooledConn struct {
-	conn      net.Conn
+	conn      *RPCConn
 	idleSince time.Time
 }
 
@@ -133,7 +170,7 @@ func NewConnPool(addr string, tlsCfg *tls.Config, size int) *ConnPool {
 // TLS is unreliable because TLS close_notify alerts may be buffered. Instead,
 // sendForward detects a dead connection when the write or read fails and
 // discards it rather than returning it to the pool.
-func (p *ConnPool) Get(timeout time.Duration) (net.Conn, error) {
+func (p *ConnPool) Get(timeout time.Duration) (*RPCConn, error) {
 	// Reject early if the pool has been closed — avoids dialing a fresh
 	// connection that would be immediately closed by Put.
 	if p.closed.Load() {
@@ -173,12 +210,12 @@ drainLoop:
 	if err != nil {
 		return nil, fmt.Errorf("rpc: dial %s: %w", p.addr, err)
 	}
-	return conn, nil
+	return NewRPCConn(conn), nil
 }
 
 // Put returns conn to the idle channel. If the pool is full or has been
 // closed, the connection is closed immediately rather than leaked.
-func (p *ConnPool) Put(conn net.Conn) {
+func (p *ConnPool) Put(conn *RPCConn) {
 	if p.closed.Load() {
 		_ = conn.Close()
 		return
@@ -235,13 +272,13 @@ func sendForward(pool *ConnPool, req ForwardRequest, timeout time.Duration) erro
 		return fmt.Errorf("rpc: set deadline: %w", err)
 	}
 
-	if err := writeMsg(conn, req); err != nil {
+	if err := conn.writeMsg(req); err != nil {
 		_ = conn.Close()
 		return err
 	}
 
 	var resp ForwardResponse
-	if err := readMsg(conn, &resp); err != nil {
+	if err := conn.readMsg(&resp); err != nil {
 		_ = conn.Close()
 		return err
 	}

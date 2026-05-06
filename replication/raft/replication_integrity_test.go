@@ -63,7 +63,7 @@ type threeNodeCluster struct {
 // newThreeNodeCluster constructs the cluster and waits for a leader to be
 // elected. It registers cleanup so the t.TempDir-based node state is
 // discarded at the end of the test.
-func newThreeNodeCluster(t *testing.T) *threeNodeCluster {
+func newThreeNodeCluster(t testing.TB) *threeNodeCluster {
 	t.Helper()
 	tlsCfg := generateTLSConfig(t)
 

@@ -100,7 +100,7 @@ func TestConnPool_FullPool(t *testing.T) {
 	defer pool.Close()
 
 	// Check out more connections than the pool can hold.
-	conns := make([]net.Conn, size+2)
+	conns := make([]*memraft.RPCConn, size+2)
 	for i := range conns {
 		c, err := pool.Get(2 * time.Second)
 		if err != nil {
@@ -162,11 +162,11 @@ func TestConnPool_Close(t *testing.T) {
 	}
 
 	// A put() after close should not add to the pool.
-	c, err := tls.Dial("tcp", ln.Addr().String(), tlsCfg)
+	rawConn, err := tls.Dial("tcp", ln.Addr().String(), tlsCfg)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	pool.Put(c) // should close c immediately, not add to pool
+	pool.Put(memraft.NewRPCConn(rawConn)) // should close it immediately, not add to pool
 
 	if count := pool.IdleCount(); count != 0 {
 		t.Errorf("expected 0 idle after put post-close, got %d", count)

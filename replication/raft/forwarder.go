@@ -65,6 +65,12 @@ func (f *forwarder) serve() {
 func (f *forwarder) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	// Wrap the conn so the gob Encoder/Decoder are created once and reused
+	// across every request on this conn. Without this, each request would
+	// re-send the ForwardRequest/ForwardResponse type schemas, which
+	// dominated allocations on the forwarding hot path.
+	rc := NewRPCConn(conn)
+
 	// Per-iteration idle timeout. The follower's ConnPool reuses connections
 	// across requests, so handleConn loops until the peer closes or stays
 	// idle longer than this window. Resetting the deadline before every
@@ -73,12 +79,12 @@ func (f *forwarder) handleConn(conn net.Conn) {
 	const requestTimeout = 30 * time.Second
 
 	for {
-		if err := conn.SetDeadline(time.Now().Add(requestTimeout)); err != nil {
+		if err := rc.SetDeadline(time.Now().Add(requestTimeout)); err != nil {
 			return
 		}
 
 		var req ForwardRequest
-		if err := readMsg(conn, &req); err != nil {
+		if err := rc.readMsg(&req); err != nil {
 			// Clean EOF (peer closed), idle timeout, or malformed framing —
 			// close silently. The follower will dial fresh on its next call.
 			return
@@ -100,7 +106,7 @@ func (f *forwarder) handleConn(conn net.Conn) {
 			}
 		}
 
-		if err := writeMsg(conn, resp); err != nil {
+		if err := rc.writeMsg(resp); err != nil {
 			// Response write failed (peer closed mid-request). Cannot
 			// continue this conn — the follower will dial again.
 			return

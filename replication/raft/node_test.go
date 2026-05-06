@@ -27,7 +27,7 @@ import (
 // newTestNodeWithForward is like newTestNode but also binds a ForwardAddr so
 // the node can receive and send forwarded write RPCs.
 func newTestNodeWithForward(
-	t *testing.T,
+	t testing.TB,
 	nodeID string,
 	tlsCfg *tls.Config,
 	raftAddr, fwdAddr string,
@@ -68,7 +68,7 @@ func newTestNodeWithForward(
 // TLS helper
 // ---------------------------------------------------------------------------
 
-func generateTLSConfig(t *testing.T) *tls.Config {
+func generateTLSConfig(t testing.TB) *tls.Config {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -164,7 +164,7 @@ func (m *mockDB) logEntry(i int) string {
 
 // pickFreeAddr finds a free TCP port on 127.0.0.1 and returns the address.
 // The listener is closed before returning so the port can be reused.
-func pickFreeAddr(t *testing.T) string {
+func pickFreeAddr(t testing.TB) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -175,7 +175,7 @@ func pickFreeAddr(t *testing.T) string {
 	return addr
 }
 
-func newTestNode(t *testing.T, nodeID string, tlsCfg *tls.Config, peers []string) (*memraft.Node, *mockDB) {
+func newTestNode(t testing.TB, nodeID string, tlsCfg *tls.Config, peers []string) (*memraft.Node, *mockDB) {
 	t.Helper()
 	db := &mockDB{}
 
