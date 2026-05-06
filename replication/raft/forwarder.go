@@ -65,38 +65,47 @@ func (f *forwarder) serve() {
 func (f *forwarder) handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	// Set an overall deadline for receiving the request. If the peer sends
-	// nothing within this window, the connection is torn down so the
-	// goroutine cannot leak waiting for a length-prefix that never arrives.
+	// Per-iteration idle timeout. The follower's ConnPool reuses connections
+	// across requests, so handleConn loops until the peer closes or stays
+	// idle longer than this window. Resetting the deadline before every
+	// readMsg lets a long-lived conn serve many requests while still bounding
+	// the goroutine's lifetime when the follower goes quiet.
 	const requestTimeout = 30 * time.Second
-	if err := conn.SetDeadline(time.Now().Add(requestTimeout)); err != nil {
-		return
-	}
 
-	var req ForwardRequest
-	if err := readMsg(conn, &req); err != nil {
-		// Malformed request or timeout — close silently.
-		return
-	}
+	for {
+		if err := conn.SetDeadline(time.Now().Add(requestTimeout)); err != nil {
+			return
+		}
 
-	// Apply through Raft. This node must be the leader; if not (e.g. a
-	// leadership change happened mid-flight), Exec returns ErrNotLeader and
-	// the follower will retry on the new leader.
-	err := f.node.Exec(req.SQL, req.Args...)
+		var req ForwardRequest
+		if err := readMsg(conn, &req); err != nil {
+			// Clean EOF (peer closed), idle timeout, or malformed framing —
+			// close silently. The follower will dial fresh on its next call.
+			return
+		}
 
-	resp := ForwardResponse{}
-	if err != nil {
-		resp.ErrMsg = err.Error()
-		// Set a sentinel code for known error types so the caller of
-		// sendForward can reconstitute a typed error and use errors.Is
-		// for retry logic (rather than matching on the message string).
-		if errors.Is(err, ErrNotLeader) {
-			resp.ErrCode = "ErrNotLeader"
+		// Apply through Raft. This node must be the leader; if not (e.g. a
+		// leadership change happened mid-flight), Exec returns ErrNotLeader
+		// and the follower will retry on the new leader.
+		err := f.node.Exec(req.SQL, req.Args...)
+
+		resp := ForwardResponse{}
+		if err != nil {
+			resp.ErrMsg = err.Error()
+			// Sentinel code for known error types so sendForward can
+			// reconstitute a typed error and drive retry via errors.Is
+			// rather than message-string matching.
+			if errors.Is(err, ErrNotLeader) {
+				resp.ErrCode = "ErrNotLeader"
+			}
+		}
+
+		if err := writeMsg(conn, resp); err != nil {
+			// Response write failed (peer closed mid-request). Cannot
+			// continue this conn — the follower will dial again.
+			return
 		}
 	}
-
-	// Best-effort response write — ignore errors (connection may have closed).
-	_ = writeMsg(conn, resp)
 }
 
 func (f *forwarder) close() error {

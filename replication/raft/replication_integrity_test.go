@@ -873,6 +873,39 @@ func TestReplication_ForwardingReconnect(t *testing.T) {
 	}
 }
 
+// TestReplication_ForwardingPoolReuse is a regression test for a bug where
+// forwarder.handleConn closed the TCP connection after a single request,
+// while the follower's ConnPool returned the same conn to subsequent callers
+// within its idle window. The first forwarded write succeeded; the next one
+// — handed a half-closed conn the pool could not detect — failed with EOF
+// on the response read.
+//
+// The test issues many sequential forwards through one follower with no
+// leader change in between; if the leader's handleConn does not loop on the
+// same conn, every call after the first will fail.
+func TestReplication_ForwardingPoolReuse(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping replication integration test in -short mode")
+	}
+	t.Parallel()
+	cluster := newThreeNodeCluster(t)
+
+	follower := cluster.follower()
+	if follower == nil {
+		t.Fatal("missing follower")
+	}
+
+	const n = 20
+	for i := 0; i < n; i++ {
+		if err := follower.Exec(fmt.Sprintf("INSERT pool-reuse-%d", i)); err != nil {
+			t.Fatalf("forward #%d: %v", i+1, err)
+		}
+	}
+	if err := cluster.waitForReplication(n, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // TestReplication_AtomicCommit
 // ---------------------------------------------------------------------------
