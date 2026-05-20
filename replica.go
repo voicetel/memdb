@@ -172,6 +172,29 @@ func (p *replicaPool) checkout() (*sql.DB, replicaReleaser) {
 // (typically because the parent DB is shutting down) interrupts a refresh
 // that is otherwise blocked waiting on a leaked *sql.Rows holding a
 // replica's single connection (MaxOpenConns=1).
+//
+// # Known optimisation opportunity (deferred)
+//
+// pprof of TestPProf_MixedReadWrite_DefaultRefresh shows runtime.memmove
+// at ~19% of CPU — the cost of mattn.Deserialize allocating and memcpying
+// a fresh per-replica C buffer on every tick. Each refresh performs N+2
+// full-image copies for an N-replica pool (one inside sqlite3_serialize,
+// one C→Go inside mattn.Serialize, and N Go→C inside mattn.Deserialize).
+//
+// SQLite's SQLITE_DESERIALIZE_READONLY flag would let every replica share
+// a single read-only buffer (no FREEONCLOSE; we own the lifetime), reducing
+// the cost to two memcpys per refresh regardless of N. Implementing it
+// requires direct access to the *C.sqlite3 handle inside mattn's
+// SQLiteConn — an unexported field. The unsafe-mirror approach (reflect-
+// derived offset + a layout guard) plus a small inline-CGo helper is the
+// shape that fits this codebase.
+//
+// Deferred because (a) no production workload has reported the cost,
+// (b) the gain shows up only in sustained mixed read+write workloads
+// without Raft, which is not memdb's primary use case, and (c) the
+// permanent maintenance tax of pinning to a specific mattn struct layout
+// is real. Revisit when there is profile data from a real workload that
+// justifies the trade.
 func (p *replicaPool) refresh(ctx context.Context, d *DB) error {
 	// Fast-path: if the pool has already been seeded once AND no write
 	// has occurred since the last successful refresh, every replica
