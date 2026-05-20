@@ -95,6 +95,26 @@ type replicaPool struct {
 	// since deserialize on a single-conn in-memory replica with no
 	// active cursors essentially cannot fail except on OOM).
 	staleBufs []unsafe.Pointer
+
+	// refreshDivergenceCount counts refreshes where some replicas
+	// ended up holding a different snapshot than the others. Two
+	// conditions bump it:
+	//
+	//   1. A migrate-loop failure where the rollback to the previous
+	//      shared buffer also failed on at least one replica.
+	//   2. The very first refresh (currentBuf == nil) failing partway:
+	//      migrated replicas have the new snapshot installed; the
+	//      remaining ones still hold the empty initial :memory: state.
+	//
+	// In both cases reads served by different replicas may return
+	// different results until the next successful refresh re-converges
+	// them. Operators should scrape this counter (via
+	// DB.ReplicaRefreshDivergenceCount) and alert when it advances —
+	// divergence is rare in practice (the deserialize calls that
+	// fail are essentially OOM) but is a correctness signal worth
+	// surfacing rather than burying in a generic "refresh failed"
+	// error log.
+	refreshDivergenceCount atomic.Uint64
 }
 
 // replicaReleaser returns a checked-out replica to the pool. It is an
@@ -297,18 +317,46 @@ func (p *replicaPool) refresh(ctx context.Context, d *DB) error {
 		}); err != nil {
 			// Rollback every successfully-migrated replica to the OLD
 			// shared buffer (if we have one) so they keep serving
-			// readable data. If the old buffer is nil (first refresh)
-			// or a rollback itself fails, the affected replicas are
-			// stuck pointing somewhere undefined — return them to the
-			// channel anyway so checkout can still hand them out,
-			// and let the next refresh tick try to fix it.
+			// readable data. Track rollback failures because they are
+			// the actual divergence signal: rollback success means all
+			// live replicas converge on the old snapshot (just no
+			// progress this tick); rollback failure means some
+			// replicas hold the new snapshot and some the old.
+			rollbackFailures := 0
 			if p.currentBuf != nil {
 				for j := 0; j < migrated; j++ {
-					_ = withRawConn(ctx, replicas[j], func(conn *sqlite3.SQLiteConn) error {
+					if rbErr := withRawConn(ctx, replicas[j], func(conn *sqlite3.SQLiteConn) error {
 						return deserializeReadonlyShared(conn, p.currentBuf, p.currentSz)
-					})
+					}); rbErr != nil {
+						rollbackFailures++
+					}
 				}
 			}
+
+			// Decide whether this counts as divergence:
+			//   - currentBuf == nil (first refresh) AND migrated > 0:
+			//     migrated replicas have the new snapshot, the rest
+			//     hold the empty initial :memory: state — divergent.
+			//   - rollback failed on at least one replica: that replica
+			//     still references newBuf with new-snapshot data while
+			//     the rest hold currentBuf with the old snapshot —
+			//     divergent.
+			//   - Otherwise (currentBuf != nil AND all rollbacks
+			//     succeeded): every replica converges on the old
+			//     snapshot. Not divergent, just a failed refresh.
+			divergent := (p.currentBuf == nil && migrated > 0) || rollbackFailures > 0
+			if divergent {
+				p.refreshDivergenceCount.Add(1)
+				d.logger().Warn(
+					"memdb: replica refresh divergence — replicas now serve mixed snapshots",
+					"migrated", migrated,
+					"total", n,
+					"rollback_failures", rollbackFailures,
+					"first_refresh", p.currentBuf == nil,
+					"underlying_error", err,
+				)
+			}
+
 			// Park newBuf in staleBufs — we can't be sure no replica
 			// still references it after a failed rollback. close()
 			// drains the slice and frees everything safely.

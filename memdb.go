@@ -468,6 +468,28 @@ func (d *DB) Flush(ctx context.Context) error {
 
 // Close flushes to the backend, stops the background goroutine, and closes
 // the in-memory DB. Subsequent calls are no-ops.
+// ReplicaRefreshDivergenceCount returns the number of times since
+// Open that the replica pool detected a partial-migration failure
+// where some replicas hold a different snapshot than others. Reads
+// served by different replicas during such a window may return
+// different results until the next successful refresh re-converges
+// the pool.
+//
+// In practice this counter advances only under SQLite OOM during
+// deserialize — every other failure mode is recoverable by the
+// rollback path. Operators should still alert on this counter
+// advancing, since it is the only observability signal for read
+// inconsistency across replicas.
+//
+// Returns 0 when no replica pool is configured (ReadPoolSize == 0)
+// or when no divergence has been observed.
+func (d *DB) ReplicaRefreshDivergenceCount() uint64 {
+	if d.replica == nil {
+		return 0
+	}
+	return d.replica.refreshDivergenceCount.Load()
+}
+
 func (d *DB) Close() error {
 	var closeErr error
 	d.stopOnce.Do(func() {
