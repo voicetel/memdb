@@ -72,6 +72,59 @@ timings reflect only the operation under measurement, not periodic I/O.
 
 ## What changed since v1.5.0
 
+### v1.9.1 — shared read-only deserialize buffer for replicas
+
+The replica refresh path previously called mattn's `Deserialize` on
+each of N replicas, which `sqlite3_malloc64`s and `memcpy`s the full
+serialized image **per replica per tick**. pprof showed
+`runtime.memmove` at ~19 % of CPU on the
+`TestPProf_MixedReadWrite_DefaultRefresh` workload — the
+N + 2 full-image copies per refresh (one inside sqlite3_serialize,
+one C→Go inside mattn.Serialize, and N Go→C inside mattn.Deserialize)
+dominated.
+
+`replicaPool.refresh` now allocates ONE C buffer per tick, copies the
+serialized bytes into it once, and deserializes every replica to
+point at the same buffer with `SQLITE_DESERIALIZE_READONLY` (no
+`FREEONCLOSE`; the pool owns the buffer's lifetime). The cost is
+`O(1)` memcpys per refresh regardless of replica count.
+
+The `READONLY` flag also pins `PRAGMA query_only=ON` on every replica
+automatically, so a stray direct-replica write attempt is rejected
+with `SQLITE_READONLY` instead of silently mutating the in-memory
+copy.
+
+| Scenario | v1.8.0 | v1.9.1 | Change |
+|---|---:|---:|---:|
+| `runtime.memmove` % of CPU (mixed RW) | ~19 % | **2.17 %** | **−89 %** |
+| Mixed RW (default refresh) writes/s | 56,438 | **170,717** | **3.03×** |
+| Mixed RW (default refresh) reads/s | 273,878 | **596,058** | **2.18×** |
+| Concurrent reads (16 goroutines) | 821,756 | **840,522** | within noise |
+
+v1.9.1 captures are from `make pprof` on the same 12th Gen Intel Core
+i7-1280P (20 threads) reference hardware as v1.8.0. Reads stayed
+roughly the same because the read-only workload already uses the
+write-generation short-circuit (refresh fast-path skips deserialize
+when writeGen has not advanced); the optimisation only fires when
+refresh actually runs, which it does continuously under a mixed RW
+workload.
+
+The shared-buffer wins compound with the v1.9.0 fix: writer +
+replicas now both go through the cgo-shimmed `sqlite3_deserialize`
+path, with the writer using `FREEONCLOSE | RESIZEABLE` and replicas
+using `READONLY` against a pool-owned shared buffer. Both paths
+share the unsafe-mirror access to mattn's unexported `*C.sqlite3`
+handle (`sqliteConnMirror`, layout-guarded by
+`TestSQLiteConnMirrorLayout`).
+
+### v1.9.0 — SQLITE_FULL after Restore fix (no perf-impacting changes on the bench)
+
+`DB.Restore` now uses `SQLITE_DESERIALIZE_RESIZEABLE` so the writer
+can grow past the snapshot size. Adds `Config.RestoreMaxBytes` with
+a host-aware default. No effect on the steady-state benchmarks above
+— the change is on the post-restore write path, not the hot path.
+See the v1.9.0 release notes for the bug diagnosis.
+
 ### v1.7.0 – v1.8.0 — feature releases (no perf-impacting changes)
 
 These tags add user-visible features without touching the measured hot

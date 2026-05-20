@@ -29,6 +29,7 @@ extern const char* sqlite3_libversion(void);
 #define MEMDB_SQLITE_OK                       0
 #define MEMDB_SQLITE_DESERIALIZE_FREEONCLOSE  1
 #define MEMDB_SQLITE_DESERIALIZE_RESIZEABLE   2
+#define MEMDB_SQLITE_DESERIALIZE_READONLY     4
 
 static int memdb_deserialize_resizable(
     sqlite3* db, const char* schema,
@@ -38,6 +39,27 @@ static int memdb_deserialize_resizable(
         db, schema, (unsigned char*)buf, sz, sz,
         (unsigned)(MEMDB_SQLITE_DESERIALIZE_FREEONCLOSE |
                    MEMDB_SQLITE_DESERIALIZE_RESIZEABLE)
+    );
+}
+
+// memdb_deserialize_readonly_shared installs a CALLER-OWNED buffer as
+// the connection's "main" database with SQLITE_DESERIALIZE_READONLY.
+// Critically, FREEONCLOSE is NOT set — SQLite will not call
+// sqlite3_free on buf when the connection closes; the caller retains
+// ownership and must keep buf alive as long as ANY connection
+// references it, then free it via memdb_sqlite3_free.
+//
+// READONLY pins query_only=ON automatically, so the connection can
+// serve reads but rejects any write attempt. This matches the
+// read-replica use case exactly and lets N replicas share one buffer
+// (the optimization that backs replicaPool's shared-buffer pool).
+static int memdb_deserialize_readonly_shared(
+    sqlite3* db, const char* schema,
+    void* buf, long long sz
+) {
+    return sqlite3_deserialize(
+        db, schema, (unsigned char*)buf, sz, sz,
+        (unsigned)(MEMDB_SQLITE_DESERIALIZE_READONLY)
     );
 }
 
@@ -127,6 +149,78 @@ func verifyLayout(c *sqlite3.SQLiteConn) error {
 		}
 	})
 	return layoutErr
+}
+
+// allocSharedSnapshotBuffer copies b into a freshly sqlite3_malloc64'd
+// C buffer suitable for the caller-owned, read-only shared-buffer
+// deserialize path (see deserializeReadonlyShared). The returned
+// pointer and size are valid until the caller invokes
+// freeSharedSnapshotBuffer; SQLite will not free the buffer on
+// connection close because READONLY-without-FREEONCLOSE retains
+// caller ownership.
+//
+// Returns (nil, 0, err) on allocation failure.
+func allocSharedSnapshotBuffer(b []byte) (unsafe.Pointer, int64, error) {
+	sz := C.longlong(len(b))
+	cbuf := C.memdb_sqlite3_malloc64(sz)
+	if cbuf == nil {
+		return nil, 0, fmt.Errorf("memdb: sqlite3_malloc64(%d) returned NULL (shared snapshot buffer)", len(b))
+	}
+	if len(b) > 0 {
+		copy(unsafe.Slice((*byte)(cbuf), len(b)), b)
+	}
+	return unsafe.Pointer(cbuf), int64(len(b)), nil
+}
+
+// freeSharedSnapshotBuffer releases a buffer previously returned by
+// allocSharedSnapshotBuffer. MUST be called only when no live
+// SQLiteConn still has the buffer installed via
+// deserializeReadonlyShared; doing so otherwise causes a use-after-free
+// crash inside SQLite the next time the connection touches its main
+// schema.
+//
+// nil buf is a no-op (mirrors free(3) semantics).
+func freeSharedSnapshotBuffer(buf unsafe.Pointer) {
+	if buf == nil {
+		return
+	}
+	C.memdb_sqlite3_free(buf)
+}
+
+// deserializeReadonlyShared installs the caller-owned buffer at buf
+// (of size sz) as the connection's "main" database with
+// SQLITE_DESERIALIZE_READONLY and NO FREEONCLOSE.
+//
+// The buffer MUST outlive every connection it is installed on. The
+// caller is responsible for tracking liveness and calling
+// freeSharedSnapshotBuffer only after every connection has been
+// re-deserialized to a different buffer (or closed). This is how
+// replicaPool fans one snapshot across N replicas without the per-
+// replica memcpy that the mattn Deserialize path incurs.
+//
+// READONLY automatically enables PRAGMA query_only, so any write
+// attempt on a replica deserialized this way returns
+// SQLITE_READONLY. That matches the read-replica contract; callers
+// who need a writable deserialize must use deserializeResizable
+// instead.
+func deserializeReadonlyShared(c *sqlite3.SQLiteConn, buf unsafe.Pointer, sz int64) error {
+	if err := verifyLayout(c); err != nil {
+		return err
+	}
+	handle := rawConnHandle(c)
+	if handle == nil {
+		return fmt.Errorf("memdb: deserialize (readonly): nil sqlite3 handle")
+	}
+	zSchema := C.CString("main")
+	defer C.free(unsafe.Pointer(zSchema))
+
+	rc := C.memdb_deserialize_readonly_shared(
+		(*C.sqlite3)(handle), zSchema, buf, C.longlong(sz),
+	)
+	if rc != C.MEMDB_SQLITE_OK {
+		return fmt.Errorf("memdb: sqlite3_deserialize (readonly shared): rc=%d", int(rc))
+	}
+	return nil
 }
 
 // deserializeResizable installs b as the current "main" database on

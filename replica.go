@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
 )
@@ -65,6 +66,35 @@ type replicaPool struct {
 	// Like lastRefreshedGen, this is only written from the single refresh
 	// goroutine so it does not need atomic access.
 	seeded bool
+
+	// currentBuf is the C-allocated buffer (sqlite3_malloc64) that every
+	// replica currently has deserialized as its "main" schema with
+	// SQLITE_DESERIALIZE_READONLY and NO FREEONCLOSE. The pool owns
+	// the buffer's lifetime; it stays valid as long as any replica
+	// references it. refresh() rotates currentBuf on every successful
+	// refresh: allocate new, deserialize every replica to point at new,
+	// free old. close() frees whatever is still live.
+	//
+	// Sharing one buffer across N replicas (instead of mattn's per-call
+	// sqlite3_malloc64 + memcpy inside Deserialize) is the optimisation
+	// that drops runtime.memmove from ~19% to a fraction of a percent
+	// on mixed read+write workloads — see v1.9.1 release notes.
+	//
+	// Only touched from the refresh goroutine (and close), so no
+	// atomic access required.
+	currentBuf unsafe.Pointer
+	currentSz  int64
+
+	// staleBufs holds C buffers that were allocated by a refresh that
+	// failed partway through migrating replicas. We can't safely free
+	// them mid-refresh because we don't know whether a replica still
+	// references them after a failed rollback. They stay in the slice
+	// until close() drains everything. In normal operation this slice
+	// stays at 0 entries; in the pathological case it's bounded by
+	// the number of failed refreshes (which itself should be rare
+	// since deserialize on a single-conn in-memory replica with no
+	// active cursors essentially cannot fail except on OOM).
+	staleBufs []unsafe.Pointer
 }
 
 // replicaReleaser returns a checked-out replica to the pool. It is an
@@ -173,28 +203,11 @@ func (p *replicaPool) checkout() (*sql.DB, replicaReleaser) {
 // that is otherwise blocked waiting on a leaked *sql.Rows holding a
 // replica's single connection (MaxOpenConns=1).
 //
-// # Known optimisation opportunity (deferred)
-//
-// pprof of TestPProf_MixedReadWrite_DefaultRefresh shows runtime.memmove
-// at ~19% of CPU — the cost of mattn.Deserialize allocating and memcpying
-// a fresh per-replica C buffer on every tick. Each refresh performs N+2
-// full-image copies for an N-replica pool (one inside sqlite3_serialize,
-// one C→Go inside mattn.Serialize, and N Go→C inside mattn.Deserialize).
-//
-// SQLite's SQLITE_DESERIALIZE_READONLY flag would let every replica share
-// a single read-only buffer (no FREEONCLOSE; we own the lifetime), reducing
-// the cost to two memcpys per refresh regardless of N. Implementing it
-// requires direct access to the *C.sqlite3 handle inside mattn's
-// SQLiteConn — an unexported field. The unsafe-mirror approach (reflect-
-// derived offset + a layout guard) plus a small inline-CGo helper is the
-// shape that fits this codebase.
-//
-// Deferred because (a) no production workload has reported the cost,
-// (b) the gain shows up only in sustained mixed read+write workloads
-// without Raft, which is not memdb's primary use case, and (c) the
-// permanent maintenance tax of pinning to a specific mattn struct layout
-// is real. Revisit when there is profile data from a real workload that
-// justifies the trade.
+// Since v1.9.1 every replica shares a single C-allocated snapshot
+// buffer via SQLITE_DESERIALIZE_READONLY (no FREEONCLOSE), so the
+// per-refresh cost is one sqlite3_malloc64 + one memcpy regardless
+// of N replicas — see allocSharedSnapshotBuffer and currentBuf for
+// the lifecycle.
 func (p *replicaPool) refresh(ctx context.Context, d *DB) error {
 	// Fast-path: if the pool has already been seeded once AND no write
 	// has occurred since the last successful refresh, every replica
@@ -260,24 +273,64 @@ func (p *replicaPool) refresh(ctx context.Context, d *DB) error {
 		return fmt.Errorf("memdb: replica serialize: %w", err)
 	}
 
-	// Step 4 — Deserialize into each replica and return it to the channel
-	// immediately after it is updated so reads can resume as quickly as possible.
+	// Step 4 — Allocate ONE fresh C buffer and deserialize every replica
+	// to point at it with SQLITE_DESERIALIZE_READONLY (no FREEONCLOSE,
+	// the pool owns the buffer's lifetime). This is the shared-buffer
+	// optimisation that replaces N per-replica sqlite3_malloc64 +
+	// memcpy round-trips with a single shared allocation.
 	//
-	// Uses the same loadSnapshot helper as DB.Restore so writer and
-	// replicas share the same growth policy: SQLITE_DESERIALIZE_RESIZEABLE
-	// flag + PRAGMA max_page_count cap from Config.RestoreMaxBytes. The
-	// cap is largely defence-in-depth on replicas (which never write),
-	// but keeping the code path identical prevents future divergence.
+	// Replicas are read-only by design, so READONLY is the natural flag
+	// and PRAGMA max_page_count (which DB.Restore applies to the
+	// writer) is irrelevant here: replicas cannot grow.
+	newBuf, newSz, err := allocSharedSnapshotBuffer(data)
+	if err != nil {
+		for _, r := range replicas {
+			p.idle <- r
+		}
+		return fmt.Errorf("memdb: alloc shared snapshot buffer: %w", err)
+	}
+
+	migrated := 0
 	for i, r := range replicas {
-		if err := loadSnapshot(ctx, r, data, d.cfg.RestoreMaxBytes); err != nil {
-			// Deserialize failed on replica i. Return all remaining replicas
-			// (including i itself) to the channel before surfacing the error
-			// so the pool stays fully populated.
-			for _, rem := range replicas[i:] {
-				p.idle <- rem
+		if err := withRawConn(ctx, r, func(conn *sqlite3.SQLiteConn) error {
+			return deserializeReadonlyShared(conn, newBuf, newSz)
+		}); err != nil {
+			// Rollback every successfully-migrated replica to the OLD
+			// shared buffer (if we have one) so they keep serving
+			// readable data. If the old buffer is nil (first refresh)
+			// or a rollback itself fails, the affected replicas are
+			// stuck pointing somewhere undefined — return them to the
+			// channel anyway so checkout can still hand them out,
+			// and let the next refresh tick try to fix it.
+			if p.currentBuf != nil {
+				for j := 0; j < migrated; j++ {
+					_ = withRawConn(ctx, replicas[j], func(conn *sqlite3.SQLiteConn) error {
+						return deserializeReadonlyShared(conn, p.currentBuf, p.currentSz)
+					})
+				}
+			}
+			// Park newBuf in staleBufs — we can't be sure no replica
+			// still references it after a failed rollback. close()
+			// drains the slice and frees everything safely.
+			p.staleBufs = append(p.staleBufs, newBuf)
+			for _, rr := range replicas {
+				p.idle <- rr
 			}
 			return fmt.Errorf("memdb: replica %d deserialize: %w", i, err)
 		}
+		migrated++
+	}
+
+	// All N replicas now point to newBuf. The previous buffer (if any)
+	// is unreferenced; safe to free.
+	if p.currentBuf != nil {
+		freeSharedSnapshotBuffer(p.currentBuf)
+	}
+	p.currentBuf = newBuf
+	p.currentSz = newSz
+
+	// Return migrated replicas to the channel for checkout.
+	for _, r := range replicas {
 		p.idle <- r
 	}
 
@@ -292,17 +345,50 @@ func (p *replicaPool) refresh(ctx context.Context, d *DB) error {
 	return nil
 }
 
-// close drains the idle channel and closes every idle replica connection.
-// Replicas currently checked out by callers are closed when their release()
-// runs, because the closed flag is set first.
+// close shuts the pool down and frees its shared buffers. Sets the
+// closed flag first so that any in-flight Releaser closes its replica
+// instead of returning it to the channel; drains the idle channel and
+// closes those replicas; waits for every checked-out replica to be
+// released (and thereby closed); then frees the shared C buffers.
+//
+// Ordering matters because the shared buffer (currentBuf) is
+// referenced by every replica's SQLite connection. Closing a
+// connection releases that reference; only after ALL replica
+// connections have closed is it safe to call sqlite3_free on the
+// buffer. close() does this in three phases — set flag, close every
+// connection (both idle and checked-out), free buffers — so a
+// checked-out replica running a query at close time cannot end up
+// querying a freed buffer.
 func (p *replicaPool) close() {
 	p.closed.Store(true)
+
+	// Phase 1 — drain the idle channel and close those replicas.
+drain:
 	for {
 		select {
 		case r := <-p.idle:
-			r.Close()
+			_ = r.Close()
 		default:
-			return
+			break drain
 		}
 	}
+
+	// Phase 2 — wait for every checked-out replica to be released.
+	// Releaser sees closed=true and closes its replica instead of
+	// returning it to the channel, then calls inUse.Done(). When
+	// inUse drops to zero, no connection still references any
+	// shared buffer.
+	p.inUse.Wait()
+
+	// Phase 3 — every replica connection has closed; freeing the
+	// shared buffer(s) is safe.
+	if p.currentBuf != nil {
+		freeSharedSnapshotBuffer(p.currentBuf)
+		p.currentBuf = nil
+		p.currentSz = 0
+	}
+	for _, b := range p.staleBufs {
+		freeSharedSnapshotBuffer(b)
+	}
+	p.staleBufs = nil
 }
