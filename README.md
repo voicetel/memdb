@@ -177,6 +177,13 @@ type Config struct {
 	// Tune for large DBs to reduce latency spikes. Default: -1.
 	BackupStepPages int
 
+	// Maximum bytes the in-memory database (writer + replicas) is
+	// allowed to grow to after Restore. Enforced via PRAGMA max_page_count
+	// on every copy. Default: host-aware (GOMEMLIMIT/2 or host RAM/2,
+	// divided by 1+ReadPoolSize, clamped to [256 MiB, 16 GiB]).
+	// See v1.9.0 release notes for the SQLITE_FULL bug this fixes.
+	RestoreMaxBytes int64
+
 	// Set true to disable SQLite foreign-key enforcement.
 	// The zero value (false) means enforcement is ON.
 	DisableForeignKeys bool

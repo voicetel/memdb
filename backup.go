@@ -1,13 +1,20 @@
 package memdb
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
 )
+
+// sqliteFileHeader is the 16-byte magic that prefixes every well-formed
+// SQLite database file (https://sqlite.org/fileformat.html §1.3). DB.Restore
+// rejects payloads that do not start with this prefix.
+var sqliteFileHeader = []byte("SQLite format 3\x00")
 
 // copyMemToWriter serialises the in-memory DB into w using the SQLite Online
 // Backup API: memory → temp file on disk → stream temp file → delete temp file.
@@ -105,10 +112,77 @@ func (d *DB) Serialize() ([]byte, error) {
 
 // Restore replaces the complete in-memory database from raw SQLite bytes
 // using sqlite3_deserialize. Used by the Raft FSM to install snapshots.
+//
+// Since v1.9.0 the deserialize is performed via deserializeResizable
+// (SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE) so
+// the database is allowed to grow past len(data) on subsequent writes
+// — before that, the cap was frozen at the snapshot size and produced
+// SQLITE_FULL on every post-restore write.
+//
+// A PRAGMA max_page_count cap is applied immediately after the
+// deserialize to honour Config.RestoreMaxBytes. The cap is enforced
+// in pages so it is automatically scaled by whatever page_size the
+// snapshot was written with.
+//
+// Defence-in-depth: a 16-byte SQLite header check rejects malformed
+// payloads with ErrSnapshotCorrupt before reaching sqlite3_deserialize.
+// The Raft stream that feeds this entry point is already authenticated,
+// but accepting a stray byte slice into the raw deserialize API would
+// crash the FSM goroutine on the next query instead of returning
+// cleanly.
 func (d *DB) Restore(data []byte) error {
-	return withRawConn(context.Background(), d.mem, func(conn *sqlite3.SQLiteConn) error {
-		return conn.Deserialize(data, "main")
-	})
+	// minSnapshotBytes is the SQLite file header length (100 bytes,
+	// https://sqlite.org/fileformat.html §1.3). A payload shorter
+	// than this cannot be a valid database; rejecting it here keeps
+	// sqlite3_deserialize from being asked to install bytes that
+	// would corrupt the connection's internal state on the next
+	// query — sqlite3_deserialize itself does not promise atomicity
+	// on malformed input.
+	const minSnapshotBytes = 100
+	if len(data) < minSnapshotBytes || !bytes.HasPrefix(data, sqliteFileHeader) {
+		return ErrSnapshotCorrupt
+	}
+	return loadSnapshot(context.Background(), d.mem, data, d.cfg.RestoreMaxBytes)
+}
+
+// loadSnapshot installs data into db via RESIZEABLE deserialize and
+// then enforces maxBytes (when > 0) as PRAGMA max_page_count. Shared
+// by DB.Restore (writer) and replicaPool.refresh (each replica) so
+// every in-memory copy of the database goes through the same code
+// path and ends up with the same growth policy.
+func loadSnapshot(ctx context.Context, db *sql.DB, data []byte, maxBytes int64) error {
+	if err := withRawConn(ctx, db, func(conn *sqlite3.SQLiteConn) error {
+		return deserializeResizable(conn, data)
+	}); err != nil {
+		return err
+	}
+	return applyMaxPageCount(ctx, db, maxBytes)
+}
+
+// applyMaxPageCount sets PRAGMA max_page_count = (maxBytes/page_size)
+// on db. Reads page_size first because the deserialised database can
+// have been written with any supported page size and we want the cap
+// expressed in bytes regardless. Maps maxBytes <= 0 to a no-op so
+// callers can pass through their config field without a guard.
+func applyMaxPageCount(ctx context.Context, db *sql.DB, maxBytes int64) error {
+	if maxBytes <= 0 {
+		return nil
+	}
+	var pageSize int64
+	if err := db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return fmt.Errorf("memdb: read page_size after restore: %w", err)
+	}
+	if pageSize <= 0 {
+		return fmt.Errorf("memdb: unexpected page_size=%d after restore", pageSize)
+	}
+	maxPages := maxBytes / pageSize
+	if maxPages < 1 {
+		maxPages = 1
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA max_page_count = %d", maxPages)); err != nil {
+		return fmt.Errorf("memdb: apply max_page_count=%d after restore: %w", maxPages, err)
+	}
+	return nil
 }
 
 // copyDB copies all pages from src to dst using the SQLite Online Backup API.

@@ -10,6 +10,13 @@ const (
 	defaultFlushInterval = 30 * time.Second
 	defaultBusyTimeout   = 5000
 	defaultCacheSize     = -64000 // 64MB in kibibytes
+
+	// DefaultRestoreMaxBytesFallback is the last-resort static value
+	// used by defaultRestoreMaxBytes when neither GOMEMLIMIT nor the
+	// host-physical-memory probe yields a number (4 GiB). Most callers
+	// will never see this value because Linux/Darwin both expose host
+	// memory; it exists for platforms without a stdlib probe.
+	DefaultRestoreMaxBytesFallback int64 = 4 << 30
 )
 
 // DurabilityMode controls the write durability guarantee.
@@ -93,6 +100,43 @@ type Config struct {
 	// Pages to copy per backup step. -1 = all at once.
 	// Tune for large DBs to reduce latency spikes during flush.
 	BackupStepPages int
+
+	// RestoreMaxBytes is the upper bound on how far the deserialized
+	// in-memory database (writer and every replica) is allowed to grow
+	// after Restore. memdb calls sqlite3_deserialize with
+	// SQLITE_DESERIALIZE_RESIZEABLE so the database can grow past the
+	// snapshot size; the cap is enforced after deserialization by
+	// PRAGMA max_page_count = RestoreMaxBytes / page_size on every
+	// copy (writer + N replicas).
+	//
+	// Default: 0 → host-aware computation in defaultRestoreMaxBytes:
+	//
+	//   budget = GOMEMLIMIT/2 if set, else host physical RAM / 2
+	//   budget = clamp(budget, 256 MiB, 16 GiB)
+	//   RestoreMaxBytes = clamp(budget / (1 + ReadPoolSize), 256 MiB, 16 GiB)
+	//
+	// Dividing by (1 + ReadPoolSize) keeps the total memory footprint
+	// across writer + replicas bounded; a 16 GiB host with
+	// ReadPoolSize=4 lands at ~1.6 GiB per copy instead of 8 GiB per
+	// copy. The 256 MiB floor wins on tiny VMs even if division would
+	// otherwise drive the cap below it. Platforms without a memory
+	// probe fall through to DefaultRestoreMaxBytesFallback (4 GiB).
+	//
+	// Growth is on-demand via sqlite3_realloc64, so the cap value
+	// itself does not pre-allocate; it only defines the level at
+	// which SQLITE_FULL would re-appear.
+	//
+	// Set explicitly in memory-constrained environments to fail closed
+	// rather than relying on the auto-scaled default. A value below
+	// the snapshot's already-occupied size is honoured exactly (the
+	// snapshot loads but no growth is permitted past current usage).
+	//
+	// Background: before this knob existed (memdb ≤ v1.8.3),
+	// sqlite3_deserialize was called without RESIZEABLE, freezing the
+	// page capacity at len(snapshot) and producing SQLITE_FULL on
+	// every post-Restore write. See the v1.9.0 release notes for the
+	// full diagnosis.
+	RestoreMaxBytes int64
 
 	// ReadPoolSize is the number of independent in-memory replica databases
 	// to maintain for read operations. When > 0, Query and QueryRow are
@@ -195,6 +239,9 @@ func (c *Config) validate() error {
 	if c.FilePath == "" && c.Backend == nil {
 		return fmt.Errorf("memdb: FilePath or Backend is required")
 	}
+	if c.RestoreMaxBytes < 0 {
+		return fmt.Errorf("memdb: RestoreMaxBytes must be >= 0 (got %d)", c.RestoreMaxBytes)
+	}
 	return nil
 }
 
@@ -221,6 +268,19 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ReadPoolSize < 0 {
 		c.ReadPoolSize = 0
+	}
+	if c.RestoreMaxBytes == 0 {
+		// Divide the host-aware budget across writer + replicas so the
+		// total cap stays bounded regardless of ReadPoolSize. Floor at
+		// restoreMaxBytesFloor (256 MiB) so the writer never gets a
+		// useless cap even if N is large.
+		base := defaultRestoreMaxBytes()
+		copies := int64(1 + c.ReadPoolSize)
+		perDB := base / copies
+		if perDB < restoreMaxBytesFloor {
+			perDB = restoreMaxBytesFloor
+		}
+		c.RestoreMaxBytes = perDB
 	}
 	if c.ReadPoolSize > 0 && c.ReplicaRefreshInterval <= 0 {
 		// 50 ms balances read staleness against writer CPU cost. See the

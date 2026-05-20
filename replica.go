@@ -262,10 +262,14 @@ func (p *replicaPool) refresh(ctx context.Context, d *DB) error {
 
 	// Step 4 — Deserialize into each replica and return it to the channel
 	// immediately after it is updated so reads can resume as quickly as possible.
+	//
+	// Uses the same loadSnapshot helper as DB.Restore so writer and
+	// replicas share the same growth policy: SQLITE_DESERIALIZE_RESIZEABLE
+	// flag + PRAGMA max_page_count cap from Config.RestoreMaxBytes. The
+	// cap is largely defence-in-depth on replicas (which never write),
+	// but keeping the code path identical prevents future divergence.
 	for i, r := range replicas {
-		if err := withRawConn(ctx, r, func(conn *sqlite3.SQLiteConn) error {
-			return conn.Deserialize(data, "main")
-		}); err != nil {
+		if err := loadSnapshot(ctx, r, data, d.cfg.RestoreMaxBytes); err != nil {
 			// Deserialize failed on replica i. Return all remaining replicas
 			// (including i itself) to the channel before surfacing the error
 			// so the pool stays fully populated.
