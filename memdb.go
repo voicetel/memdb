@@ -115,7 +115,7 @@ func Open(cfg Config) (*DB, error) {
 	// restore() checks Exists internally and is a no-op when no snapshot
 	// exists. Errors are surfaced by restore() itself.
 	if err := db.restore(); err != nil {
-		mem.Close()
+		_ = mem.Close()
 		return nil, err
 	}
 
@@ -126,7 +126,7 @@ func Open(cfg Config) (*DB, error) {
 		walPath := cfg.FilePath + ".wal"
 		db.wal, err = OpenWAL(walPath)
 		if err != nil {
-			mem.Close()
+			_ = mem.Close()
 			return nil, err
 		}
 		// Replay any entries written after the last snapshot. Use the stmt
@@ -136,8 +136,8 @@ func Open(cfg Config) (*DB, error) {
 			_, err := db.stmts.ExecContext(context.Background(), e.SQL, e.Args...)
 			return err
 		}); err != nil {
-			mem.Close()
-			db.wal.Close()
+			_ = mem.Close()
+			_ = db.wal.Close()
 			return nil, fmt.Errorf("memdb: wal replay: %w", err)
 		}
 		db.logger().Info("memdb: WAL replayed")
@@ -145,7 +145,7 @@ func Open(cfg Config) (*DB, error) {
 
 	if cfg.InitSchema != nil {
 		if err := cfg.InitSchema(db); err != nil {
-			mem.Close()
+			_ = mem.Close()
 			return nil, fmt.Errorf("memdb: InitSchema: %w", err)
 		}
 	}
@@ -155,7 +155,7 @@ func Open(cfg Config) (*DB, error) {
 	if cfg.ReadPoolSize > 0 {
 		pool, err := newReplicaPool(db, cfg.ReadPoolSize, name)
 		if err != nil {
-			mem.Close()
+			_ = mem.Close()
 			return nil, fmt.Errorf("memdb: replica pool: %w", err)
 		}
 		db.replica = pool
@@ -519,9 +519,9 @@ func (d *DB) Close() error {
 		if d.stmts != nil {
 			_ = d.stmts.Close()
 		}
-		d.mem.Close()
+		_ = d.mem.Close()
 		if d.wal != nil {
-			d.wal.Close()
+			_ = d.wal.Close()
 		}
 	})
 	return closeErr

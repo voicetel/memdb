@@ -218,7 +218,7 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	stableStore, err := newStableStore(filepath.Join(cfg.DataDir, "raft-stable"))
 	if err != nil {
 		if c, ok := logStore.(storeCloser); ok {
-			c.Close()
+			_ = c.Close()
 		}
 		return nil, fmt.Errorf("raft node: stable store: %w", err)
 	}
@@ -229,10 +229,10 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	)
 	if err != nil {
 		if c, ok := logStore.(storeCloser); ok {
-			c.Close()
+			_ = c.Close()
 		}
 		if c, ok := stableStore.(storeCloser); ok {
-			c.Close()
+			_ = c.Close()
 		}
 		return nil, fmt.Errorf("raft node: snapshot store: %w", err)
 	}
@@ -244,10 +244,10 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	hasState, err := hraft.HasExistingState(logStore, stableStore, snapStore)
 	if err != nil {
 		if c, ok := logStore.(storeCloser); ok {
-			c.Close()
+			_ = c.Close()
 		}
 		if c, ok := stableStore.(storeCloser); ok {
-			c.Close()
+			_ = c.Close()
 		}
 		return nil, fmt.Errorf("raft node: check state: %w", err)
 	}
@@ -257,10 +257,10 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 		// into an existing cluster uses whatever membership is already stored.
 		if len(cfg.Peers)%2 == 0 {
 			if c, ok := logStore.(storeCloser); ok {
-				c.Close()
+				_ = c.Close()
 			}
 			if c, ok := stableStore.(storeCloser); ok {
-				c.Close()
+				_ = c.Close()
 			}
 			return nil, fmt.Errorf("raft node: cluster size must be odd (got %d peers) — "+
 				"even-sized clusters have no fault tolerance advantage over the next smaller odd size; "+
@@ -281,10 +281,10 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	stream, err := newTLSStreamLayer(cfg.BindAddr, cfg.AdvertiseAddr, cfg.TLSConfig)
 	if err != nil {
 		if c, ok := logStore.(storeCloser); ok {
-			c.Close()
+			_ = c.Close()
 		}
 		if c, ok := stableStore.(storeCloser); ok {
-			c.Close()
+			_ = c.Close()
 		}
 		return nil, err
 	}
@@ -326,12 +326,12 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 
 	r, err := hraft.NewRaft(raftCfg, fsm, logStore, stableStore, snapStore, transport)
 	if err != nil {
-		transport.Close()
+		_ = transport.Close()
 		if c, ok := logStore.(storeCloser); ok {
-			c.Close()
+			_ = c.Close()
 		}
 		if c, ok := stableStore.(storeCloser); ok {
-			c.Close()
+			_ = c.Close()
 		}
 		return nil, fmt.Errorf("raft node: new raft: %w", err)
 	}

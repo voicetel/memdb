@@ -31,25 +31,25 @@ func (b *LocalBackend) Write(ctx context.Context, r io.Reader) error {
 	tmpName := tmp.Name()
 
 	if _, err := io.Copy(tmp, r); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("local backend: write: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("local backend: fsync: %w", err)
 	}
-	tmp.Close()
+	_ = tmp.Close()
 
 	if err := os.Rename(tmpName, b.Path); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("local backend: rename: %w", err)
 	}
 	// fsync the parent directory so the rename is durable.
 	if dir, err := os.Open(filepath.Dir(b.Path)); err == nil {
 		_ = dir.Sync()
-		dir.Close()
+		_ = dir.Close()
 	}
 	return nil
 }

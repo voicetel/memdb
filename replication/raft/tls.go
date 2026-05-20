@@ -28,7 +28,7 @@ func newTLSStreamLayer(bindAddr, advertisedAddr string, tlsCfg *tls.Config) (*tl
 	if advertisedAddr != "" {
 		advertise, err = net.ResolveTCPAddr("tcp", advertisedAddr)
 		if err != nil {
-			ln.Close()
+			_ = ln.Close()
 			return nil, fmt.Errorf("raft tls: resolve advertise addr %s: %w", advertisedAddr, err)
 		}
 	}

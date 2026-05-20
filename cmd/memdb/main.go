@@ -234,7 +234,7 @@ func runServe(file, addr string, flush time.Duration, durability string,
 		slog.Error("open failed", "error", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if raftCfg.enabled() {
 		node, err := buildRaftNode(db, *raftCfg, slog.Default())
@@ -321,7 +321,7 @@ func copyFileAtomic(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 
 	dir := filepath.Dir(dst)
 	tmp, err := os.CreateTemp(dir, ".memdb-restore-*.db")
@@ -331,25 +331,25 @@ func copyFileAtomic(src, dst string) error {
 	tmpName := tmp.Name()
 
 	if _, err := io.Copy(tmp, in); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("copy: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("sync: %w", err)
 	}
-	tmp.Close()
+	_ = tmp.Close()
 
 	if err := os.Rename(tmpName, dst); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("rename: %w", err)
 	}
 	// fsync the parent directory so the rename is durable.
 	if dir, err := os.Open(filepath.Dir(dst)); err == nil {
 		_ = dir.Sync()
-		dir.Close()
+		_ = dir.Close()
 	}
 	return nil
 }

@@ -54,7 +54,7 @@ func newLogStore(path string) (hraft.LogStore, error) {
 		index: make(map[uint64]int64),
 	}
 	if err := s.load(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("log store: load: %w", err)
 	}
 	return s, nil
@@ -291,8 +291,8 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 		copy(record[8:], e.data)
 
 		if _, err := tmp.WriteAt(record, writeOffset); err != nil {
-			tmp.Close()
-			os.Remove(tmpName)
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
 			return fmt.Errorf("log store: delete range write: %w", err)
 		}
 		newIndex[e.idx] = writeOffset
@@ -308,15 +308,15 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 	}
 
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return err
 	}
-	tmp.Close()
+	_ = tmp.Close()
 
 	// Close the current file before rename so Windows is happy too.
 	if err := s.f.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 
@@ -324,7 +324,7 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 		// Rename failed. The temp file is still valid; s.f has been closed.
 		// If the original file still exists (rename failed before replacing it),
 		// try to re-open it. Otherwise the store is in an unrecoverable state.
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		f, reopenErr := os.OpenFile(s.path, os.O_RDWR, 0o600)
 		if reopenErr != nil {
 			// Both failed — return the original rename error; the store is broken.
@@ -337,7 +337,7 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 	// fsync the parent directory so the rename is durable across a crash.
 	if dir, err := os.Open(filepath.Dir(s.path)); err == nil {
 		_ = dir.Sync()
-		dir.Close()
+		_ = dir.Close()
 	}
 
 	f, err := os.OpenFile(s.path, os.O_RDWR, 0o600)
@@ -420,24 +420,24 @@ func (s *fileStableStore) save() error {
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("stable store: write temp: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("stable store: sync temp: %w", err)
 	}
-	tmp.Close()
+	_ = tmp.Close()
 	if err := os.Rename(tmpName, s.path); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("stable store: rename: %w", err)
 	}
 	// fsync the parent directory so the rename is durable across a crash.
 	if dir, err := os.Open(filepath.Dir(s.path)); err == nil {
 		_ = dir.Sync()
-		dir.Close()
+		_ = dir.Close()
 	}
 	return nil
 }

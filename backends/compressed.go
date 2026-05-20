@@ -56,7 +56,7 @@ func (b *CompressedBackend) Write(ctx context.Context, r io.Reader) error {
 			pw.CloseWithError(fmt.Errorf("compressed backend: encoder close: %w", closeErr))
 			encErr = closeErr
 		} else {
-			pw.Close()
+			_ = pw.Close()
 		}
 	}()
 
@@ -78,7 +78,7 @@ func (b *CompressedBackend) Read(ctx context.Context) (io.ReadCloser, error) {
 	}
 	dec, err := zstd.NewReader(rc)
 	if err != nil {
-		rc.Close()
+		_ = rc.Close()
 		return nil, fmt.Errorf("compressed backend: decoder: %w", err)
 	}
 	return dec.IOReadCloser(), nil

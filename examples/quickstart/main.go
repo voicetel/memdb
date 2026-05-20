@@ -35,7 +35,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Write — hits memory only until next flush
 	_, err = db.Exec(

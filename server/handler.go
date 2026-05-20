@@ -78,8 +78,8 @@ func newHandler(db *memdb.DB, cfg Config, conn net.Conn) *handler {
 }
 
 func (h *handler) serve() {
-	defer h.conn.Close()
-	defer h.bufW.Flush() // best-effort final flush
+	defer func() { _ = h.conn.Close() }()
+	defer func() { _ = h.bufW.Flush() }() // best-effort final flush
 
 	// Set a generous idle timeout — refreshed per message.
 	const idleTimeout = 5 * time.Minute
@@ -453,7 +453,7 @@ func (h *handler) handleSelect(query string) error {
 		}
 		return h.sendReadyForQuery()
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {

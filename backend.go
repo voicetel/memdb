@@ -288,35 +288,35 @@ func (b *LocalBackend) flush(ctx context.Context, d *DB) error {
 
 	sw, err := newSnapshotWriter(tmp)
 	if err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("local backend: write snapshot header: %w", err)
 	}
 	if err := copyMemToWriter(ctx, d, sw, d.cfg.BackupStepPages); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("local backend: write snapshot: %w", err)
 	}
 	if err := sw.Finish(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("local backend: write snapshot footer: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("local backend: fsync: %w", err)
 	}
-	tmp.Close()
+	_ = tmp.Close()
 
 	if err := os.Rename(tmpName, b.Path); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("local backend: rename: %w", err)
 	}
 	// fsync the parent directory so the rename is durable.
 	if dir, err := os.Open(filepath.Dir(b.Path)); err == nil {
 		_ = dir.Sync()
-		dir.Close()
+		_ = dir.Close()
 	}
 	return nil
 }
@@ -330,7 +330,7 @@ func (b *LocalBackend) restore(ctx context.Context, d *DB) error {
 	if err != nil {
 		return fmt.Errorf("local backend: open for restore: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	isLegacy, err := restoreVerifiedSnapshot(ctx, d, f)
 	if err != nil {
@@ -452,7 +452,7 @@ func (a *externalBackendAdapter) flush(ctx context.Context, d *DB) error {
 				return
 			}
 		}
-		pw.Close()
+		_ = pw.Close()
 	}()
 
 	writeErr := a.inner.Write(ctx, pr)
@@ -487,7 +487,7 @@ func (a *externalBackendAdapter) restore(ctx context.Context, d *DB) error {
 	if err != nil {
 		return fmt.Errorf("external backend: read: %w", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	isLegacy, err := restoreVerifiedSnapshot(ctx, d, rc)
 	if err != nil {

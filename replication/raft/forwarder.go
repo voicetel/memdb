@@ -50,7 +50,7 @@ func (f *forwarder) serve() {
 					// A panicking handler must not crash the forwarder or
 					// the Raft node. Log and close the connection so the
 					// follower gets a clean EOF and retries.
-					conn.Close()
+					_ = conn.Close()
 					f.node.logger().Error("forwarder: handler panic recovered",
 						"panic", r,
 						"remote", conn.RemoteAddr(),
@@ -63,7 +63,7 @@ func (f *forwarder) serve() {
 }
 
 func (f *forwarder) handleConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Wrap the conn so the gob Encoder/Decoder are created once and reused
 	// across every request on this conn. Without this, each request would

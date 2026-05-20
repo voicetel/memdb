@@ -131,7 +131,7 @@ func (s *Server) ListenAndServe() error {
 		}
 		select {
 		case <-s.quit:
-			conn.Close()
+			_ = conn.Close()
 			return nil
 		default:
 		}
@@ -144,7 +144,7 @@ func (s *Server) ListenAndServe() error {
 					// Log the panic and close the connection so the client
 					// gets a clean EOF rather than a half-written response.
 					// Other connections are unaffected.
-					conn.Close()
+					_ = conn.Close()
 					s.cfg.logger().Error("memdb server: handler panic recovered",
 						"panic", r,
 						"remote", conn.RemoteAddr(),
@@ -162,7 +162,7 @@ func (s *Server) Stop() {
 		close(s.quit)
 		s.mu.Lock()
 		if s.listener != nil {
-			s.listener.Close()
+			_ = s.listener.Close()
 		}
 		s.mu.Unlock()
 	})

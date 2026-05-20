@@ -440,7 +440,7 @@ func peekColumns(db queryRunner, sql string, nParams int) ([]string, []*sql.Colu
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, nil, err
@@ -589,7 +589,7 @@ func (p *portal) openRows(h *handler) error {
 		p.executed = true
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {

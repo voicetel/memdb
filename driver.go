@@ -135,7 +135,7 @@ func withRawConn(ctx context.Context, db *sql.DB, fn func(*sqlite3.SQLiteConn) e
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	return conn.Raw(func(c any) error {
 		sc, ok := c.(*sqlite3.SQLiteConn)

@@ -257,7 +257,7 @@ func openSnapshot(path string) (*sql.DB, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("open snapshot: %w", err)
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 
 	tmp, err := os.CreateTemp("", "memdb-cli-*.db")
 	if err != nil {
@@ -325,7 +325,7 @@ func repl(db *sql.DB, out *printer, historyPath, modeTag string) {
 	}
 
 	line := liner.NewLiner()
-	defer line.Close()
+	defer func() { _ = line.Close() }()
 	line.SetCtrlCAborts(true) // ctrl-c on empty prompt → io.EOF, exit cleanly
 	line.SetMultiLineMode(true)
 
@@ -335,7 +335,7 @@ func repl(db *sql.DB, out *printer, historyPath, modeTag string) {
 	if historyPath != "" {
 		if f, err := os.Open(historyPath); err == nil {
 			_, _ = line.ReadHistory(f)
-			f.Close()
+			_ = f.Close()
 		}
 		// Persist on exit. Best-effort — a write failure should not
 		// mask a successful inspection session.
@@ -408,8 +408,8 @@ func writeHistory(historyPath string, line *liner.State) error {
 	}
 	tmpName := tmp.Name()
 	if _, err := line.WriteHistory(tmp); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -446,7 +446,7 @@ func loadTableNames(db *sql.DB) []string {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var names []string
 	for rows.Next() {
 		var n string
@@ -696,7 +696,7 @@ func runFile(db *sql.DB, path string, out *printer) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1024*1024), 16*1024*1024)
@@ -748,14 +748,14 @@ func unescape(s string) string {
 // succeed.
 func runStatement(db *sql.DB, sqlStmt string, out *printer) error {
 	if out.echo {
-		fmt.Fprintln(out.w, sqlStmt)
+		_, _ = fmt.Fprintln(out.w, sqlStmt)
 	}
 	start := time.Now()
 	rows, err := db.Query(sqlStmt)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
@@ -773,7 +773,7 @@ func runStatement(db *sql.DB, sqlStmt string, out *printer) error {
 			return err
 		}
 		if out.timer {
-			fmt.Fprintf(out.w, "Time: %s\n", time.Since(start))
+			_, _ = fmt.Fprintf(out.w, "Time: %s\n", time.Since(start))
 		}
 		return nil
 	}
@@ -783,7 +783,7 @@ func runStatement(db *sql.DB, sqlStmt string, out *printer) error {
 		return err
 	}
 	if out.timer {
-		fmt.Fprintf(out.w, "Time: %s\n", time.Since(start))
+		_, _ = fmt.Fprintf(out.w, "Time: %s\n", time.Since(start))
 	}
 	return nil
 }
@@ -868,7 +868,7 @@ func (p *printer) printColumn(cols []string, rows *sql.Rows) {
 // "|"). Lower memory than column mode for large result sets.
 func (p *printer) printList(cols []string, rows *sql.Rows) {
 	if p.headers {
-		fmt.Fprintln(p.w, strings.Join(cols, p.separator))
+		_, _ = fmt.Fprintln(p.w, strings.Join(cols, p.separator))
 	}
 	n := 0
 	row := make([]string, len(cols))
@@ -885,7 +885,7 @@ func (p *printer) printList(cols []string, rows *sql.Rows) {
 		for i, v := range raw {
 			row[i] = formatCell(v)
 		}
-		fmt.Fprintln(p.w, strings.Join(row, p.separator))
+		_, _ = fmt.Fprintln(p.w, strings.Join(row, p.separator))
 		n++
 	}
 	printRowCount(p.w, n)
@@ -912,10 +912,10 @@ func (p *printer) printLine(cols []string, rows *sql.Rows) {
 			return
 		}
 		if n > 0 {
-			fmt.Fprintln(p.w)
+			_, _ = fmt.Fprintln(p.w)
 		}
 		for i, v := range raw {
-			fmt.Fprintf(p.w, "%*s = %s\n", maxName, cols[i], formatCell(v))
+			_, _ = fmt.Fprintf(p.w, "%*s = %s\n", maxName, cols[i], formatCell(v))
 		}
 		n++
 	}
@@ -1019,9 +1019,9 @@ func writeFixedWidthRow(w io.Writer, cells []string, widths []int, sep string) {
 
 func printRowCount(w io.Writer, n int) {
 	if n == 0 {
-		fmt.Fprintln(w, "(0 rows)")
+		_, _ = fmt.Fprintln(w, "(0 rows)")
 	} else {
-		fmt.Fprintf(w, "(%d row%s)\n", n, pluralS(n))
+		_, _ = fmt.Fprintf(w, "(%d row%s)\n", n, pluralS(n))
 	}
 }
 

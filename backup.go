@@ -26,8 +26,8 @@ func copyMemToWriter(ctx context.Context, d *DB, w io.Writer, stepPages int) err
 		return fmt.Errorf("memdb: backup temp: %w", err)
 	}
 	tmpName := tmp.Name()
-	tmp.Close()
-	defer os.Remove(tmpName)
+	_ = tmp.Close()
+	defer func() { _ = os.Remove(tmpName) }()
 
 	fileDB, err := openFileDB(tmpName)
 	if err != nil {
@@ -39,16 +39,16 @@ func copyMemToWriter(ctx context.Context, d *DB, w io.Writer, stepPages int) err
 			return copyDB(ctx, memConn, fileConn, stepPages)
 		})
 	}); err != nil {
-		fileDB.Close()
+		_ = fileDB.Close()
 		return err
 	}
-	fileDB.Close()
+	_ = fileDB.Close()
 
 	f, err := os.Open(tmpName)
 	if err != nil {
 		return fmt.Errorf("memdb: open backup temp: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	_, err = io.Copy(w, f)
 	return err
 }
@@ -73,7 +73,7 @@ func restoreVerifiedSnapshot(ctx context.Context, d *DB, r io.Reader) (isLegacy 
 		return false, fmt.Errorf("memdb: restore temp: %w", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }()
 
 	isLegacy, verr := verifyAndStreamPayload(r, tmp)
 	if cerr := tmp.Close(); cerr != nil && verr == nil {
@@ -87,7 +87,7 @@ func restoreVerifiedSnapshot(ctx context.Context, d *DB, r io.Reader) (isLegacy 
 	if err != nil {
 		return isLegacy, err
 	}
-	defer fileDB.Close()
+	defer func() { _ = fileDB.Close() }()
 
 	return isLegacy, withRawConn(ctx, fileDB, func(fileConn *sqlite3.SQLiteConn) error {
 		return withRawConn(ctx, d.mem, func(memConn *sqlite3.SQLiteConn) error {
