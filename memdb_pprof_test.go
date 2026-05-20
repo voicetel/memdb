@@ -455,6 +455,161 @@ func runMixedPProf(t *testing.T, cfg memdb.Config, dir, namePrefix string) {
 }
 
 // ---------------------------------------------------------------------------
+// TestPProf_LargeDB_MixedRW
+// ---------------------------------------------------------------------------
+
+// TestPProf_LargeDB_MixedRW exercises a mixed-RW workload against a
+// pre-seeded ~100 MiB in-memory database to measure whether per-refresh
+// snapshot copying still dominates CPU after the v1.9.1 shared-READONLY
+// buffer optimisation. Without that optimisation, refresh would
+// memmove ~100 MiB into every replica on every tick. With it, refresh
+// memmoves ~100 MiB exactly once per tick regardless of replica count
+// — but the cost still scales with DB size.
+//
+// This is the empirical signal for whether session-extension v2.0
+// (row-level streaming replication) is justified:
+//
+//   - If runtime.memmove and replicaPool.refresh dominate CPU here,
+//     the per-tick full-snapshot copy is still the bottleneck on large
+//     databases — v2.0 (which streams row-level changesets instead of
+//     copying the whole image) would be a big win.
+//
+//   - If memmove is small (e.g. <5 %) and the top costs are cgo
+//     crossings, SQL execution, and database/sql plumbing, the v2.0
+//     rewrite would be solving a non-problem — the remaining cost is
+//     structural to the cgo + driver stack and won't be addressed by
+//     changing the replication primitive.
+//
+// Gated on MEMDB_PPROF=1 like every other test in this file.
+func TestPProf_LargeDB_MixedRW(t *testing.T) {
+	dir := pprofOutputDir(t)
+
+	cfg := pprofConfig(t)
+	cfg.ReadPoolSize = runtime.GOMAXPROCS(0)
+	// Leave ReplicaRefreshInterval at zero so applyDefaults uses the
+	// production default. The point of this test is to characterise
+	// what a production caller will see, not what an aggressively-
+	// tuned refresh produces.
+
+	db, err := memdb.Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Seed ~100 MiB. Each row is 1 KiB of BLOB plus row-id overhead, so
+	// 100 000 rows lands close to the target. The schema lives in kv
+	// (key TEXT PRIMARY KEY, value BLOB) which pprofConfig creates.
+	const (
+		seedRows  = 100_000
+		payloadKB = 1
+	)
+	t.Logf("seeding %d rows of %d KiB each (~%d MiB target) — this can take ~10 s",
+		seedRows, payloadKB, seedRows*payloadKB/1024)
+
+	payload := make([]byte, payloadKB*1024)
+	for i := range payload {
+		payload[i] = byte(i & 0xFF)
+	}
+	for i := 0; i < seedRows; i++ {
+		if _, err := db.Exec(
+			`INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+			fmt.Sprintf("large-%d", i), payload,
+		); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+	// Let the replica pool absorb the seeded state — at 100 MiB the
+	// initial deserialize tick is not free.
+	time.Sleep(200 * time.Millisecond)
+
+	cpuPath := filepath.Join(dir, "pprof_large_mixed.cpu.prof")
+	heapPath := filepath.Join(dir, "pprof_large_mixed.heap.prof")
+
+	const (
+		workDuration = 3 * time.Second
+		readers      = 8
+	)
+	var writes, reads atomic.Int64
+
+	start := time.Now()
+	err = profiling.CaptureCPUProfile(cpuPath, func() error {
+		var wg sync.WaitGroup
+		done := make(chan struct{})
+
+		// Writer goroutine — every write bumps writeGen so refresh
+		// runs continuously. We deliberately use small per-write
+		// payloads so the workload measures the refresh path's CPU
+		// cost on a large existing DB, not the cost of growing it.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			i := 0
+			small := []byte("x")
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				if _, err := db.Exec(
+					`INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+					fmt.Sprintf("hot-%d", i%1000), small,
+				); err != nil {
+					return
+				}
+				i++
+				writes.Add(1)
+			}
+		}()
+
+		// Reader goroutines hit the seeded set so they always find data.
+		for g := 0; g < readers; g++ {
+			g := g
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var val []byte
+				i := g
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+					_ = db.QueryRow(
+						`SELECT value FROM kv WHERE key = ?`,
+						fmt.Sprintf("large-%d", i%seedRows),
+					).Scan(&val)
+					i++
+					reads.Add(1)
+				}
+			}()
+		}
+
+		time.Sleep(workDuration)
+		close(done)
+		wg.Wait()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CaptureCPUProfile: %v", err)
+	}
+	if err := profiling.CaptureHeapProfile(heapPath, func() error { return nil }); err != nil {
+		t.Fatalf("CaptureHeapProfile: %v", err)
+	}
+
+	w, r := writes.Load(), reads.Load()
+	t.Logf("pprof_large_mixed (refresh=%s, seed=%d rows × %d KiB, replicas=%d): "+
+		"%d writes, %d reads in %s (%.0f write/s, %.0f read/s)  cpu=%s  heap=%s",
+		cfg.ReplicaRefreshInterval, seedRows, payloadKB, cfg.ReadPoolSize,
+		w, r, time.Since(start),
+		float64(w)/time.Since(start).Seconds(),
+		float64(r)/time.Since(start).Seconds(),
+		cpuPath, heapPath)
+}
+
+// ---------------------------------------------------------------------------
 // TestPProf_Flush
 // ---------------------------------------------------------------------------
 
