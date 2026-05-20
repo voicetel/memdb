@@ -60,7 +60,7 @@ func newSingleNodeRaft(t *testing.T, fsm hraft.FSM) *hraft.Raft {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { transport.Close() })
+	t.Cleanup(func() { _ = transport.Close() })
 
 	r, err := hraft.NewRaft(cfg, fsm, logStore, stableStore, snapStore, transport)
 	if err != nil {
@@ -319,7 +319,7 @@ func TestApply_NotLeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { transport.Close() })
+	t.Cleanup(func() { _ = transport.Close() })
 
 	r, err := hraft.NewRaft(cfg, noopFSM(), logStore, stableStore, snapStore, transport)
 	if err != nil {

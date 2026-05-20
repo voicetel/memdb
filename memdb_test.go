@@ -30,7 +30,7 @@ func TestReplicaPool_ReadsConverge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Write a row via the writer connection.
 	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES (?, ?)`, "pool-key", "pool-val"); err != nil {
@@ -62,7 +62,7 @@ func TestReplicaPool_WritesAlwaysVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES (?, ?)`, "tx-key", "tx-val"); err != nil {
 		t.Fatalf("Exec: %v", err)
@@ -87,7 +87,7 @@ func TestReplicaPool_ConcurrentReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Seed some rows.
 	for i := 0; i < 20; i++ {
@@ -131,7 +131,7 @@ func TestReplicaPool_Disabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES (?, ?)`, "npool", "yes"); err != nil {
 		t.Fatalf("Exec: %v", err)
@@ -151,8 +151,8 @@ func testConfig(t *testing.T) memdb.Config {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
-	os.Remove(f.Name()) // start fresh
+	_ = f.Close()
+	_ = os.Remove(f.Name()) // start fresh
 
 	return memdb.Config{
 		FilePath:      f.Name(),
@@ -185,7 +185,7 @@ func TestExecQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES (?, ?)`, "foo", "bar"); err != nil {
 		t.Fatalf("Exec: %v", err)
@@ -215,14 +215,14 @@ func TestFlushAndRestore(t *testing.T) {
 	if err := db.Flush(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	// Re-open — should restore from snapshot
 	db2, err := memdb.Open(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	var val string
 	if err := db2.QueryRow(`SELECT value FROM kv WHERE key = ?`, "hello").Scan(&val); err != nil {
@@ -238,7 +238,7 @@ func TestWithTx_Commit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	err = memdb.WithTx(context.Background(), db, func(tx *sql.Tx) error {
 		_, err := tx.Exec(`INSERT INTO kv (key, value) VALUES (?, ?)`, "tx", "ok")
@@ -262,7 +262,7 @@ func TestWithTx_Rollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	_ = memdb.WithTx(context.Background(), db, func(tx *sql.Tx) error {
 		_, _ = tx.Exec(`INSERT INTO kv (key, value) VALUES (?, ?)`, "rollback", "nope")
@@ -287,7 +287,7 @@ func TestChangeHook(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES (?, ?)`, "k", "v"); err != nil {
 		t.Fatalf("Exec INSERT: %v", err)
@@ -316,7 +316,7 @@ func TestClosedDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	if _, err := db.Exec(`SELECT 1`); err != memdb.ErrClosed {
 		t.Errorf("expected ErrClosed, got %v", err)

@@ -88,7 +88,7 @@ func BenchmarkOpenSnapshot(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		db.Close()
+		_ = db.Close()
 		cleanup()
 	}
 }
@@ -129,7 +129,7 @@ func benchRunStatement(b *testing.B, rows int, query, mode string) {
 		b.Fatal(err)
 	}
 	defer cleanup()
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	out := newPrinter(io.Discard, true, mode, "|")
 
@@ -151,7 +151,7 @@ func BenchmarkUnwrapOnly(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	stat, _ := in.Stat()
 	b.SetBytes(stat.Size())
 
@@ -220,7 +220,7 @@ func wireFixture(tb testing.TB, rows int) (*sql.DB, func()) {
 		tb.Fatal(err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	srv := server.New(mdb, server.Config{ListenAddr: addr})
 	go srv.ListenAndServe() //nolint:errcheck // server returns nil on Stop
@@ -230,7 +230,7 @@ func wireFixture(tb testing.TB, rows int) (*sql.DB, func()) {
 			strings.Split(addr, ":")[0], strings.Split(addr, ":")[1]))
 	if err != nil {
 		srv.Stop()
-		mdb.Close()
+		_ = mdb.Close()
 		tb.Fatal(err)
 	}
 	db.SetMaxOpenConns(1)
@@ -244,16 +244,16 @@ func wireFixture(tb testing.TB, rows int) (*sql.DB, func()) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		srv.Stop()
-		mdb.Close()
+		_ = mdb.Close()
 		tb.Fatalf("server never accepted connections: %v", err)
 	}
 
 	cleanup := func() {
-		db.Close()
+		_ = db.Close()
 		srv.Stop()
-		mdb.Close()
+		_ = mdb.Close()
 	}
 	return db, cleanup
 }

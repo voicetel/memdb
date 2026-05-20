@@ -37,7 +37,7 @@ func mustOpen(t *testing.T, cfg memdb.Config) *memdb.DB {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
@@ -130,7 +130,7 @@ func TestDB_Begin_Closed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	_, err = db.Begin()
 	if !errors.Is(err, memdb.ErrClosed) {
@@ -143,7 +143,7 @@ func TestDB_BeginTx_Closed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	_, err = db.BeginTx(context.Background(), nil)
 	if !errors.Is(err, memdb.ErrClosed) {
@@ -156,7 +156,7 @@ func TestDB_Query_Closed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	_, err = db.Query("SELECT 1")
 	if !errors.Is(err, memdb.ErrClosed) {
@@ -187,7 +187,7 @@ func TestDB_Flush_Closed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	ctx := context.Background()
 	if err := db.Flush(ctx); !errors.Is(err, memdb.ErrClosed) {
@@ -296,7 +296,7 @@ func TestDurabilityWAL_RestoreIncludesWALReplay(t *testing.T) {
 	}
 
 	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES ('replay-key', 'replay-val')`); err != nil {
-		db.Close()
+		_ = db.Close()
 		t.Fatalf("Exec: %v", err)
 	}
 
@@ -311,7 +311,7 @@ func TestDurabilityWAL_RestoreIncludesWALReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	var val string
 	if err := db2.QueryRow(`SELECT value FROM kv WHERE key = 'replay-key'`).Scan(&val); err != nil {
@@ -352,7 +352,7 @@ func TestConfig_Defaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open with default config: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Verify the DB is usable.
 	var n int
@@ -417,7 +417,7 @@ func TestWAL_Truncate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWAL: %v", err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	// Append 3 entries.
 	for i := 0; i < 3; i++ {
@@ -482,7 +482,7 @@ func TestWAL_Replay_Empty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWAL: %v", err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	count := 0
 	if err := w.Replay(func(_ memdb.WALEntry) error {
@@ -513,7 +513,7 @@ func TestWAL_Replay_CorruptEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWAL: %v", err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	// Replay is tolerant of a corrupt tail — it returns nil and simply
 	// skips the garbage. No entries are delivered to the callback because
@@ -573,13 +573,13 @@ func TestWrapBackend_AuthenticatedSkipsHeader(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES ('aead-key', 'aead-val')`); err != nil {
-		db.Close()
+		_ = db.Close()
 		t.Fatalf("Exec: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.Flush(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		t.Fatalf("Flush: %v", err)
 	}
 	if err := db.Close(); err != nil {
@@ -590,7 +590,7 @@ func TestWrapBackend_AuthenticatedSkipsHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	var val string
 	if err := db2.QueryRow(`SELECT value FROM kv WHERE key = 'aead-key'`).Scan(&val); err != nil {
@@ -627,14 +627,14 @@ func TestWrapBackend_FlushAndRestore(t *testing.T) {
 	}
 
 	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES ('wrapped-key', 'wrapped-val')`); err != nil {
-		db.Close()
+		_ = db.Close()
 		t.Fatalf("Exec: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.Flush(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		t.Fatalf("Flush: %v", err)
 	}
 	if err := db.Close(); err != nil {
@@ -646,7 +646,7 @@ func TestWrapBackend_FlushAndRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	var val string
 	if err := db2.QueryRow(`SELECT value FROM kv WHERE key = 'wrapped-key'`).Scan(&val); err != nil {
@@ -674,7 +674,7 @@ func TestExec_WithOnExec_SkipsLocalWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES (?, ?)`, "k", "v"); err != nil {
 		t.Fatalf("Exec: %v", err)
@@ -700,7 +700,7 @@ func TestBegin_WithOnExec_ReturnsError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	_, err = db.Begin()
 	if !errors.Is(err, memdb.ErrTransactionNotSupported) {
@@ -917,7 +917,7 @@ func TestPanic_OnExec_PanicsToCallerBecauseItIsSync(t *testing.T) {
 	if err := db1.Flush(ctx); err != nil {
 		t.Fatalf("initial flush: %v", err)
 	}
-	db1.Close()
+	_ = db1.Close()
 
 	// Step 2: reopen the same file with OnExec set and no InitSchema
 	// (schema already persisted). The panicking hook will fire on Exec
@@ -935,7 +935,7 @@ func TestPanic_OnExec_PanicsToCallerBecauseItIsSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open with OnExec: %v", err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	didPanic := false
 	func() {
@@ -977,14 +977,14 @@ func TestSnapshot_Checksum_RoundTrip(t *testing.T) {
 	if err := db.Flush(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	// Re-open from the snapshot — checksum verification must pass silently.
 	db2, err := memdb.Open(cfg)
 	if err != nil {
 		t.Fatalf("Open after flush: %v", err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	var val string
 	if err := db2.QueryRow(`SELECT value FROM kv WHERE key = 'snap-key'`).Scan(&val); err != nil {
@@ -1014,7 +1014,7 @@ func TestSnapshot_Checksum_Corruption(t *testing.T) {
 	if err := db.Flush(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	// Corrupt a byte in the payload portion (byte 1000, well past the 44-byte header).
 	path := cfg.FilePath
@@ -1055,7 +1055,7 @@ func TestSnapshot_Checksum_HeaderCorruption(t *testing.T) {
 	if err := db.Flush(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	// Flip a byte inside the SHA-256 field of the header (offset 8).
 	path := cfg.FilePath
@@ -1097,7 +1097,7 @@ func TestSnapshot_Legacy_NoChecksum(t *testing.T) {
 	if err := db.Flush(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	// Strip the snapshot wrapping ([magic][version] prefix at the front,
 	// [payloadLen][sha256] footer at the back), leaving a raw SQLite
@@ -1124,7 +1124,7 @@ func TestSnapshot_Legacy_NoChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open legacy snapshot: %v", err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	var val string
 	if err := db2.QueryRow(`SELECT value FROM kv WHERE key = 'leg'`).Scan(&val); err != nil {
@@ -1153,7 +1153,7 @@ func TestDB_WithTx_OnClosedDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	err = memdb.WithTx(context.Background(), db, func(_ *sql.Tx) error {
 		return nil
@@ -1180,7 +1180,7 @@ func writeSnapshotForCorruption(t *testing.T) (cfg memdb.Config, path string) {
 	if err := db.Flush(ctx); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 	return cfg, cfg.FilePath
 }
 

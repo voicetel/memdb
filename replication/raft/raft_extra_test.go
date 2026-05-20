@@ -32,7 +32,7 @@ func TestConnPool_GetPut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	addr := ln.Addr().String()
 
 	// Accept connections in the background.
@@ -43,7 +43,7 @@ func TestConnPool_GetPut(t *testing.T) {
 				return
 			}
 			// Keep the server-side connection open for the duration of the test.
-			go func(c net.Conn) { defer c.Close(); _, _ = io.Copy(io.Discard, c) }(conn)
+			go func(c net.Conn) { defer func() { _ = c.Close() }(); _, _ = io.Copy(io.Discard, c) }(conn)
 		}
 	}()
 
@@ -83,7 +83,7 @@ func TestConnPool_FullPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		for {
@@ -91,7 +91,7 @@ func TestConnPool_FullPool(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go func(c net.Conn) { defer c.Close(); _, _ = io.Copy(io.Discard, c) }(conn)
+			go func(c net.Conn) { defer func() { _ = c.Close() }(); _, _ = io.Copy(io.Discard, c) }(conn)
 		}
 	}()
 
@@ -131,7 +131,7 @@ func TestConnPool_Close(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		for {
@@ -139,7 +139,7 @@ func TestConnPool_Close(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go func(c net.Conn) { defer c.Close(); _, _ = io.Copy(io.Discard, c) }(conn)
+			go func(c net.Conn) { defer func() { _ = c.Close() }(); _, _ = io.Copy(io.Discard, c) }(conn)
 		}
 	}()
 
@@ -188,7 +188,7 @@ func TestConnPool_IdleTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		for {
@@ -196,7 +196,7 @@ func TestConnPool_IdleTimeout(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go func(c net.Conn) { defer c.Close(); _, _ = io.Copy(io.Discard, c) }(conn)
+			go func(c net.Conn) { defer func() { _ = c.Close() }(); _, _ = io.Copy(io.Discard, c) }(conn)
 		}
 	}()
 
@@ -247,7 +247,7 @@ func TestConnPool_ConcurrentAccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		for {
@@ -255,7 +255,7 @@ func TestConnPool_ConcurrentAccess(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go func(c net.Conn) { defer c.Close(); _, _ = io.Copy(io.Discard, c) }(conn)
+			go func(c net.Conn) { defer func() { _ = c.Close() }(); _, _ = io.Copy(io.Discard, c) }(conn)
 		}
 	}()
 

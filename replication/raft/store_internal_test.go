@@ -97,7 +97,7 @@ func TestFileLogStore_DeleteRange_Middle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.(*fileLogStore).Close()
+	defer func() { _ = store.(*fileLogStore).Close() }()
 
 	for i := uint64(1); i <= 5; i++ {
 		if err := store.StoreLog(&hraft.Log{Index: i, Term: 1, Data: []byte{byte(i)}}); err != nil {
@@ -136,7 +136,7 @@ func TestFileLogStore_DeleteRange_All(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.(*fileLogStore).Close()
+	defer func() { _ = store.(*fileLogStore).Close() }()
 
 	for i := uint64(1); i <= 3; i++ {
 		_ = store.StoreLog(&hraft.Log{Index: i, Term: 1, Data: []byte("x")})
@@ -216,7 +216,7 @@ func TestFileLogStore_LoadStopsAtTruncation(t *testing.T) {
 	if _, err := f.Write([]byte("garbage")); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	reopened, err := newLogStore(logPath)
 	if err != nil {

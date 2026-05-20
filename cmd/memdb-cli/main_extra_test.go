@@ -51,7 +51,7 @@ func TestPrintHelp(t *testing.T) {
 	t.Cleanup(func() { os.Stdout = orig })
 
 	printHelp()
-	w.Close()
+	_ = w.Close()
 
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(r); err != nil {
@@ -197,7 +197,7 @@ func TestRepl_ExitOnQuit(t *testing.T) {
 	if _, err := pipeW.WriteString(".quit\n"); err != nil {
 		t.Fatal(err)
 	}
-	pipeW.Close()
+	_ = pipeW.Close()
 
 	db, cleanup := openTestSnapshot(t, 1)
 	t.Cleanup(cleanup)
@@ -228,7 +228,7 @@ func TestRepl_ExecutesStatement(t *testing.T) {
 	if _, err := pipeW.WriteString("SELECT COUNT(*) FROM users;\n.quit\n"); err != nil {
 		t.Fatal(err)
 	}
-	pipeW.Close()
+	_ = pipeW.Close()
 
 	db, cleanup := openTestSnapshot(t, 4)
 	t.Cleanup(cleanup)
@@ -270,7 +270,7 @@ func TestRepl_WireBannerSelected(t *testing.T) {
 	if _, err := pipeW.WriteString(".quit\n"); err != nil {
 		t.Fatal(err)
 	}
-	pipeW.Close()
+	_ = pipeW.Close()
 
 	db, cleanup := openTestSnapshot(t, 1)
 	t.Cleanup(cleanup)
@@ -285,7 +285,7 @@ func TestRepl_WireBannerSelected(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("repl wire-mode did not return")
 	}
-	wOut.Close()
+	_ = wOut.Close()
 
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(rOut); err != nil {
@@ -311,7 +311,7 @@ func TestRepl_HistoryRoundTrip(t *testing.T) {
 	if _, err := pipeW.WriteString(".tables\n.quit\n"); err != nil {
 		t.Fatal(err)
 	}
-	pipeW.Close()
+	_ = pipeW.Close()
 
 	db, cleanup := openTestSnapshot(t, 1)
 	t.Cleanup(cleanup)

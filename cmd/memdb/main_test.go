@@ -230,7 +230,7 @@ func TestUsage_NotEmpty(t *testing.T) {
 	t.Cleanup(func() { os.Stderr = origStderr })
 
 	usage()
-	w.Close()
+	_ = w.Close()
 
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(r); err != nil {

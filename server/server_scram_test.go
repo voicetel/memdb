@@ -28,7 +28,7 @@ func TestServer_ScramAuth_Success(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := scramClientLogin(t, conn, "alice", "hunter2"); err != nil {
 		t.Fatalf("SCRAM login: %v", err)
@@ -44,7 +44,7 @@ func TestServer_ScramAuth_BadPassword(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	err = scramClientLogin(t, conn, "alice", "wrong-password")
 	if err == nil {
@@ -64,7 +64,7 @@ func TestServer_ScramAuth_UnknownUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	err = scramClientLogin(t, conn, "bob", "hunter2")
 	if err == nil {

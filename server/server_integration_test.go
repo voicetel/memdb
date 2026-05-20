@@ -90,7 +90,7 @@ func integrationDB(t *testing.T) *memdb.DB {
 	if err != nil {
 		t.Fatalf("integrationDB: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
@@ -104,7 +104,7 @@ func startIntegServer(t *testing.T, db *memdb.DB, cfg server.Config) string {
 		t.Fatalf("listen: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	cfg.ListenAddr = addr
 	srv := server.New(db, cfg)
@@ -116,7 +116,7 @@ func startIntegServer(t *testing.T, db *memdb.DB, cfg server.Config) string {
 	for time.Now().Before(deadline) {
 		c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
 		if err == nil {
-			c.Close()
+			_ = c.Close()
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -258,7 +258,7 @@ func TestServer_TLS_ClientConnects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TLS dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	doStartup(t, conn, "memdb")
 
@@ -313,7 +313,7 @@ func TestServer_TLS_MultipleClients(t *testing.T) {
 				errc <- err
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			doStartup(t, conn, "memdb")
 			sendSimpleQuery(t, conn, "SELECT 1")
@@ -341,7 +341,7 @@ func TestServer_TLS_INSERT_and_SELECT(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TLS dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	doStartup(t, conn, "memdb")
 
@@ -402,7 +402,7 @@ func TestServer_TLS_AuthSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TLS dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Send startup.
 	if _, err := conn.Write(startupPacket("alice")); err != nil {
@@ -456,7 +456,7 @@ func TestServer_TLS_AuthFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TLS dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Send startup.
 	if _, err := conn.Write(startupPacket("alice")); err != nil {
@@ -501,7 +501,7 @@ func TestServer_SSLRequest_Declined(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	resp := doStartupWithSSL(t, conn, "memdb")
 	if resp != 'N' {
@@ -539,7 +539,7 @@ func TestServer_SSLRequest_Declined_QueryWorks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	resp := doStartupWithSSL(t, conn, "memdb")
 	if resp != 'N' {
@@ -575,16 +575,16 @@ func TestServer_SSLRequest_MultipleTimes(t *testing.T) {
 
 		resp := doStartupWithSSL(t, conn, "memdb")
 		if resp != 'N' {
-			conn.Close()
+			_ = conn.Close()
 			t.Fatalf("iteration %d: expected 'N', got %q", i, resp)
 		}
 		// Drain AuthOk + ReadyForQuery.
 		buf := make([]byte, 15)
 		if _, err := io.ReadFull(conn, buf); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			t.Fatalf("iteration %d: read startup response: %v", i, err)
 		}
-		conn.Close()
+		_ = conn.Close()
 	}
 }
 
@@ -617,7 +617,7 @@ func TestServer_ConcurrentConnections(t *testing.T) {
 				errCount.Add(1)
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			doStartup(t, conn, "memdb")
 			sendSimpleQuery(t, conn, `SELECT key, value FROM kv LIMIT 5`)
@@ -652,7 +652,7 @@ func TestServer_ConcurrentConnections_TLS(t *testing.T) {
 				errCount.Add(1)
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			doStartup(t, conn, "memdb")
 			sendSimpleQuery(t, conn, `SELECT 1`)
@@ -676,7 +676,7 @@ func TestServer_Stop_RejectsNewConnections(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	srv := server.New(db, server.Config{ListenAddr: addr})
 	go func() { _ = srv.ListenAndServe() }()
@@ -686,7 +686,7 @@ func TestServer_Stop_RejectsNewConnections(t *testing.T) {
 	for time.Now().Before(deadline) {
 		c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
 		if err == nil {
-			c.Close()
+			_ = c.Close()
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -698,7 +698,7 @@ func TestServer_Stop_RejectsNewConnections(t *testing.T) {
 	// New connections must fail.
 	conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 	if err == nil {
-		conn.Close()
+		_ = conn.Close()
 		t.Fatal("expected connection refused after Stop(), got successful dial")
 	}
 }
@@ -716,7 +716,7 @@ func TestServer_Stop_WaitsForInFlight(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	srv := server.New(db, server.Config{ListenAddr: addr})
 	go func() { _ = srv.ListenAndServe() }()
@@ -726,7 +726,7 @@ func TestServer_Stop_WaitsForInFlight(t *testing.T) {
 	for time.Now().Before(deadline) {
 		c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
 		if err == nil {
-			c.Close()
+			_ = c.Close()
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -755,7 +755,7 @@ func TestServer_Stop_WaitsForInFlight(t *testing.T) {
 	}
 
 	// Close the client connection — the handler should exit.
-	conn.Close()
+	_ = conn.Close()
 
 	// Now Stop() must complete within a generous timeout.
 	select {
@@ -792,7 +792,7 @@ func TestServer_AbruptClientClose_OtherConnectionsUnaffected(t *testing.T) {
 		t.Fatalf("conn1 Dial: %v", err)
 	}
 	doStartup(t, conn1, "memdb")
-	conn1.Close() // abrupt close mid-session
+	_ = conn1.Close() // abrupt close mid-session
 
 	// Give the server a moment to notice the EOF.
 	time.Sleep(20 * time.Millisecond)
@@ -802,7 +802,7 @@ func TestServer_AbruptClientClose_OtherConnectionsUnaffected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("conn2 Dial after abrupt close: %v", err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	doStartup(t, conn2, "memdb")
 	sendSimpleQuery(t, conn2, `SELECT value FROM kv WHERE key = 'probe'`)
@@ -825,7 +825,7 @@ func TestServer_OversizeQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	doStartup(t, conn, "memdb")
 
@@ -866,7 +866,7 @@ func TestServer_EmptyQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	doStartup(t, conn, "memdb")
 	sendSimpleQuery(t, conn, "") // empty query string
@@ -903,7 +903,7 @@ func TestServer_Terminate_TLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TLS dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	doStartup(t, conn, "memdb")
 
@@ -942,7 +942,7 @@ func TestServer_Config_Logger_DoesNotBreakNormalOperation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	doStartup(t, conn, "memdb")
 	sendSimpleQuery(t, conn, `SELECT 1`)
@@ -966,7 +966,7 @@ func TestServer_Config_Logger_TLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TLS dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	doStartup(t, conn, "memdb")
 	sendSimpleQuery(t, conn, `SELECT 1`)

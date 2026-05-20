@@ -40,7 +40,7 @@ func TestStartServer_StartsAndServesIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("unexpected status: %d", resp.StatusCode)
@@ -97,7 +97,7 @@ func TestStartServer_ServesNamedEndpoints(t *testing.T) {
 			t.Errorf("GET %s: status %d", url, resp.StatusCode)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 }
 

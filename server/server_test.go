@@ -24,7 +24,7 @@ func dialAndStartup(t *testing.T, addr string) net.Conn {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { conn.Close() })
+	t.Cleanup(func() { _ = conn.Close() })
 
 	// Send startup message: length=8, protocol version 3.0 (196608)
 	startup := []byte{0, 0, 0, 8, 0, 3, 0, 0}
@@ -115,7 +115,7 @@ func startServerWithConfig(t *testing.T, cfg server.Config) (string, *memdb.DB) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 
 	// Grab a free port by binding then immediately releasing it.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -123,7 +123,7 @@ func startServerWithConfig(t *testing.T, cfg server.Config) (string, *memdb.DB) 
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 
 	cfg.ListenAddr = addr
 	srv := server.New(db, cfg)
@@ -206,7 +206,7 @@ func TestServer_BasicAuth_Success(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	ok := doAuthHandshake(t, conn, "secret")
 	if !ok {
@@ -223,7 +223,7 @@ func TestServer_BasicAuth_Failure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	ok := doAuthHandshake(t, conn, "wrongpassword")
 	if ok {
@@ -451,7 +451,7 @@ func TestServer_UnixSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 
 	sockPath := filepath.Join(t.TempDir(), "memdb-test.sock")
 	srv := server.New(db, server.Config{
@@ -477,7 +477,7 @@ func TestServer_UnixSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial unix: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Startup handshake.
 	if _, err := conn.Write([]byte{0, 0, 0, 8, 0, 3, 0, 0}); err != nil {

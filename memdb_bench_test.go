@@ -30,8 +30,8 @@ func benchConfig(b *testing.B) memdb.Config {
 	if err != nil {
 		b.Fatal(err)
 	}
-	f.Close()
-	os.Remove(f.Name())
+	_ = f.Close()
+	_ = os.Remove(f.Name())
 
 	return memdb.Config{
 		FilePath:      f.Name(),
@@ -65,7 +65,7 @@ func openBench(b *testing.B, cfg memdb.Config, rows int) *memdb.DB {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { db.Close() })
+	b.Cleanup(func() { _ = db.Close() })
 
 	for i := 0; i < rows; i++ {
 		if _, err := db.Exec(
@@ -194,7 +194,7 @@ func BenchmarkQuery_RangeScan(b *testing.B) {
 					b.Error(err)
 				}
 			}
-			rows.Close()
+			_ = rows.Close()
 		}
 	})
 }
@@ -445,8 +445,8 @@ func BenchmarkOpen(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		f.Close()
-		os.Remove(f.Name())
+		_ = f.Close()
+		_ = os.Remove(f.Name())
 		cfg := memdb.Config{
 			FilePath:      f.Name(),
 			FlushInterval: -1,
@@ -460,7 +460,7 @@ func BenchmarkOpen(b *testing.B) {
 			b.Fatal(err)
 		}
 		b.StopTimer()
-		db.Close()
+		_ = db.Close()
 		b.StartTimer()
 	}
 }
@@ -473,8 +473,8 @@ func BenchmarkOpenRestore(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	f.Close()
-	os.Remove(f.Name())
+	_ = f.Close()
+	_ = os.Remove(f.Name())
 
 	cfg := memdb.Config{
 		FilePath:      f.Name(),
@@ -501,7 +501,7 @@ func BenchmarkOpenRestore(b *testing.B) {
 	if err := seed.Flush(ctx); err != nil {
 		b.Fatal(err)
 	}
-	seed.Close()
+	_ = seed.Close()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -510,7 +510,7 @@ func BenchmarkOpenRestore(b *testing.B) {
 			b.Fatal(err)
 		}
 		b.StopTimer()
-		db.Close()
+		_ = db.Close()
 		b.StartTimer()
 	}
 }
@@ -523,13 +523,13 @@ func BenchmarkWAL_Append(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	wal, err := memdb.OpenWAL(f.Name())
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { wal.Close() })
+	b.Cleanup(func() { _ = wal.Close() })
 
 	entry := memdb.WALEntry{
 		Timestamp: time.Now().UnixNano(),
@@ -558,13 +558,13 @@ func BenchmarkWAL_Append_Parallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	wal, err := memdb.OpenWAL(f.Name())
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { wal.Close() })
+	b.Cleanup(func() { _ = wal.Close() })
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -591,13 +591,13 @@ func BenchmarkWAL_Replay(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			f.Close()
+			_ = f.Close()
 
 			wal, err := memdb.OpenWAL(f.Name())
 			if err != nil {
 				b.Fatal(err)
 			}
-			b.Cleanup(func() { wal.Close() })
+			b.Cleanup(func() { _ = wal.Close() })
 
 			for i := 0; i < n; i++ {
 				e := memdb.WALEntry{

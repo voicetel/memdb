@@ -32,7 +32,7 @@ func fileDB(b *testing.B, synchronous string) *sql.DB {
 	if err != nil {
 		b.Fatal(err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	db, err := sql.Open("sqlite3", f.Name())
 	if err != nil {
@@ -61,7 +61,7 @@ func fileDB(b *testing.B, synchronous string) *sql.DB {
 		b.Fatal(err)
 	}
 
-	b.Cleanup(func() { db.Close() })
+	b.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
@@ -228,7 +228,7 @@ func BenchmarkCompare_RangeScan(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
-			rows.Close()
+			_ = rows.Close()
 		}
 	})
 
@@ -248,7 +248,7 @@ func BenchmarkCompare_RangeScan(b *testing.B) {
 						b.Fatal(err)
 					}
 				}
-				rows.Close()
+				_ = rows.Close()
 			}
 		})
 	}
@@ -374,7 +374,7 @@ func BenchmarkCompare_ConcurrentRead(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			f.Close()
+			_ = f.Close()
 
 			db, err := sql.Open("sqlite3", f.Name())
 			if err != nil {
@@ -382,7 +382,7 @@ func BenchmarkCompare_ConcurrentRead(b *testing.B) {
 			}
 			// Allow up to 4 concurrent reader connections.
 			db.SetMaxOpenConns(4)
-			b.Cleanup(func() { db.Close() })
+			b.Cleanup(func() { _ = db.Close() })
 
 			pragmas := []string{
 				"PRAGMA journal_mode=WAL",

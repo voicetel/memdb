@@ -138,7 +138,7 @@ func TestSyslogHandler_StructuralSmoke(t *testing.T) {
 	if err != nil {
 		t.Skipf("unixgram listener unavailable: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	defer func() { _ = os.Remove(addr) }()
 	if err := conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 		t.Fatal(err)

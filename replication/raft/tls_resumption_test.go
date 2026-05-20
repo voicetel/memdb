@@ -48,7 +48,7 @@ func TestTLSResumption_NodeDials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Server: accept, write a single byte, then drain to EOF. The byte
 	// triggers the client's record-processing path so any post-handshake
@@ -63,7 +63,7 @@ func TestTLSResumption_NodeDials(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				_, _ = c.Write([]byte{0x42})
 				_, _ = io.Copy(io.Discard, c)
 			}(c)
@@ -91,7 +91,7 @@ func dialAndVerify(t *testing.T, addr string, cfg *tls.Config) tls.ConnectionSta
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := conn.Handshake(); err != nil {
 		t.Fatal(err)
 	}

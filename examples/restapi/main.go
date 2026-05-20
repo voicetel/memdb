@@ -90,7 +90,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("memdb.Open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	s := &server{db: db}
 	mux := http.NewServeMux()
@@ -206,7 +206,7 @@ func (s *server) listTodos(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err, http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	out := make([]Todo, 0)
 	for rows.Next() {

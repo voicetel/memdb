@@ -68,8 +68,8 @@ func pprofConfig(t *testing.T) memdb.Config {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
-	os.Remove(f.Name())
+	_ = f.Close()
+	_ = os.Remove(f.Name())
 
 	return memdb.Config{
 		FilePath:      f.Name(),
@@ -102,7 +102,7 @@ func TestPProf_Writes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	cpuPath := filepath.Join(dir, "pprof_writes.cpu.prof")
 	heapPath := filepath.Join(dir, "pprof_writes.heap.prof")
@@ -162,7 +162,7 @@ func TestPProf_Writes_WAL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	cpuPath := filepath.Join(dir, "pprof_writes_wal.cpu.prof")
 	heapPath := filepath.Join(dir, "pprof_writes_wal.heap.prof")
@@ -227,7 +227,7 @@ func TestPProf_Reads_Replicas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Seed rows so the readers always hit data.
 	const seed = 1000
@@ -352,7 +352,7 @@ func runMixedPProf(t *testing.T, cfg memdb.Config, dir, namePrefix string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Seed rows so the readers always hit data.
 	for i := 0; i < 500; i++ {
@@ -469,7 +469,7 @@ func TestPProf_Flush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Seed enough rows that the flush has real work to do.
 	const rows = 50_000
@@ -577,7 +577,7 @@ func TestPProf_WAL_Replay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CaptureCPUProfile: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := profiling.CaptureHeapProfile(heapPath, func() error { return nil }); err != nil {
 		t.Fatalf("CaptureHeapProfile: %v", err)
@@ -634,7 +634,7 @@ func flushBackendPProf(t *testing.T, name string, wrap func(*backends.LocalBacke
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	const rows = 50_000
 	for i := 0; i < rows; i++ {
@@ -697,7 +697,7 @@ func TestPProf_Writes_Contention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	cpuPath := filepath.Join(dir, "pprof_writes_contention.cpu.prof")
 	mutexPath := filepath.Join(dir, "pprof_writes_contention.mutex.prof")

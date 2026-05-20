@@ -171,7 +171,7 @@ func pickFreeAddr(t testing.TB) string {
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 	return addr
 }
 

@@ -127,7 +127,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer cleanup()
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	out := newPrinter(os.Stdout, *headers, *mode, *separator)
 
@@ -240,7 +240,7 @@ func openWire(opt wireOptions) (*sql.DB, func(), error) {
 	ctx, cancel := context.WithTimeout(context.Background(), opt.ConnectTimeout)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, nil, fmt.Errorf("connect to %s: %w", opt.Addr, err)
 	}
 
@@ -264,7 +264,7 @@ func openSnapshot(path string) (*sql.DB, func(), error) {
 		return nil, nil, fmt.Errorf("create temp: %w", err)
 	}
 	tmpName := tmp.Name()
-	cleanup := func() { os.Remove(tmpName) }
+	cleanup := func() { _ = os.Remove(tmpName) }
 
 	isLegacy, err := memdb.UnwrapSnapshot(in, tmp)
 	if cerr := tmp.Close(); err == nil {
@@ -290,7 +290,7 @@ func openSnapshot(path string) (*sql.DB, func(), error) {
 		return nil, nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		cleanup()
 		return nil, nil, fmt.Errorf("ping sqlite: %w", err)
 	}
@@ -413,7 +413,7 @@ func writeHistory(historyPath string, line *liner.State) error {
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 	return os.Rename(tmpName, historyPath)

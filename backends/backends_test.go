@@ -99,7 +99,7 @@ func TestLocalBackend_WriteAndRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read failed: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	got, err := io.ReadAll(rc)
 	if err != nil {
@@ -198,7 +198,7 @@ func TestCompressedBackend_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompressedBackend.Read failed: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	got, err := io.ReadAll(rc)
 	if err != nil {
@@ -241,7 +241,7 @@ func TestCompressedBackend_Read_CorruptData(t *testing.T) {
 		// Error at open-time — acceptable.
 		return
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	_, err = io.ReadAll(rc)
 	if err == nil {
@@ -289,7 +289,7 @@ func TestEncryptedBackend_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncryptedBackend.Read failed: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	got, err := io.ReadAll(rc)
 	if err != nil {
@@ -416,7 +416,7 @@ func TestCompressedEncrypted_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("composed Read failed: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	got, err := io.ReadAll(rc)
 	if err != nil {

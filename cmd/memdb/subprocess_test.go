@@ -30,7 +30,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "create temp: %v\n", err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	bin := filepath.Join(dir, "memdb")
 	if runtime.GOOS == "windows" {
@@ -179,7 +179,7 @@ func TestBinary_ServeSmoke(t *testing.T) {
 	for {
 		conn, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			break
 		}
 		if time.Now().After(deadline) {
@@ -231,14 +231,14 @@ func TestBinary_ServeUnixSocket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create stale socket: %v", err)
 	}
-	staleConn.Close()
+	_ = staleConn.Close()
 	// Listen.Close() removes the socket; recreate one so the stat catches it.
 	if err := os.WriteFile(sockPath, nil, 0o600); err == nil {
 		// Plain file, not a socket — so the runServe stat branch will see
 		// "not a socket" and skip. That's fine — the cleanup branch is
 		// already covered when previous run left a real socket. We keep
 		// the test as a serve-on-unix smoke without asserting cleanup.
-		os.Remove(sockPath)
+		_ = os.Remove(sockPath)
 	}
 
 	cmd := exec.Command(memdbBinary, "serve",
@@ -268,7 +268,7 @@ func TestBinary_ServeUnixSocket(t *testing.T) {
 	for {
 		conn, err := net.Dial("unix", sockPath)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			return
 		}
 		if time.Now().After(deadline) {
@@ -323,6 +323,6 @@ func freePort() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	return l.Addr().(*net.TCPAddr).Port, nil
 }

@@ -183,7 +183,7 @@ func runServe(file, addr string, flush time.Duration, durability string,
 		path := strings.TrimPrefix(addr, "unix://")
 		if fi, err := os.Stat(path); err == nil && fi.Mode()&os.ModeSocket != 0 {
 			// Existing socket — likely stale from a previous crash.
-			os.Remove(path)
+			_ = os.Remove(path)
 		}
 	}
 

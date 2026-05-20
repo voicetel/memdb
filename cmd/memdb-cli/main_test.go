@@ -28,7 +28,7 @@ func openTestSnapshot(tb testing.TB, rows int) (*sql.DB, func()) {
 		tb.Fatalf("openSnapshot: %v", err)
 	}
 	return db, func() {
-		db.Close()
+		_ = db.Close()
 		cleanup()
 	}
 }
@@ -45,7 +45,7 @@ func TestOpenSnapshot(t *testing.T) {
 			t.Fatalf("open: %v", err)
 		}
 		t.Cleanup(func() {
-			db.Close()
+			_ = db.Close()
 			cleanup()
 		})
 		var n int
@@ -78,7 +78,7 @@ func TestOpenSnapshot(t *testing.T) {
 		if _, err := f.WriteAt([]byte{0xFF}, stat.Size()-1); err != nil {
 			t.Fatal(err)
 		}
-		f.Close()
+		_ = f.Close()
 
 		_, _, err = openSnapshot(path)
 		if err == nil {
@@ -572,7 +572,7 @@ func TestWriteHistory_AtomicRename(t *testing.T) {
 	histPath := filepath.Join(dir, "subdir", "history")
 
 	state := liner.NewLiner()
-	defer state.Close()
+	defer func() { _ = state.Close() }()
 	state.AppendHistory("SELECT * FROM users;")
 	state.AppendHistory(".tables")
 
