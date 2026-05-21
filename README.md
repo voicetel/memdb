@@ -4,7 +4,7 @@ A high-performance, embedded Go database library built on SQLite. All reads and 
 
 Think Redis RDB+AOF semantics with full SQL query power — in a single Go import.
 
-**~3× faster writes than file SQLite. ~37% faster concurrent reads than file SQLite with `ReadPoolSize > 0`.** See [BENCHMARKS.md](./BENCHMARKS.md) for the current v1.8.0 report.
+**~3× faster writes than file SQLite. ~37% faster concurrent reads than file SQLite with `ReadPoolSize > 0`. v1.9.1 shared-READONLY refresh buffer: ~3× mixed-RW writes/s vs v1.8.0.** See [BENCHMARKS.md](./BENCHMARKS.md) for the current report.
 
 ---
 
@@ -1310,7 +1310,7 @@ matching C toolchain to be available on the build host.
 
 ## Benchmarks
 
-> **For the current v1.8.0 report see [BENCHMARKS.md](./BENCHMARKS.md).**
+> **For the current v1.9.x report see [BENCHMARKS.md](./BENCHMARKS.md).**
 > It contains the full throughput table (core DB + Postgres wire server),
 > the `ReplicaRefreshInterval` parameter sweep, the side-by-side vs
 > file-SQLite comparison, and a section-by-section pprof analysis of
@@ -1753,7 +1753,7 @@ memdb/
 │   ├── compressed.go       # zstd compression wrapper (fixed at SpeedFastest)
 │   └── encrypted.go        # AES-256-GCM encryption wrapper (implements AuthenticatedBackend)
 ├── stmt_cache.go           # Prepared-statement cache (writer); multi-statement bypass
-├── BENCHMARKS.md           # v1.8.0 benchmark report with pprof analysis
+├── BENCHMARKS.md           # v1.9.x benchmark report with pprof analysis
 ├── Makefile                # Build, test, lint, benchmark, profiling, release
 └── cmd/
     ├── memdb/              # Server CLI: serve [--pprof], snapshot, restore

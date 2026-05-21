@@ -72,6 +72,37 @@ timings reflect only the operation under measurement, not periodic I/O.
 
 ## What changed since v1.5.0
 
+### v1.9.2 — large-DB pprof characterisation + observability + lint cleanup
+
+No hot-path perf changes; the benchmark numbers in the headline tables
+below are unchanged from v1.9.1. What landed:
+
+- `DB.ReplicaRefreshDivergenceCount()` (`memdb.go`) — public counter
+  bumped when `replicaPool.refresh` ends a tick with replicas pointing
+  at different snapshots (first-refresh partial OR rollback failure).
+  Operators should scrape it; in practice it advances only under SQLite
+  OOM during `sqlite3_deserialize`.
+- `TestPProf_LargeDB_MixedRW` (`memdb_pprof_test.go`) — new pprof
+  scenario at ~100 MiB seeded data. Throughput **9 976 writes/s +
+  80 393 reads/s** with the default 50 ms refresh interval; pprof
+  attributes **62 % cumulative CPU** to `replicaPool.refresh`,
+  **29 % flat** to `runtime.memmove`. Confirms that the per-tick
+  full-image copy still scales with DB size — the v1.9.1
+  shared-READONLY-buffer optimisation eliminated the N-replicas-cost
+  but the 1-copy-per-tick remains linear in payload size. **Session-
+  extension v2.0** (row-level changeset streaming) is the right next
+  lever for large-DB workloads with continuous write activity.
+- Two attempts to remove the C→Go→C round trip in refresh (skip
+  `mattn.Serialize`'s Go-heap copy by calling `sqlite3_serialize`
+  directly from a custom cgo helper) regressed throughput **40–90×**
+  on the large-DB scenario. Writer-held time was identical between
+  baseline and the direct path, yet the workload became
+  single-threaded. Both attempts reverted; the proven `mattn.Serialize
+  → allocSharedSnapshotBuffer` chain remains in place.
+- `golangci-lint` errcheck across the entire codebase: **50 → 0**.
+  Mechanical `_ = X.Close()` / `defer func() { _ = X.Close() }()`
+  pattern applied uniformly. No behaviour change.
+
 ### v1.9.1 — shared read-only deserialize buffer for replicas
 
 The replica refresh path previously called mattn's `Deserialize` on
