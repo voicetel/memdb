@@ -17,6 +17,11 @@ var hookCounter atomic.Uint64
 
 var registeredDriverCount atomic.Uint64
 
+// registerMu serializes the slow path of registerDriver so that a driver name
+// is published into registeredDrivers only after its sql.Register has returned.
+// See registerDriver for the publish-before-register race this prevents.
+var registerMu sync.Mutex
+
 // registerDriver registers a named sqlite3 driver with pragmas applied via
 // ConnectHook. Each unique combination of CacheSize, BusyTimeout, and OnChange
 // gets its own registered driver name, avoiding sql.Register panics on
@@ -48,15 +53,30 @@ func registerDriver(cfg Config) string {
 	}
 	key := fmt.Sprintf("cache=%d,busy=%d%s%s", cfg.CacheSize, cfg.BusyTimeout, fkPart, hookID)
 
+	// Fast path: a name present in registeredDrivers is, by construction in the
+	// slow path below, only ever published AFTER its sql.Register has returned,
+	// so a hit here is guaranteed resolvable by sql.Open.
+	if name, ok := registeredDrivers.Load(key); ok {
+		return name.(string)
+	}
+
+	// Slow path: serialize registration so the name enters registeredDrivers
+	// only once the driver is actually registered with database/sql. The old
+	// LoadOrStore published the name BEFORE sql.Register ran; a concurrent
+	// caller could then Load that name and hand it to sql.Open before
+	// registration completed, hitting sql.Open's "unknown driver" error. The
+	// mutex closes that window and also prevents the duplicate sql.Register
+	// panic.
+	registerMu.Lock()
+	defer registerMu.Unlock()
+
+	// Re-check under the lock: another goroutine may have registered this key
+	// while we waited for the mutex.
 	if name, ok := registeredDrivers.Load(key); ok {
 		return name.(string)
 	}
 
 	name := "sqlite3_memdb_" + fmt.Sprintf("%x", fnv32(key))
-	actual, loaded := registeredDrivers.LoadOrStore(key, name)
-	if loaded {
-		return actual.(string)
-	}
 
 	count := registeredDriverCount.Add(1)
 	if count > 100 && count%100 == 1 {
@@ -111,6 +131,10 @@ func registerDriver(cfg Config) string {
 			return nil
 		},
 	})
+
+	// Publish only after sql.Register has returned: now any concurrent
+	// fast-path Load hit on this key is guaranteed to resolve in sql.Open.
+	registeredDrivers.Store(key, name)
 	return name
 }
 
