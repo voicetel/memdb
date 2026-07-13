@@ -9,7 +9,7 @@ require (
 	github.com/hashicorp/raft v1.7.3
 	github.com/klauspost/compress v1.18.6
 	github.com/lib/pq v1.12.3
-	github.com/mattn/go-sqlite3 v1.14.47
+	github.com/mattn/go-sqlite3 v1.14.48
 	github.com/peterh/liner v1.2.2
 )
 
