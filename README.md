@@ -252,12 +252,20 @@ type Config struct {
 	// Storage backend. Default: LocalBackend{Path: FilePath}.
 	Backend Backend
 
-	// Called after every successful Exec with the SQL and its arguments.
-	// When set, Exec no longer writes locally — the write only happens when
-	// the Raft FSM calls ExecDirect after consensus. Use this to route all
-	// writes through a raft.Node for cluster replication.
-	// If nil, Exec operates locally (standalone mode).
-	OnExec func(sql string, args ...any) error
+	// Called after every successful Exec with the SQL and its arguments,
+	// returning the committed statement's rows-affected count. When set,
+	// Exec no longer writes locally — the write only happens when the
+	// Raft FSM calls ExecDirectResult after consensus, and Exec's
+	// sql.Result reports the returned count. Wire it to
+	// raft.Node.ExecResult for cluster replication.
+	// If nil (and OnExec is nil), Exec operates locally (standalone mode).
+	OnExecResult func(sql string, args []any) (int64, error)
+
+	// Legacy variant of OnExecResult without the count — still supported,
+	// but Exec then reports 0 rows affected for every statement. Clients
+	// that gate on the count (e.g. OpenSIPS msilo over the pg-wire
+	// server) need OnExecResult. Setting both is a configuration error.
+	OnExec func(sql string, args []any) error
 }
 ```
 
@@ -618,7 +626,7 @@ func openClusterNode(tlsCfg *tls.Config, nodeID string) (*memdb.DB, *mraft.Node,
         "node-3=10.0.0.3:7001",
     }
 
-    // node is captured in the OnExec closure below; declare it first.
+    // node is captured in the OnExecResult closure below; declare it first.
     var node *mraft.Node
 
     db, err := memdb.Open(memdb.Config{
@@ -1292,20 +1300,21 @@ matching C toolchain to be available on the build host.
 │                          Caller                               │
 │                 Exec / Query / Begin / WithTx                 │
 └───────┬──────────────────────────────┬────────────────────────┘
-        │ writes (OnExec set)          │ reads (ReadPoolSize > 0)
+        │ writes (hook set)            │ reads (ReadPoolSize > 0)
         ▼                              ▼
-  ┌───────────┐              ┌──────────────────────────────────┐
-  │ OnExec()  │              │        replicaPool (×N)          │
-  │ node.Exec │              │  channel-based exclusive checkout│
-  └─────┬─────┘              │  sqlite3_serialize/deserialize   │
-        │                    │  N independent :memory: DBs      │
-        │ IsLeader?          │  refreshed every 50 ms (default) │
+  ┌─────────────────┐        ┌──────────────────────────────────┐
+  │ OnExecResult()  │        │        replicaPool (×N)          │
+  │ node.ExecResult │        │  channel-based exclusive checkout│
+  └─────┬───────────┘        │  per-replica stmt cache          │
+        │                    │  sqlite3_serialize/deserialize   │
+        │ IsLeader?          │  N independent :memory: DBs      │
+        │                    │  refreshed every 50 ms (default) │
         │                    └──────────────────────────────────┘
         ├─ Yes ──────────────────────────────────────┐
         │                                            │
         │  No: dial leader ForwardAddr (TLS)         │
         │  → ForwardRequest{SQL, Args}               │
-        │  ← ForwardResponse{Err}                    │
+        │  ← ForwardResponse{Err, RowsAffected}      │
         │                                            │
         └────────────────────────────────────────────┤
                                                      ▼
@@ -1319,7 +1328,8 @@ matching C toolchain to be available on the build host.
                                     ┌────────────────────────────┐
                                     │   Writer (×1) per node     │
                                     │   SQLite :memory:          │
-                                    │   ExecDirect (no OnExec)   │
+                                    │   ExecDirectResult (no     │
+                                    │   replication hook)        │
                                     └──────────┬─────────────────┘
                                                │
                            ┌───────────────────┤
@@ -1393,8 +1403,8 @@ which previously accounted for ~25% of total CPU under `DurabilityWAL` in pprof 
 A zero-alloc optimisation pre-reserves the 4-byte length prefix in the pool buffer,
 eliminating a `make+copy` per write. `BenchmarkWAL_Append` measures **~568 ns/op,
 0 B/op, 0 allocs/op** (down from 2,809 ns/op, 1,602 B/op, 20 allocs/op pre-binary-codec).
-End-to-end WAL-durability insert throughput in `TestPProf_Writes_WAL` reaches 298k
-writes/s. Even with the per-write `fsync` included, `DurabilityWAL` (3,144 ns/op) remains
+End-to-end WAL-durability insert throughput in `TestPProf_Writes_WAL` reaches ~364k
+writes/s (v1.10.0 capture). Even with the per-write `fsync` included, `DurabilityWAL` (3,144 ns/op) remains
 **2.33× faster than `file/sync=off`** (7,338 ns/op) on INSERT — you get near-zero data
 loss durability while still beating an unprotected file database.
 
@@ -1462,8 +1472,9 @@ x86_64 box; dominated by the `write(2)` + `fsync` syscall pair, not the encoder 
 see the WAL on-disk format section below for the binary v1 layout), making
 `DurabilityWAL` practical for most workloads. Replay is perfectly linear (10× entries
 = ~10× time). A 10,000-entry WAL replays in ~9 ms; the prepared-statement cache on the
-writer brings end-to-end replay throughput on `TestPProf_WAL_Replay` to ~164k entries/s
-by reusing one `*sql.Stmt` per distinct SQL string instead of preparing on every entry.
+writer brings end-to-end replay throughput on `TestPProf_WAL_Replay` to ~331k entries/s
+(v1.10.0 capture) by reusing one `*sql.Stmt` per distinct SQL string instead of
+preparing on every entry.
 
 ## WAL on-disk format
 

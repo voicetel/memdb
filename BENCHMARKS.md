@@ -153,10 +153,16 @@ round evidence in `coverage/pprof-round1/` for shapes):
    writer connection and GOMAXPROCS replicas at 100 % CPU. A property
    of running at saturation, not a fixable code path.
 
+### v1.9.3 — driver-registration race fix
+
+No perf impact: `registerDriver` now registers the sqlite driver before
+publishing its name, closing a startup race under concurrent `Open`.
+
 ### v1.9.2 — large-DB pprof characterisation + observability + lint cleanup
 
-No hot-path perf changes; the benchmark numbers in the headline tables
-below are unchanged from v1.9.1. What landed:
+No hot-path perf changes (the v1.9.1/v1.9.2 headline numbers of the era
+are preserved in the per-release notes; the tables above were re-captured
+at v1.10.0). What landed:
 
 - `DB.ReplicaRefreshDivergenceCount()` (`memdb.go`) — public counter
   bumped when `replicaPool.refresh` ends a tick with replicas pointing
