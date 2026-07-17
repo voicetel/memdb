@@ -210,11 +210,11 @@ func runServe(file, addr string, flush time.Duration, durability string,
 		}()
 	}
 
-	// nodeExec is assigned after the Raft node is built. The OnExec closure
-	// captures it by reference so memdb.Open can be called before the node
-	// exists — ListenAndServe only starts after assignment, so the nil
-	// window is never observable to a concurrent caller.
-	var nodeExec func(sql string, args ...any) error
+	// nodeExec is assigned after the Raft node is built. The OnExecResult
+	// closure captures it by reference so memdb.Open can be called before
+	// the node exists — ListenAndServe only starts after assignment, so the
+	// nil window is never observable to a concurrent caller.
+	var nodeExec func(sql string, args ...any) (int64, error)
 	memCfg := memdb.Config{
 		FilePath:      file,
 		FlushInterval: flush,
@@ -224,7 +224,7 @@ func runServe(file, addr string, flush time.Duration, durability string,
 		},
 	}
 	if raftCfg.enabled() {
-		memCfg.OnExec = func(sql string, args []any) error {
+		memCfg.OnExecResult = func(sql string, args []any) (int64, error) {
 			return nodeExec(sql, args...)
 		}
 	}
@@ -242,7 +242,7 @@ func runServe(file, addr string, flush time.Duration, durability string,
 			slog.Error("raft start failed", "error", err)
 			os.Exit(1)
 		}
-		nodeExec = node.Exec
+		nodeExec = node.ExecResult
 		defer func() {
 			if err := node.Shutdown(); err != nil {
 				slog.Warn("raft shutdown error", "error", err)

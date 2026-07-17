@@ -215,11 +215,25 @@ func (h *handler) handleBind(body []byte) error {
 		if format != 0 {
 			return h.extendedErrf("Bind: binary parameter format not supported (param %d)", i+1)
 		}
-		// Text format: hand the raw bytes as a string. SQLite does its
-		// own coercion based on column type, so passing strings into
-		// integer/real/blob columns works the same way "?" parameters
-		// from the simple-query path do.
-		args[i] = string(body[pos : pos+int(paramLen)])
+		// Text format. A parameter declared bytea at Parse time (OID 17)
+		// arrives in one of PG's textual bytea input encodings — hex
+		// ("\x0d0a…", what modern libpq/pgx/lib/pq emit) or the legacy
+		// octal escape format — and must be decoded to raw bytes here;
+		// binding the text through to SQLite would store the encoded
+		// string literally. Everything else is handed through as a
+		// string: SQLite does its own coercion based on column type, so
+		// passing strings into integer/real columns works the same way
+		// "?" parameters from the simple-query path do.
+		val := body[pos : pos+int(paramLen)]
+		if i < len(stmt.paramOIDs) && stmt.paramOIDs[i] == 17 {
+			decoded, err := decodeByteaText(val)
+			if err != nil {
+				return h.extendedErrf("Bind: param %d: %v", i+1, err)
+			}
+			args[i] = decoded
+		} else {
+			args[i] = string(val)
+		}
 		pos += int(paramLen)
 	}
 
@@ -524,6 +538,76 @@ func countDollarPlaceholders(sql string) int {
 	return maxN
 }
 
+// decodeByteaText decodes PostgreSQL's textual bytea input encodings to
+// raw bytes, mirroring the server-side byteain input function:
+//
+//   - hex format: "\x" followed by hex digit pairs; whitespace is
+//     permitted between pairs (PG docs §8.4). This is what libpq emits
+//     when the advertised server_version is ≥ 9.0.
+//   - legacy escape format: "\\" for a literal backslash, "\ooo" (first
+//     octal digit 0–3) for an arbitrary byte, every other byte literal.
+func decodeByteaText(s []byte) ([]byte, error) {
+	if len(s) >= 2 && s[0] == '\\' && s[1] == 'x' {
+		out := make([]byte, 0, (len(s)-2)/2)
+		var hi byte
+		havePair := false
+		for _, c := range s[2:] {
+			if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+				if havePair {
+					return nil, fmt.Errorf("invalid hexadecimal data: whitespace inside digit pair")
+				}
+				continue
+			}
+			var d byte
+			switch {
+			case c >= '0' && c <= '9':
+				d = c - '0'
+			case c >= 'a' && c <= 'f':
+				d = c - 'a' + 10
+			case c >= 'A' && c <= 'F':
+				d = c - 'A' + 10
+			default:
+				return nil, fmt.Errorf("invalid hexadecimal digit %q in bytea input", c)
+			}
+			if havePair {
+				out = append(out, hi<<4|d)
+				havePair = false
+			} else {
+				hi = d
+				havePair = true
+			}
+		}
+		if havePair {
+			return nil, fmt.Errorf("invalid hexadecimal data: odd number of digits")
+		}
+		return out, nil
+	}
+
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != '\\' {
+			out = append(out, c)
+			continue
+		}
+		if i+1 < len(s) && s[i+1] == '\\' {
+			out = append(out, '\\')
+			i++
+			continue
+		}
+		if i+3 < len(s) &&
+			s[i+1] >= '0' && s[i+1] <= '3' &&
+			s[i+2] >= '0' && s[i+2] <= '7' &&
+			s[i+3] >= '0' && s[i+3] <= '7' {
+			out = append(out, (s[i+1]-'0')<<6|(s[i+2]-'0')<<3|(s[i+3]-'0'))
+			i += 3
+			continue
+		}
+		return nil, fmt.Errorf("invalid input syntax for type bytea")
+	}
+	return out, nil
+}
+
 // isQueryVerb reports whether the SQL verb returns rows. The same
 // keyword set the simple-query dispatch uses (handler.go) — keeping
 // them in sync ensures Describe and Execute take consistent paths.
@@ -721,7 +805,7 @@ func (h *handler) streamPortalRows(p *portal, maxRows int) (int64, error) {
 				}
 				rb.cellBuf = encodeCellBinary(rb.cellBuf, oid, v)
 			} else {
-				rb.cellBuf = appendCell(rb.cellBuf, v)
+				rb.cellBuf = appendCellText(rb.cellBuf, v)
 			}
 			rb.cellOffsets[2*i] = start
 			rb.cellOffsets[2*i+1] = len(rb.cellBuf) - start

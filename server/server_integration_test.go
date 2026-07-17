@@ -164,14 +164,8 @@ func doStartup(t *testing.T, conn net.Conn, user string) {
 	if buf[0] != 'R' {
 		t.Fatalf("doStartup: expected 'R', got %q (full: %x)", buf[0], buf)
 	}
-	// Expect ReadyForQuery ('Z', length=5, 'I').
-	rdy := make([]byte, 6)
-	if _, err := io.ReadFull(conn, rdy); err != nil {
-		t.Fatalf("doStartup read rdy: %v", err)
-	}
-	if rdy[0] != 'Z' {
-		t.Fatalf("doStartup: expected 'Z', got %q", rdy[0])
-	}
+	// Skip ParameterStatus frames, then expect ReadyForQuery.
+	skipToReadyForQuery(t, conn)
 }
 
 // doStartupWithSSL sends an SSLRequest first, reads the server's single-byte
@@ -426,20 +420,14 @@ func TestServer_TLS_AuthSuccess(t *testing.T) {
 	if _, err := conn.Write(pmsg); err != nil {
 		t.Fatalf("write password: %v", err)
 	}
-	// Expect AuthenticationOk then ReadyForQuery.
+	// Expect AuthenticationOk, ParameterStatus frames, then ReadyForQuery.
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		t.Fatalf("read auth ok: %v", err)
 	}
 	if buf[0] != 'R' {
 		t.Fatalf("expected AuthenticationOk 'R', got %q", buf[0])
 	}
-	rdy := make([]byte, 6)
-	if _, err := io.ReadFull(conn, rdy); err != nil {
-		t.Fatalf("read rdy: %v", err)
-	}
-	if rdy[0] != 'Z' {
-		t.Fatalf("expected 'Z', got %q", rdy[0])
-	}
+	skipToReadyForQuery(t, conn)
 }
 
 // TestServer_TLS_AuthFailure verifies that wrong credentials over TLS cause
@@ -508,7 +496,8 @@ func TestServer_SSLRequest_Declined(t *testing.T) {
 		t.Errorf("expected SSL decline 'N', got %q (%d)", resp, resp)
 	}
 
-	// After the decline + startup, the server should send AuthOk + ReadyForQuery.
+	// After the decline + startup, the server should send AuthOk,
+	// ParameterStatus frames, then ReadyForQuery.
 	buf := make([]byte, 9)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		t.Fatalf("read AuthOk: %v", err)
@@ -516,13 +505,7 @@ func TestServer_SSLRequest_Declined(t *testing.T) {
 	if buf[0] != 'R' {
 		t.Fatalf("expected 'R' after SSLRequest decline, got %q", buf[0])
 	}
-	rdy := make([]byte, 6)
-	if _, err := io.ReadFull(conn, rdy); err != nil {
-		t.Fatalf("read ReadyForQuery: %v", err)
-	}
-	if rdy[0] != 'Z' {
-		t.Fatalf("expected 'Z' after SSLRequest decline, got %q", rdy[0])
-	}
+	skipToReadyForQuery(t, conn)
 }
 
 // TestServer_SSLRequest_Declined_QueryWorks verifies that a client that
@@ -546,11 +529,15 @@ func TestServer_SSLRequest_Declined_QueryWorks(t *testing.T) {
 		t.Fatalf("expected 'N', got %q", resp)
 	}
 
-	// Complete auth + ready.
-	buf := make([]byte, 15) // 9 (AuthOk) + 6 (ReadyForQuery)
+	// Complete auth + ready: AuthOk, ParameterStatus frames, ReadyForQuery.
+	buf := make([]byte, 9)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		t.Fatalf("read startup response: %v", err)
 	}
+	if buf[0] != 'R' {
+		t.Fatalf("expected 'R', got %q", buf[0])
+	}
+	skipToReadyForQuery(t, conn)
 
 	sendSimpleQuery(t, conn, `SELECT value FROM kv WHERE key = 'ssl-test'`)
 	rows := drainToReady(t, conn)
@@ -578,12 +565,13 @@ func TestServer_SSLRequest_MultipleTimes(t *testing.T) {
 			_ = conn.Close()
 			t.Fatalf("iteration %d: expected 'N', got %q", i, resp)
 		}
-		// Drain AuthOk + ReadyForQuery.
-		buf := make([]byte, 15)
+		// Drain AuthOk + ParameterStatus frames + ReadyForQuery.
+		buf := make([]byte, 9)
 		if _, err := io.ReadFull(conn, buf); err != nil {
 			_ = conn.Close()
 			t.Fatalf("iteration %d: read startup response: %v", i, err)
 		}
+		skipToReadyForQuery(t, conn)
 		_ = conn.Close()
 	}
 }

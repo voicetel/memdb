@@ -13,7 +13,7 @@ import (
 // state machine. All nodes in the cluster apply the same WAL entries in
 // the same order via Raft consensus.
 type FSM struct {
-	execFn       func(sql string, args ...any) error
+	execFn       func(sql string, args ...any) (int64, error)
 	serializeFn  func() ([]byte, error)
 	restoreFn    func([]byte) error
 	onApplyError func(error) // optional; called when Apply fails
@@ -23,8 +23,30 @@ type FSM struct {
 // execFn applies a SQL statement to the local state.
 // serializeFn returns the full DB as a byte slice (sqlite3_serialize).
 // restoreFn replaces the full DB from a byte slice (sqlite3_deserialize).
+//
+// An FSM built this way reports 0 rows affected for every entry because
+// execFn cannot carry the count; use NewResultFSM when the caller can
+// provide it (memdb.DB.ExecDirectResult can).
 func NewFSM(
 	execFn func(sql string, args ...any) error,
+	serializeFn func() ([]byte, error),
+	restoreFn func([]byte) error,
+) *FSM {
+	return NewResultFSM(
+		func(sql string, args ...any) (int64, error) {
+			return 0, execFn(sql, args...)
+		},
+		serializeFn,
+		restoreFn,
+	)
+}
+
+// NewResultFSM is NewFSM with an execFn that also returns the number of
+// rows the statement affected. On the leader, Apply returns that count as
+// the Raft future response so it can travel back to the original Exec
+// caller (see ApplyResult / Node.ExecResult).
+func NewResultFSM(
+	execFn func(sql string, args ...any) (int64, error),
 	serializeFn func() ([]byte, error),
 	restoreFn func([]byte) error,
 ) *FSM {
@@ -73,7 +95,8 @@ func (f *FSM) Apply(log *raft.Log) (result any) {
 	if err != nil {
 		return fmt.Errorf("raft fsm: decode: %w", err)
 	}
-	if err := f.execFn(entry.SQL, entry.Args...); err != nil {
+	rowsAffected, err := f.execFn(entry.SQL, entry.Args...)
+	if err != nil {
 		applyErr := fmt.Errorf("raft fsm: exec: %w", err)
 		if f.onApplyError != nil {
 			func() {
@@ -83,7 +106,10 @@ func (f *FSM) Apply(log *raft.Log) (result any) {
 		}
 		return applyErr
 	}
-	return nil
+	// On success the future response is the rows-affected count, read back
+	// by ApplyResult on the leader. Followers apply the same entry but
+	// their return value is discarded by hashicorp/raft.
+	return rowsAffected
 }
 
 // Snapshot produces a point-in-time snapshot for Raft log compaction.
@@ -131,17 +157,33 @@ func (s *fsmSnapshot) Release() {}
 // the FSM Apply path showed encoding/gob accounting for ~31% of CPU; the
 // binary codec is the same one already used by the WAL hot path.
 func Apply(r *raft.Raft, entry replication.WALEntry, timeout time.Duration) error {
+	_, err := ApplyResult(r, entry, timeout)
+	return err
+}
+
+// ApplyResult is Apply returning the rows-affected count the FSM produced
+// for the committed entry (the Raft future response). An FSM built with
+// NewFSM (no count support) yields 0.
+func ApplyResult(r *raft.Raft, entry replication.WALEntry, timeout time.Duration) (int64, error) {
 	data, err := replication.EncodeEntry(nil, entry)
 	if err != nil {
-		return fmt.Errorf("raft: encode entry: %w", err)
+		return 0, fmt.Errorf("raft: encode entry: %w", err)
 	}
 
 	future := r.Apply(data, timeout)
 	if err := future.Error(); err != nil {
-		return fmt.Errorf("raft: apply: %w", err)
+		return 0, fmt.Errorf("raft: apply: %w", err)
 	}
-	if resp, ok := future.Response().(error); ok && resp != nil {
-		return resp
+	switch resp := future.Response().(type) {
+	case error:
+		if resp != nil {
+			return 0, resp
+		}
+		return 0, nil
+	case int64:
+		return resp, nil
+	default:
+		// nil or a foreign type — an FSM predating the count contract.
+		return 0, nil
 	}
-	return nil
 }

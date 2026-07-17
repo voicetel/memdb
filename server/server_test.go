@@ -41,16 +41,28 @@ func dialAndStartup(t *testing.T, addr string) net.Conn {
 		t.Fatalf("expected AuthenticationOk ('R'), got %q", buf[0])
 	}
 
-	// Read ReadyForQuery: 'Z' + length=5 + 'I'  (6 bytes total)
-	rdy := make([]byte, 6)
-	if _, err := io.ReadFull(conn, rdy); err != nil {
-		t.Fatalf("reading ReadyForQuery: %v", err)
-	}
-	if rdy[0] != 'Z' {
-		t.Fatalf("expected ReadyForQuery ('Z'), got %q", rdy[0])
-	}
+	// Skip ParameterStatus frames, then expect ReadyForQuery.
+	skipToReadyForQuery(t, conn)
 
 	return conn
+}
+
+// skipToReadyForQuery consumes ParameterStatus ('S') frames until the
+// ReadyForQuery ('Z') that ends the startup exchange. Any other message
+// type is a protocol violation.
+func skipToReadyForQuery(t *testing.T, conn net.Conn) {
+	t.Helper()
+	for {
+		msgType, _ := readMessage(t, conn)
+		switch msgType {
+		case 'S':
+			continue
+		case 'Z':
+			return
+		default:
+			t.Fatalf("expected ParameterStatus ('S') or ReadyForQuery ('Z'), got %q", msgType)
+		}
+	}
 }
 
 // sendQuery writes a Simple Query ('Q') message to conn.
@@ -187,11 +199,8 @@ func doAuthHandshake(t *testing.T, conn net.Conn, password string) bool {
 		t.Fatalf("expected AuthenticationOk ('R' body=0), got type=%q body=%v", msgType, body)
 	}
 
-	// Read ReadyForQuery
-	msgType, _ = readMessage(t, conn)
-	if msgType != 'Z' {
-		t.Fatalf("expected ReadyForQuery ('Z'), got %q", msgType)
-	}
+	// Skip ParameterStatus frames, then expect ReadyForQuery.
+	skipToReadyForQuery(t, conn)
 	return true
 }
 
@@ -493,14 +502,8 @@ func TestServer_UnixSocket(t *testing.T) {
 		t.Fatalf("expected 'R', got %q", authBuf[0])
 	}
 
-	// Read ReadyForQuery (6 bytes).
-	rdyBuf := make([]byte, 6)
-	if _, err := io.ReadFull(conn, rdyBuf); err != nil {
-		t.Fatalf("reading ReadyForQuery: %v", err)
-	}
-	if rdyBuf[0] != 'Z' {
-		t.Fatalf("expected 'Z', got %q", rdyBuf[0])
-	}
+	// Skip ParameterStatus frames, then expect ReadyForQuery.
+	skipToReadyForQuery(t, conn)
 
 	// Send a query and verify we get a response.
 	body := append([]byte("SELECT 1"), 0)

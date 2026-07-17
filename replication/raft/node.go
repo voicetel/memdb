@@ -126,6 +126,17 @@ type DB interface {
 	Restore(data []byte) error
 }
 
+// ResultDB is an optional extension of DB. When the value passed to NewNode
+// also implements it, the FSM applies entries through ExecLocalResult and
+// the rows-affected count is returned to Exec/ExecResult callers on the
+// leader (and to forwarded followers via ForwardResponse). memdb.DB
+// satisfies it via ExecDirectResult.
+type ResultDB interface {
+	// ExecLocalResult applies SQL directly to the local database, bypassing
+	// Raft, and returns the number of rows the statement affected.
+	ExecLocalResult(sql string, args ...any) (int64, error)
+}
+
 // logger returns the slog.Logger to use, falling back to slog.Default() when
 // no logger was provided in NodeConfig.
 func (n *Node) logger() *slog.Logger {
@@ -299,10 +310,17 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	// ── FSM ──────────────────────────────────────────────────────────────────
 	node := &Node{cfg: cfg, transport: transport}
 
-	fsm := NewFSM(
-		func(sql string, args ...any) error {
-			return db.ExecLocal(sql, args...)
-		},
+	// Prefer the count-carrying apply when the DB supports it so the
+	// rows-affected count reaches ExecResult callers; fall back to the
+	// legacy error-only apply (count always 0) otherwise.
+	execFn := func(sql string, args ...any) (int64, error) {
+		return 0, db.ExecLocal(sql, args...)
+	}
+	if rdb, ok := db.(ResultDB); ok {
+		execFn = rdb.ExecLocalResult
+	}
+	fsm := NewResultFSM(
+		execFn,
 		func() ([]byte, error) {
 			return db.Serialize()
 		},
@@ -458,6 +476,15 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 // is transparently forwarded to the leader using a pooled TLS connection.
 // Otherwise ErrNotLeader is returned.
 func (n *Node) Exec(sql string, args ...any) error {
+	_, err := n.ExecResult(sql, args...)
+	return err
+}
+
+// ExecResult is Exec returning the number of rows the committed statement
+// affected. The count originates from the FSM apply on the leader (see
+// ResultDB); on the forwarded-follower path it arrives in ForwardResponse.
+// A cluster whose DB does not implement ResultDB reports 0.
+func (n *Node) ExecResult(sql string, args ...any) (int64, error) {
 	// If we are the leader, apply directly through Raft.
 	if n.raft.State() == hraft.Leader {
 		entry := replication.WALEntry{
@@ -470,13 +497,13 @@ func (n *Node) Exec(sql string, args ...any) error {
 			SQL:       sql,
 			Args:      args,
 		}
-		return Apply(n.raft, entry, n.cfg.ApplyTimeout)
+		return ApplyResult(n.raft, entry, n.cfg.ApplyTimeout)
 	}
 
 	// We are not the leader. Forward to the leader using the connection pool.
 	leaderAddr, leaderID := n.raft.LeaderWithID()
 	if leaderAddr == "" {
-		return fmt.Errorf("%w: no leader elected yet", ErrNotLeader)
+		return 0, fmt.Errorf("%w: no leader elected yet", ErrNotLeader)
 	}
 
 	n.logger().Debug("memdb raft: forwarding write to leader",
@@ -489,7 +516,7 @@ func (n *Node) Exec(sql string, args ...any) error {
 		// Pool not yet initialised (leader just elected) — try to build one.
 		pool = n.poolForLeader(string(leaderID))
 		if pool == nil {
-			return fmt.Errorf("%w: leader is %s (configure ForwardPeers to enable transparent forwarding)", ErrNotLeader, leaderID)
+			return 0, fmt.Errorf("%w: leader is %s (configure ForwardPeers to enable transparent forwarding)", ErrNotLeader, leaderID)
 		}
 		// Store only if nobody beat us to it; if they did, use theirs and
 		// discard the one we just created.

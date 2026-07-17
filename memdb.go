@@ -26,11 +26,11 @@ import (
 // writer connection. Reads may observe a replica that is slightly behind the
 // writer (bounded by Config.ReplicaRefreshInterval).
 //
-// When Config.OnExec is set (Raft replication mode), Exec routes writes
-// exclusively through OnExec — the local database is only written by the
-// Raft FSM via ExecLocal after consensus is reached. Transactions (Begin,
-// BeginTx, WithTx) are not supported in this mode because they cannot
-// span consensus rounds.
+// When Config.OnExecResult (or the legacy OnExec) is set — Raft replication
+// mode — Exec routes writes exclusively through the hook; the local database
+// is only written by the Raft FSM via ExecLocal after consensus is reached.
+// Transactions (Begin, BeginTx, WithTx) are not supported in this mode
+// because they cannot span consensus rounds.
 type DB struct {
 	mem      *sql.DB // single writer connection (also used for Flush/WAL)
 	cfg      Config
@@ -230,16 +230,25 @@ func (d *DB) writeDurability(ctx context.Context, query string, args []any) erro
 
 // execDirect writes SQL directly to the local in-memory database, bypassing
 // the OnExec hook. Used by the Raft FSM to apply committed log entries on
-// every node without re-entering the replication path.
-func (d *DB) execDirect(query string, args ...any) error {
+// every node without re-entering the replication path. Returns the number
+// of rows the statement affected.
+func (d *DB) execDirect(query string, args ...any) (int64, error) {
 	if d.closed.Load() {
-		return ErrClosed
+		return 0, ErrClosed
 	}
-	if _, err := d.stmts.ExecContext(context.Background(), query, args...); err != nil {
-		return err
+	result, err := d.stmts.ExecContext(context.Background(), query, args...)
+	if err != nil {
+		return 0, err
 	}
+	// RowsAffected can return an error for drivers that don't support it;
+	// mattn/go-sqlite3 always does, but treat a failure as "0 rows" rather
+	// than failing a write that already applied.
+	rowsAffected, _ := result.RowsAffected()
 	d.bumpWriteGen()
-	return d.writeDurability(context.Background(), query, args)
+	if err := d.writeDurability(context.Background(), query, args); err != nil {
+		return 0, err
+	}
+	return rowsAffected, nil
 }
 
 // ExecDirect writes SQL directly to the local in-memory database, bypassing
@@ -247,15 +256,32 @@ func (d *DB) execDirect(query string, args ...any) error {
 // log entries without re-entering the replication path. Do not call this
 // directly in application code.
 func (d *DB) ExecDirect(query string, args ...any) error {
+	_, err := d.execDirect(query, args...)
+	return err
+}
+
+// ExecDirectResult is ExecDirect returning the number of rows the statement
+// affected. The Raft FSM adapter should prefer this over ExecDirect so the
+// count can travel back through the consensus response to the leader's Exec
+// caller (see Config.OnExecResult). Do not call this directly in
+// application code.
+func (d *DB) ExecDirectResult(query string, args ...any) (int64, error) {
 	return d.execDirect(query, args...)
+}
+
+// replicated reports whether writes are routed through a replication hook
+// (OnExec or OnExecResult). Transactions are unsupported in this mode
+// because they cannot span consensus rounds.
+func (d *DB) replicated() bool {
+	return d.cfg.OnExec != nil || d.cfg.OnExecResult != nil
 }
 
 // Exec executes a query against the in-memory DB.
 //
-// When OnExec is set the write must go through Raft consensus first.
-// The FSM will call ExecDirect on every node (including this one) once
-// the entry is committed. Writing locally here would cause split-brain
-// on non-leader nodes.
+// When a replication hook (OnExecResult / OnExec) is set the write must go
+// through Raft consensus first. The FSM will call ExecDirect on every node
+// (including this one) once the entry is committed. Writing locally here
+// would cause split-brain on non-leader nodes.
 func (d *DB) Exec(query string, args ...any) (sql.Result, error) {
 	return d.ExecContext(context.Background(), query, args...)
 }
@@ -272,16 +298,25 @@ func (d *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Re
 		return nil, err
 	}
 
-	// When OnExec is set the write must go through Raft consensus first.
-	// The FSM will call execDirect on every node (including this one) once
-	// the entry is committed. Writing locally here would cause split-brain
-	// on non-leader nodes.
+	// When a replication hook is set the write must go through Raft
+	// consensus first. The FSM will call execDirect on every node
+	// (including this one) once the entry is committed. Writing locally
+	// here would cause split-brain on non-leader nodes.
+	if d.cfg.OnExecResult != nil {
+		rowsAffected, err := d.cfg.OnExecResult(query, args)
+		if err != nil {
+			return nil, err
+		}
+		return driver.RowsAffected(rowsAffected), nil
+	}
 	if d.cfg.OnExec != nil {
 		if err := d.cfg.OnExec(query, args); err != nil {
 			return nil, err
 		}
-		// Return a synthetic result — the actual rows-affected count is not
-		// available after a Raft round-trip without significant extra work.
+		// Legacy hook: the rows-affected count cannot travel back through
+		// a func that only returns error. Callers that gate on the count
+		// (e.g. pg-wire clients like OpenSIPS msilo) must wire
+		// OnExecResult instead.
 		return driver.RowsAffected(0), nil
 	}
 
@@ -336,7 +371,9 @@ func (d *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.
 		// All replicas busy or refresh in progress — fall back to the writer.
 		return d.stmts.QueryContext(ctx, query, args...)
 	}
-	rows, err := r.QueryContext(ctx, query, args...)
+	// Route through the replica's prepared-statement cache — a replica
+	// read otherwise pays a full sqlite3_prepare per call.
+	rows, err := d.replica.stmts(r).QueryContext(ctx, query, args...)
 	rel.Release()
 	if err != nil {
 		return nil, err
@@ -370,11 +407,13 @@ func (d *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sq
 	// Return the replica immediately — QueryRow buffers its result internally
 	// so the replica connection is not needed once QueryRow returns.
 	defer rel.Release()
-	return r.QueryRowContext(ctx, query, args...)
+	// Route through the replica's prepared-statement cache — a replica
+	// read otherwise pays a full sqlite3_prepare per call.
+	return d.replica.stmts(r).QueryRowContext(ctx, query, args...)
 }
 
 // Begin starts a transaction against the in-memory DB.
-// Returns ErrTransactionNotSupported when OnExec is set (Raft mode).
+// Returns ErrTransactionNotSupported when a replication hook is set (Raft mode).
 //
 // The write generation counter is bumped pessimistically when a transaction
 // is opened because we cannot intercept Tx.Commit without changing the
@@ -387,7 +426,7 @@ func (d *DB) Begin() (*sql.Tx, error) {
 	if d.closed.Load() {
 		return nil, ErrClosed
 	}
-	if d.cfg.OnExec != nil {
+	if d.replicated() {
 		return nil, ErrTransactionNotSupported
 	}
 	tx, err := d.mem.Begin()
@@ -399,7 +438,7 @@ func (d *DB) Begin() (*sql.Tx, error) {
 }
 
 // BeginTx starts a transaction with the provided context and options.
-// Returns ErrTransactionNotSupported when OnExec is set (Raft mode).
+// Returns ErrTransactionNotSupported when a replication hook is set (Raft mode).
 //
 // The write generation counter is bumped pessimistically — see Begin for
 // the rationale.
@@ -407,7 +446,7 @@ func (d *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) 
 	if d.closed.Load() {
 		return nil, ErrClosed
 	}
-	if d.cfg.OnExec != nil {
+	if d.replicated() {
 		return nil, ErrTransactionNotSupported
 	}
 	tx, err := d.mem.BeginTx(ctx, opts)
@@ -664,9 +703,9 @@ func (d *DB) flushLoop() {
 
 // WithTx runs fn inside a transaction. Commits on nil return, rolls back otherwise.
 // Transactions always run on the single writer connection regardless of ReadPoolSize.
-// Returns ErrTransactionNotSupported when OnExec is set (Raft mode).
+// Returns ErrTransactionNotSupported when a replication hook is set (Raft mode).
 func WithTx(ctx context.Context, d *DB, fn func(*sql.Tx) error) error {
-	if d.cfg.OnExec != nil {
+	if d.replicated() {
 		return ErrTransactionNotSupported
 	}
 	tx, err := d.BeginTx(ctx, nil)

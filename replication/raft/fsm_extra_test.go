@@ -55,8 +55,8 @@ func TestFSM_SetApplyErrorHandler_NotCalledOnSuccess(t *testing.T) {
 
 	entry := replication.WALEntry{Seq: 1, SQL: "SELECT 1"}
 	data, _ := replication.EncodeEntry(nil, entry)
-	if resp := fsm.Apply(&hraft.Log{Data: data}); resp != nil {
-		t.Errorf("Apply returned %v, want nil", resp)
+	if resp := fsm.Apply(&hraft.Log{Data: data}); resp != any(int64(0)) {
+		t.Errorf("Apply returned %v, want int64(0) (legacy FSM success)", resp)
 	}
 	if called.Load() {
 		t.Error("apply-error handler was called on success")

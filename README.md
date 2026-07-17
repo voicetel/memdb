@@ -14,7 +14,7 @@ Think Redis RDB+AOF semantics with full SQL query power — in a single Go impor
 - **~3× faster writes** — all writes hit memory; no VFS, no page-cache overhead
 - **Sub-millisecond reads** — all queries hit memory, no disk I/O on the hot path
 - **Concurrent reads** — channel-based replica pool (`ReadPoolSize`) is ~37% faster than file SQLite at 4 goroutines (and 2.13× faster than memdb without the pool)
-- **Prepared-statement cache** — repeated `Exec`/`Query` against the writer skip per-call Prepare/Close; ~1.4× contended write throughput from a single `sync.Map[string]*sql.Stmt`
+- **Prepared-statement cache** — repeated parameterised `Exec`/`Query` calls skip per-call Prepare/Close on the writer *and* on every read replica (v1.10.0); +23 % replica-read and +41 % mixed-read throughput vs the uncached replica path. Zero-argument SQL (values inlined into the string, as wire-protocol simple-query clients emit) deliberately bypasses the cache — such strings never repeat, and caching them only grows memory
 - **Configurable durability** — periodic snapshot only, WAL-backed near-zero loss, or fully synchronous
 - **Atomic snapshots** — write-then-rename prevents corrupt state on crash
 - **Pluggable backends** — local disk or any custom `Backend` implementation; AEAD backends opt out of the redundant SHA-256 snapshot header via `AuthenticatedBackend`
@@ -576,8 +576,10 @@ Each node uses **two TLS ports**:
 ### Wiring a node to a memdb.DB
 
 The `replication/raft` package's `Node` is decoupled from `memdb.DB` via the
-`DB` interface (`ExecLocal`, `Serialize`, `Restore`). Wire them together with
-a thin adapter and the `OnExec` hook:
+`DB` interface (`ExecLocal`, `Serialize`, `Restore`) and its optional
+`ResultDB` extension (`ExecLocalResult`), which carries the rows-affected
+count of each committed statement back through the consensus response. Wire
+them together with a thin adapter and the `OnExecResult` hook:
 
 ```go
 import (
@@ -587,19 +589,23 @@ import (
     mraft  "github.com/voicetel/memdb/replication/raft"
 )
 
-// adapter bridges memdb.DB to the raft.DB interface.
+// adapter bridges memdb.DB to the raft.DB + raft.ResultDB interfaces.
 type adapter struct{ db *memdb.DB }
 
 func (a *adapter) ExecLocal(sql string, args ...any) error {
-    return a.db.ExecDirect(sql, args...)   // bypasses OnExec — no Raft loop
+    return a.db.ExecDirect(sql, args...)   // bypasses the hook — no Raft loop
+}
+func (a *adapter) ExecLocalResult(sql string, args ...any) (int64, error) {
+    return a.db.ExecDirectResult(sql, args...)   // same, with rows affected
 }
 func (a *adapter) Serialize() ([]byte, error) { return a.db.Serialize() }
 func (a *adapter) Restore(data []byte) error  { return a.db.Restore(data) }
 
 // openClusterNode opens a memdb.DB and a Raft node together.
-// OnExec is set in Config so that every db.Exec routes through Raft consensus.
-// ExecDirect (called by the FSM on every node after commit) bypasses OnExec
-// to avoid an infinite Raft → Exec → Raft loop.
+// OnExecResult is set in Config so that every db.Exec routes through Raft
+// consensus and reports the real rows-affected count. ExecDirect /
+// ExecDirectResult (called by the FSM on every node after commit) bypass
+// the hook to avoid an infinite Raft → Exec → Raft loop.
 func openClusterNode(tlsCfg *tls.Config, nodeID string) (*memdb.DB, *mraft.Node, error) {
     peers := []string{
         "node-1=10.0.0.1:7000",
@@ -625,10 +631,12 @@ func openClusterNode(tlsCfg *tls.Config, nodeID string) (*memdb.DB, *mraft.Node,
             )`)
             return err
         },
-        // Route every Exec through Raft. ExecDirect (the FSM path) bypasses
-        // this hook so committed entries are applied without looping back.
-        OnExec: func(sql string, args []any) error {
-            return node.Exec(sql, args...)
+        // Route every Exec through Raft. ExecDirectResult (the FSM path)
+        // bypasses this hook so committed entries are applied without
+        // looping back. The returned count surfaces through
+        // sql.Result.RowsAffected on the caller's side.
+        OnExecResult: func(sql string, args []any) (int64, error) {
+            return node.ExecResult(sql, args...)
         },
     })
     if err != nil {
@@ -657,24 +665,30 @@ func openClusterNode(tlsCfg *tls.Config, nodeID string) (*memdb.DB, *mraft.Node,
 }
 ```
 
-> **Note:** When `OnExec` is set, `db.Exec` no longer writes locally —
-> the write only happens when the Raft FSM calls `ExecDirect` after consensus
-> is reached. Transactions (`Begin`, `BeginTx`, `WithTx`) return
-> `ErrTransactionNotSupported` when replication is enabled; use `node.Exec`
-> (or `db.Exec` which routes through it via `OnExec`) for all writes.
-> Use `db.ExecDirect` only inside `InitSchema` and the FSM adapter, never in
-> application code.
+> **Note:** When `OnExecResult` (or the legacy `OnExec`) is set, `db.Exec`
+> no longer writes locally — the write only happens when the Raft FSM calls
+> `ExecDirect` after consensus is reached. Transactions (`Begin`, `BeginTx`,
+> `WithTx`) return `ErrTransactionNotSupported` when replication is enabled;
+> use `node.Exec` (or `db.Exec` which routes through it via the hook) for
+> all writes. Use `db.ExecDirect` / `db.ExecDirectResult` only inside
+> `InitSchema` and the FSM adapter, never in application code.
+>
+> The legacy `OnExec` hook (error-only signature) still works but reports
+> `RowsAffected() == 0` for every statement — clients that gate on the
+> affected-row count (e.g. OpenSIPS msilo over the pg-wire server) need
+> `OnExecResult`. Setting both hooks is a configuration error.
 
 ### Write flow
 
 ```
 Any node receives db.Exec(sql)
-  → OnExec fires → node.Exec(sql)
+  → OnExecResult fires → node.ExecResult(sql)
   → IsLeader?
-      Yes → hraft.Apply → consensus → FSM.Apply on all nodes → ExecDirect
+      Yes → hraft.Apply → consensus → FSM.Apply on all nodes → ExecDirectResult
+            → leader FSM's rows-affected count returned as the future response
       No  → dial leader ForwardAddr (TLS) → ForwardRequest
            → leader: hraft.Apply → consensus → FSM.Apply on all nodes
-           → ForwardResponse → return to caller
+           → ForwardResponse{RowsAffected} → return to caller
 ```
 
 Writes block until a quorum of nodes commits the entry. The caller always
@@ -888,6 +902,32 @@ The server implements the PostgreSQL Simple Query protocol **and** the Extended 
 | Parameterised queries (`$1`, `$2`, ...) | ✅ extended query |
 | Server-side prepared statements | ✅ extended query |
 | Binary result format (int4 / int8 / float4 / float8 / bool / bytea) | ✅ |
+| `bytea` text I/O (hex `\x…` in, hex out; legacy escape format in) | ✅ |
+
+**Startup parameters.** After authentication the server advertises the
+standard `ParameterStatus` set (`server_version 16.0`,
+`standard_conforming_strings on`, `client_encoding`/`server_encoding UTF8`,
+…). This is load-bearing for libpq clients: a server version ≥ 9.0 makes
+`PQescapeByteaConn` emit hex-format bytea literals, and
+`standard_conforming_strings on` stops libpq doubling backslashes — both
+required for binary payloads and backslash-containing strings to be stored
+byte-exactly by SQLite.
+
+**bytea handling.** BLOB result cells are sent in PostgreSQL's hex output
+format (`\x…`) on the text protocol and raw on the binary protocol.
+Extended-query parameters declared `bytea` (OID 17) are decoded from hex or
+legacy-escape text input to raw bytes before binding. Hex-format string
+literals in simple-query SQL (what libpq emits) are stored as text verbatim
+and returned verbatim — libpq clients decode them transparently via
+`PQunescapeBytea`, so bytea round-trips exactly through e.g. OpenSIPS
+`db_postgres` without server-side SQL rewriting.
+
+**Affected-row counts.** Command tags report the real SQLite rows-affected
+count (`INSERT 0 1`, `UPDATE 3`, `DELETE 1`) in standalone **and** Raft
+mode — in a cluster the count travels from the leader's FSM apply back
+through the consensus (or write-forwarding) response. Clusters wired with
+the legacy `OnExec` hook report 0; wire `OnExecResult` (see the replication
+section).
 
 **Administrator schema-browsing commands are not supported.** When an
 operator connects with `psql` and types `\d tablename`, psql internally

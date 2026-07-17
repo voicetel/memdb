@@ -129,13 +129,22 @@ func (s *Server) ListenAndServe() error {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
+		// The quit-check and wg.Add must be atomic with respect to Stop:
+		// without the lock, a goroutine that passed the check could call
+		// wg.Add concurrently with Stop's wg.Wait (a WaitGroup misuse the
+		// race detector flags), letting a handler start after Stop
+		// returned. Holding s.mu orders Add before close(quit), so Wait
+		// observes every registered handler.
+		s.mu.Lock()
 		select {
 		case <-s.quit:
+			s.mu.Unlock()
 			_ = conn.Close()
 			return nil
 		default:
 		}
 		s.wg.Add(1)
+		s.mu.Unlock()
 		go func() {
 			defer s.wg.Done()
 			defer func() {
@@ -159,8 +168,8 @@ func (s *Server) ListenAndServe() error {
 // Stop gracefully shuts down the server.
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() {
-		close(s.quit)
 		s.mu.Lock()
+		close(s.quit)
 		if s.listener != nil {
 			_ = s.listener.Close()
 		}

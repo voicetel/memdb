@@ -162,12 +162,17 @@ func scramClientLogin(t *testing.T, conn net.Conn, username, password string) er
 		return parseErr(mt, body, "AuthenticationOk")
 	}
 
-	// ReadyForQuery.
-	mt, body = readMessage(t, conn)
-	if mt != 'Z' {
-		return parseErr(mt, body, "ReadyForQuery")
+	// ParameterStatus frames, then ReadyForQuery.
+	for {
+		mt, body = readMessage(t, conn)
+		if mt == 'S' {
+			continue
+		}
+		if mt != 'Z' {
+			return parseErr(mt, body, "ReadyForQuery")
+		}
+		return nil
 	}
-	return nil
 }
 
 func sendStartupWithUser(conn net.Conn, user string) error {

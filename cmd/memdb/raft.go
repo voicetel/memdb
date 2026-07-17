@@ -140,12 +140,19 @@ func loadRaftTLS(certFile, keyFile, caFile string) (*tls.Config, error) {
 }
 
 // raftDBAdapter bridges *memdb.DB to the mraft.DB interface. ExecLocal maps to
-// ExecDirect so the FSM apply path bypasses the OnExec hook and avoids the
-// Raft → Exec → Raft loop.
+// ExecDirect so the FSM apply path bypasses the replication hook and avoids
+// the Raft → Exec → Raft loop. ExecLocalResult additionally satisfies
+// mraft.ResultDB so the FSM reports the real rows-affected count, which
+// travels back through the consensus response to the pg-wire command tag
+// (clients like OpenSIPS msilo gate on it).
 type raftDBAdapter struct{ db *memdb.DB }
 
 func (a raftDBAdapter) ExecLocal(sql string, args ...any) error {
 	return a.db.ExecDirect(sql, args...)
+}
+
+func (a raftDBAdapter) ExecLocalResult(sql string, args ...any) (int64, error) {
+	return a.db.ExecDirectResult(sql, args...)
 }
 
 func (a raftDBAdapter) Serialize() ([]byte, error) { return a.db.Serialize() }

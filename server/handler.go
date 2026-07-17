@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -280,8 +281,59 @@ func (h *handler) handleStartup() error {
 	if err := h.writeRaw([]byte{'R', 0, 0, 0, 8, 0, 0, 0, 0}); err != nil {
 		return err
 	}
+	// ParameterStatus advertisement. This is not cosmetic: libpq derives
+	// connection behaviour from these values, and their absence selects
+	// worst-case legacy encodings.
+	//   - server_version ≥ 9.0 makes PQescapeByteaConn emit hex-format
+	//     bytea ("\x0d0a…"); with the version unknown (0) it falls back
+	//     to octal escape format, which SQLite stores literally and
+	//     corrupts (fe-exec.c: use_hex = conn->sversion >= 90000).
+	//   - standard_conforming_strings=on stops libpq doubling backslashes
+	//     in escaped strings. SQLite string literals have no backslash
+	//     escapes, so doubling corrupts any value containing "\".
+	// Together these make libpq clients (psql, OpenSIPS db_postgres, …)
+	// emit literals SQLite stores byte-exactly; bytea then round-trips
+	// because clients decode the hex text on read (PQunescapeBytea).
+	for _, p := range startupParameters {
+		if err := h.sendParameterStatus(p[0], p[1]); err != nil {
+			return err
+		}
+	}
 	// ReadyForQuery (idle)
 	return h.sendReadyForQuery()
+}
+
+// startupParameters are the ParameterStatus pairs sent to every client
+// after authentication. Values mirror a stock modern PostgreSQL so
+// drivers pick modern encodings; see the comment at the send site for
+// why server_version and standard_conforming_strings are load-bearing.
+var startupParameters = [][2]string{
+	{"server_version", "16.0"},
+	{"server_encoding", "UTF8"},
+	{"client_encoding", "UTF8"},
+	{"standard_conforming_strings", "on"},
+	{"integer_datetimes", "on"},
+	{"DateStyle", "ISO, MDY"},
+	{"TimeZone", "UTC"},
+	{"is_superuser", "off"},
+}
+
+// sendParameterStatus emits an 'S' ParameterStatus message (name/value,
+// both NUL-terminated).
+func (h *handler) sendParameterStatus(name, value string) error {
+	size := 1 + 4 + len(name) + 1 + len(value) + 1
+	buf := make([]byte, size)
+	buf[0] = 'S'
+	binary.BigEndian.PutUint32(buf[1:5], uint32(size-1))
+	pos := 5
+	copy(buf[pos:], name)
+	pos += len(name)
+	buf[pos] = 0
+	pos++
+	copy(buf[pos:], value)
+	pos += len(value)
+	buf[pos] = 0
+	return h.writeRaw(buf)
 }
 
 // parseStartupUser extracts the "user" parameter from PostgreSQL startup
@@ -371,10 +423,30 @@ func (h *handler) handleSimpleQuery(query string) error {
 	}
 }
 
+// appendCellText appends the PostgreSQL text-format representation of a
+// result cell to dst. It differs from appendCell in exactly one case:
+// []byte values (BLOB columns, advertised as OID 17/bytea in the
+// RowDescription) are rendered in PG's bytea hex output format
+// ("\x" + lowercase hex), which libpq-based clients decode back to raw
+// bytes via PQunescapeBytea. Emitting raw blob bytes here — the old
+// behaviour — made those clients "unescape" arbitrary binary and mangle
+// any payload containing backslashes.
+func appendCellText(dst []byte, v any) []byte {
+	if b, ok := v.([]byte); ok {
+		dst = append(dst, '\\', 'x')
+		return hex.AppendEncode(dst, b)
+	}
+	return appendCell(dst, v)
+}
+
 // appendCell appends the text representation of v to dst, avoiding the
 // allocation overhead of fmt.Sprintf("%v", v) for common types. The dst
 // slice is grown in place so callers that hand in a reused buffer pay
 // only for the incremental bytes, not a fresh allocation per cell.
+// []byte is appended verbatim — text-format result cells must use
+// appendCellText instead so bytea gets hex-encoded; this raw variant
+// remains the fallback for binary-format encoding (encodeCellBinary),
+// where bytea is defined as the raw bytes.
 func appendCell(dst []byte, v any) []byte {
 	switch t := v.(type) {
 	case nil:
@@ -521,7 +593,7 @@ func (h *handler) handleSelect(query string) error {
 				continue
 			}
 			start := len(rb.cellBuf)
-			rb.cellBuf = appendCell(rb.cellBuf, v)
+			rb.cellBuf = appendCellText(rb.cellBuf, v)
 			rb.cellOffsets[2*i] = start
 			rb.cellOffsets[2*i+1] = len(rb.cellBuf) - start
 		}

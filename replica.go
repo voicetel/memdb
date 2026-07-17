@@ -42,6 +42,20 @@ type replicaPool struct {
 	closed     atomic.Bool    // true after close() has been called
 	driverName string
 
+	// caches holds one prepared-statement cache per replica, keyed by the
+	// replica's *sql.DB. Built once in newReplicaPool and immutable after —
+	// concurrent lookups need no locking. Without a cache every replica
+	// read paid a full sqlite3_prepare per call (the writer has had a
+	// stmtCache since v1.7); the round-1 pprof pass measured replica-read
+	// workloads at 43–52% cgo with per-query prepare buried inside.
+	//
+	// Refresh interaction: an idle prepared statement survives
+	// deserializeReadonlyShared — SQLite re-prepares it lazily against the
+	// new snapshot on next use (prepare_v2 semantics). This invariant is
+	// guarded by TestReplicaPreparedStmtSurvivesRefresh; no per-tick cache
+	// flush is required.
+	caches map[*sql.DB]*stmtCache
+
 	// lastRefreshedGen records the value of DB.writeGen observed at the
 	// start of the most recent successful refresh. On the next tick,
 	// refresh() compares the current writeGen to this value and skips
@@ -138,6 +152,9 @@ type replicaReleaser struct {
 // the pool has been shut down in the meantime.
 func (rl replicaReleaser) Release() {
 	if rl.pool.closed.Load() {
+		if c := rl.pool.stmts(rl.r); c != nil {
+			_ = c.Close()
+		}
 		_ = rl.r.Close()
 		rl.pool.inUse.Done()
 		return
@@ -152,6 +169,7 @@ func newReplicaPool(d *DB, n int, driverName string) (*replicaPool, error) {
 	p := &replicaPool{
 		idle:       make(chan *sql.DB, n),
 		driverName: driverName,
+		caches:     make(map[*sql.DB]*stmtCache, n),
 	}
 
 	for i := 0; i < n; i++ {
@@ -164,6 +182,7 @@ func newReplicaPool(d *DB, n int, driverName string) (*replicaPool, error) {
 		// exactly one connection so there is no internal pool churn.
 		r.SetMaxOpenConns(1)
 		r.SetMaxIdleConns(1)
+		p.caches[r] = newStmtCache(r)
 		p.idle <- r
 	}
 
@@ -202,6 +221,13 @@ func (p *replicaPool) checkout() (*sql.DB, replicaReleaser) {
 	}
 	p.inUse.Add(1)
 	return r, replicaReleaser{pool: p, r: r}
+}
+
+// stmts returns the prepared-statement cache for a checked-out replica.
+// The caches map is immutable after construction, so this is safe from
+// any goroutine without locking.
+func (p *replicaPool) stmts(r *sql.DB) *stmtCache {
+	return p.caches[r]
 }
 
 // refresh serializes the writer's current state and deserializes it into every
@@ -410,11 +436,17 @@ func (p *replicaPool) refresh(ctx context.Context, d *DB) error {
 func (p *replicaPool) close() {
 	p.closed.Store(true)
 
-	// Phase 1 — drain the idle channel and close those replicas.
+	// Phase 1 — drain the idle channel and close those replicas. Cached
+	// statements are finalized before their connection closes so the
+	// close is clean rather than relying on database/sql's orphan
+	// handling.
 drain:
 	for {
 		select {
 		case r := <-p.idle:
+			if c := p.stmts(r); c != nil {
+				_ = c.Close()
+			}
 			_ = r.Close()
 		default:
 			break drain

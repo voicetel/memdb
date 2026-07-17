@@ -602,8 +602,8 @@ func TestFSM_Apply_EmptyArgs(t *testing.T) {
 	log := &hraft.Log{Data: encodeEntry(t, entry)}
 	result := fsm.Apply(log)
 
-	if result != nil {
-		t.Errorf("expected nil result, got: %v", result)
+	if n, ok := result.(int64); !ok || n != 0 {
+		t.Errorf("expected int64(0) result, got: %v (%T)", result, result)
 	}
 	if len(gotArgs) != 0 {
 		t.Errorf("expected empty args slice, got: %#v", gotArgs)

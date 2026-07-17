@@ -91,11 +91,11 @@ func (f *forwarder) handleConn(conn net.Conn) {
 		}
 
 		// Apply through Raft. This node must be the leader; if not (e.g. a
-		// leadership change happened mid-flight), Exec returns ErrNotLeader
-		// and the follower will retry on the new leader.
-		err := f.node.Exec(req.SQL, req.Args...)
+		// leadership change happened mid-flight), ExecResult returns
+		// ErrNotLeader and the follower will retry on the new leader.
+		rowsAffected, err := f.node.ExecResult(req.SQL, req.Args...)
 
-		resp := ForwardResponse{}
+		resp := ForwardResponse{RowsAffected: rowsAffected}
 		if err != nil {
 			resp.ErrMsg = err.Error()
 			// Sentinel code for known error types so sendForward can

@@ -132,8 +132,10 @@ func TestFSM_Apply_NoArgs(t *testing.T) {
 	log := &hraft.Log{Data: encodeEntry(t, entry)}
 	result := fsm.Apply(log)
 
-	if result != nil {
-		t.Errorf("expected nil result, got: %v", result)
+	// Legacy NewFSM cannot carry a rows-affected count; success is the
+	// zero count, not nil.
+	if n, ok := result.(int64); !ok || n != 0 {
+		t.Errorf("expected int64(0) result, got: %v (%T)", result, result)
 	}
 	if gotSQL != entry.SQL {
 		t.Errorf("execFn got SQL=%q, want %q", gotSQL, entry.SQL)
@@ -158,8 +160,8 @@ func TestFSM_Apply_WithArgs(t *testing.T) {
 	log := &hraft.Log{Data: encodeEntry(t, entry)}
 	result := fsm.Apply(log)
 
-	if result != nil {
-		t.Errorf("expected nil result, got: %v", result)
+	if n, ok := result.(int64); !ok || n != 0 {
+		t.Errorf("expected int64(0) result, got: %v (%T)", result, result)
 	}
 	if !reflect.DeepEqual(gotArgs, wantArgs) {
 		t.Errorf("args mismatch: got %#v, want %#v", gotArgs, wantArgs)

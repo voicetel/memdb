@@ -1,13 +1,12 @@
-# memdb v1.8.0 — Benchmark Report
+# memdb v1.10.0 — Benchmark Report
 
 Consolidated results from the full benchmark suite and the pprof-driven
-throughput scenarios. All numbers captured in a single session against
-the commit tagged `v1.8.0`; see the Setup section for the exact
-environment. v1.7.x and v1.8.0 are feature releases (CLI Raft wiring,
-SCRAM-SHA-256 auth, the Postgres Extended Query Protocol, and `memdb-cli`
-wire mode) and do not touch the measured hot paths, so the per-release
-shifts in this report are within run-to-run variance — see "What changed
-since v1.6.2" below for the per-release notes.
+throughput scenarios. The headline throughput tables below were captured
+in a single fresh session against the v1.10.0 tree (replica
+prepared-statement cache + cache-policy fix — see the v1.10.0 section
+under "What changed"); the microbenchmark tables further down are from
+the v1.8.0 capture and remain representative for the paths v1.9.x/v1.10.0
+did not touch. See the Setup section for the exact environment.
 
 > **Headline change vs the v1.5.0 baseline** — repeated `Exec`/`Query`
 > calls now skip per-call Prepare/Close on the writer (prepared-statement
@@ -57,11 +56,11 @@ since v1.6.2" below for the per-release notes.
 
 | Item | Value |
 |---|---|
-| Host | Linux 6.17.0-22-generic x86_64 |
+| Host | Linux 7.0.0-27-generic x86_64 (headline tables); 6.17.0-22 (v1.8.0 microbenches) |
 | CPU | 12th Gen Intel(R) Core(TM) i7-1280P (20 threads) |
-| Go | go1.24.4 linux/amd64 |
+| Go | go1.26.0 linux/amd64 (headline tables); go1.24.4 (v1.8.0 microbenches) |
 | SQLite driver | github.com/mattn/go-sqlite3 (cgo) |
-| Commit | v1.8.0 |
+| Commit | v1.10.0 working tree (headline tables); v1.8.0 (microbenches) |
 | `-benchtime` | 5 s per bench |
 | `-cpu` | default (GOMAXPROCS=20) unless noted |
 
@@ -71,6 +70,88 @@ timings reflect only the operation under measurement, not periodic I/O.
 ---
 
 ## What changed since v1.5.0
+
+### v1.10.0 — replica statement cache + cache-policy fix (pprof round sweep)
+
+A profile → fix → re-profile sweep over every pprof scenario. Two
+hot-path changes landed; each was validated with an interleaved A/B run
+(5 repetitions per tree per scenario, alternating baseline/current every
+run to cancel thermal drift; mean ± stdev):
+
+| Scenario | baseline | v1.10.0 | Δ |
+|---|---|---|---|
+| replica reads (16 goroutines) | 700 481 ±57k ops/s | 859 007 ±37k ops/s | **+22.6 %** |
+| mixed RW, default refresh — reads | 533 167 ±40k /s | 750 618 ±95k /s | **+40.8 %** |
+| pg-wire INSERT (literal DML, msilo-style) | 34 023 ±6.9k q/s | 52 162 ±4.1k q/s | **+53.3 %** |
+| pg-wire SELECT (literal, replica-served) | 137 321 ±3.3k q/s | 134 729 ±2.1k q/s | −1.9 % (noise) |
+| pure writes | 377 503 ±23k ops/s | 366 228 ±82k ops/s | −3.0 % (noise) |
+| mixed RW — writes | 144 129 ±7k /s | 136 001 ±18k /s | −5.6 % (σ overlap — watch) |
+| large-DB (100 MiB) mixed | — | — | −6…−7 % (σ overlap — watch) |
+
+What landed:
+
+- **Replica prepared-statement cache** (`replica.go`, `stmt_cache.go`).
+  Replica reads previously paid a full `sqlite3_prepare` per call — the
+  writer has had a stmtCache since v1.7 but `checkout()` handed back a
+  bare `*sql.DB`. Round-1 profiles showed replica-read workloads at
+  43–52 % `runtime.cgocall` with per-query prepare buried inside; the
+  cache cut the reads-scenario cgo share to ~27 % flat. Refresh
+  interaction is safe **without a per-tick flush**: an idle prepared
+  statement survives `deserializeReadonlyShared` and SQLite lazily
+  re-prepares it against the new snapshot (guarded by
+  `TestReplicaPreparedStmtSurvivesRefresh`).
+- **Zero-argument SQL bypasses the statement cache** (`stmt_cache.go`).
+  Literal-inlined SQL (every pg-wire simple-query client: psql, OpenSIPS
+  `db_postgres`) synthesises a distinct string per call — caching those
+  never hits, held every statement forever (unbounded growth, present
+  since v1.7 on the writer), and an intermediate epoch-flush design
+  collapsed the wire-SELECT workload to a third of baseline through
+  statement-finalize storms on the single connection. Zero-args
+  passthrough removes the whole class and is itself the +53 % on
+  literal INSERT. Parameterised statements (all library callers,
+  extended-protocol wire clients) still cache; a refcount-safe epoch
+  flush at 512 entries remains as a backstop for pathological
+  parameterised-distinct-string callers.
+
+Also in the sweep, three correctness/infra fixes the rounds surfaced:
+`Server.Stop` accept-loop `WaitGroup` race (handler could start after
+Stop returned), test `pickFreeAddr` duplicate-ephemeral-port collisions
+(raft bootstrap flake), and a single-attempt `checkout()` flake in
+`TestReplica_ReadOnlyEnforced`.
+
+**Hot paths measured and deliberately NOT addressed** (see the pprof
+round evidence in `coverage/pprof-round1/` for shapes):
+
+1. **SQLite cgo floor** — 72–79 % of pure-write CPU is
+   `runtime.cgocall` under `ctxDriverStmtExec`: the workload *is*
+   SQLite. One exec crossing per statement is already the minimum.
+   `database/sql` machinery adds ~8–10 % on top (retry wrapper, arg
+   conversion, result plumbing); bypassing it with raw `driver.Stmt`
+   handles could recover part of that but forfeits the `*sql.DB`
+   compatibility surface — rejected at this effort/risk for ≤8 % upside.
+2. **WAL fsync** — 15 % `Syscall6` in DurabilityWAL writes is the
+   durability contract itself (`fdatasync` per write). Configurable via
+   `Durability`, not optimisable away.
+3. **Refresh copy on large DBs** — 28–29 % flat `runtime.memmove` on
+   the 100 MiB scenario: one full-image serialize+copy per tick, linear
+   in DB size. Structural in the v1.9 snapshot-refresh architecture.
+   The unlock is session-extension v2.0 (row-level changesets, cost
+   scales with write rate instead of DB size) — separate decision, not
+   attempted here. The direct-cgo serialize shortcut remains a
+   documented 40–90× regression; do not retry without new evidence.
+4. **Network syscall floor (pg-wire)** — 32–57 % `Syscall6` across
+   server scenarios is one read/write syscall pair per protocol round
+   trip on loopback TCP, inflated in-profile by the in-process load
+   clients sharing the sample space. Responses are already batched into
+   a 32 KB buffered writer flushed once per ReadyForQuery.
+5. **Raft consensus overhead** — 28 % syscalls + `selectgo`/scheduler
+   churn inside hashicorp/raft (network, log fsync, channel plumbing):
+   the price of consensus, tuned via raft batching knobs, not memdb
+   code. SQLite work is only ~6 % of the raft+memdb pipeline.
+6. **Saturation scheduler churn** — 8–12 % futex/procyield/`lock2` on
+   fully-saturated mixed workloads: N goroutines contending for one
+   writer connection and GOMAXPROCS replicas at 100 % CPU. A property
+   of running at saturation, not a fixable code path.
 
 ### v1.9.2 — large-DB pprof characterisation + observability + lint cleanup
 
@@ -257,18 +338,19 @@ orchestration, buffered-writer flushing, and connection churn.
 
 ### Core DB
 
-| Scenario | Throughput |
+| Scenario | Throughput (v1.10.0) |
 |---|---|
-| Pure writes (single goroutine, `DurabilityNone`) | **387 193 ops/s** |
-| Pure writes (single goroutine, `DurabilityWAL`) | **298 338 ops/s** |
-| Concurrent reads (16 goroutines, replica pool) | **821 756 ops/s** |
-| Contended writes (16 goroutines, single writer) | **224 784 ops/s** |
-| Mixed RW, `ReplicaRefreshInterval=2ms` | 20 726 w/s + 160 901 r/s |
-| Mixed RW, `ReplicaRefreshInterval=50ms` *(default)* | 56 438 w/s + 273 878 r/s |
-| Raft Apply (3-node cluster, sustained writes) | **18 203 writes/s** |
-| Raft+memdb Apply (3-node, real `*memdb.DB` FSMs) | **13 889 writes/s** |
-| Flush (50 000 rows) | ~41 ms / flush |
-| WAL cold-start replay (50 000 entries) | **163 622 entries/s** |
+| Pure writes (single goroutine, `DurabilityNone`) | **474 833 ops/s** |
+| Pure writes (single goroutine, `DurabilityWAL`) | **364 499 ops/s** |
+| Concurrent reads (16 goroutines, replica pool) | **1 106 073 ops/s** |
+| Contended writes (16 goroutines, single writer) | **244 175 ops/s** |
+| Mixed RW, `ReplicaRefreshInterval=2ms` | 29 008 w/s + 275 994 r/s |
+| Mixed RW, `ReplicaRefreshInterval=50ms` *(default)* | 165 299 w/s + 898 883 r/s |
+| Large-DB mixed RW (100 MiB seed, 20 replicas, default refresh) | 12 198 w/s + 92 324 r/s |
+| Raft Apply (3-node cluster, sustained writes) | **18 510 writes/s** |
+| Raft+memdb Apply (3-node, real `*memdb.DB` FSMs) | **13 993 writes/s** |
+| Flush (50 000 rows) | ~4 ms / flush (compressed ~10 ms, encrypted ~5 ms) |
+| WAL cold-start replay (50 000 entries) | **330 791 entries/s** |
 
 Notes:
 
@@ -288,21 +370,23 @@ traffic exercises the read replica pool — the v1.5.0 numbers serialised
 every read through the single writer connection, which is why the SELECT
 throughputs in the table below are several × the v1.5.0 figures.
 
-| Scenario | Throughput |
+| Scenario | Throughput (v1.10.0) |
 |---|---|
-| Narrow SELECT (16 clients, ~10 rows/query, simple query) | **162 051 q/s** |
-| Narrow SELECT (16 clients, Extended Query Protocol, v1.7.2+) | **147 100 q/s** |
-| Wide SELECT (8 clients, 500 rows/query) | **9 390 q/s (~4.7 M rows/s)** |
-| INSERT (8 clients, simple-query protocol) | **38 859 q/s** |
-| Mixed SELECT/INSERT (20 clients, 1-in-4 writes) | **111 669 q/s** |
-| Connect → query → disconnect (8 clients) | **14 892 cycles/s** |
-| TLS connect → query → disconnect (8 clients) | **3 836 cycles/s** |
-| Allocation diff scenario (8 clients) | **49 262 q/s** |
+| Narrow SELECT (16 clients, ~10 rows/query, simple query) | **154 611 q/s** |
+| Narrow SELECT (16 clients, Extended Query Protocol) | **164 378 q/s** |
+| Wide SELECT (8 clients, 500 rows/query) | **9 574 q/s (~4.8 M rows/s)** |
+| INSERT (8 clients, simple-query protocol) | **55 718 q/s** |
+| Mixed SELECT/INSERT (20 clients, 1-in-4 writes) | **173 610 q/s** |
+| Connect → query → disconnect (8 clients) | **15 210 cycles/s** |
+| TLS connect → query → disconnect (8 clients) | **3 776 cycles/s** |
+| Allocation diff scenario (8 clients) | **52 906 q/s** |
 
-The Extended Query Protocol path lands within ~9 % of Simple Query on the
-narrow-SELECT scenario; both share the same replica-pool fast path on the
-SELECT side, so the gap is the additional Bind/Describe/Execute round
-trips per query.
+As of v1.10.0 the Extended Query Protocol edges out Simple Query on the
+narrow-SELECT scenario: extended-path parameters are bound (so the
+replica statement cache hits), while the simple-query workload inlines
+its values and deliberately bypasses the cache. The simple-query INSERT
+figure is up ~43 % on the same policy change (no more prepare +
+cache-forever on literal DML).
 
 ---
 

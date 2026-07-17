@@ -162,17 +162,32 @@ func (m *mockDB) logEntry(i int) string {
 // newTestNode helper
 // ---------------------------------------------------------------------------
 
-// pickFreeAddr finds a free TCP port on 127.0.0.1 and returns the address.
-// The listener is closed before returning so the port can be reused.
+// pickedAddrs records every address pickFreeAddr has handed out in this
+// process. The kernel readily re-issues an ephemeral port the instant its
+// listener closes, so two consecutive picks can return the SAME port —
+// observed as raft bootstrap failing with "found duplicate address in
+// configuration" when one cluster's 6 picks collided under parallel-test
+// scheduling jitter. Deduplicating across the process eliminates that
+// class entirely.
+var pickedAddrs sync.Map
+
+// pickFreeAddr finds a free TCP port on 127.0.0.1 and returns the address,
+// never returning the same port twice within one test process. The
+// listener is closed before returning so the port can be bound by the
+// caller.
 func pickFreeAddr(t testing.TB) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		if _, dup := pickedAddrs.LoadOrStore(addr, struct{}{}); !dup {
+			return addr
+		}
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
 }
 
 func newTestNode(t testing.TB, nodeID string, tlsCfg *tls.Config, peers []string) (*memraft.Node, *mockDB) {

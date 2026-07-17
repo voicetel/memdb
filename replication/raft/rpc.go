@@ -30,6 +30,12 @@ type ForwardResponse struct {
 	// An empty ErrCode with a non-empty ErrMsg means "some other error";
 	// callers should treat it as a generic failure.
 	ErrCode string
+
+	// RowsAffected is the count the leader's FSM apply reported for the
+	// forwarded statement. Gob keeps mixed-version clusters working: a
+	// pre-count leader simply never encodes the field (the follower sees
+	// 0), and a pre-count follower ignores it on decode.
+	RowsAffected int64
 }
 
 // ── wire helpers ──────────────────────────────────────────────────────────────
@@ -75,10 +81,10 @@ func (rc *RPCConn) writeMsg(v any) error {
 	}
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(rc.encBuf.Len()))
-	if _, err := rc.Conn.Write(hdr[:]); err != nil {
+	if _, err := rc.Write(hdr[:]); err != nil {
 		return fmt.Errorf("rpc write length: %w", err)
 	}
-	if _, err := rc.Conn.Write(rc.encBuf.Bytes()); err != nil {
+	if _, err := rc.Write(rc.encBuf.Bytes()); err != nil {
 		return fmt.Errorf("rpc write body: %w", err)
 	}
 	return nil
@@ -252,16 +258,17 @@ func (p *ConnPool) IdleCount() int {
 // ── sendForward ───────────────────────────────────────────────────────────────
 
 // sendForward sends req to the leader via pool, waits for the response, and
-// returns the leader's error (or nil on success).
+// returns the rows-affected count the leader reported along with the
+// leader's error (or nil on success).
 //
 // It checks out a connection from pool, sends the request, reads the response,
 // and — if both succeeded — returns the connection to the pool for reuse. On
 // any transport error the connection is discarded rather than pooled, so
 // a broken connection is never handed to the next caller.
-func sendForward(pool *ConnPool, req ForwardRequest, timeout time.Duration) error {
+func sendForward(pool *ConnPool, req ForwardRequest, timeout time.Duration) (int64, error) {
 	conn, err := pool.Get(timeout)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// Set a single deadline covering both the write and the read. The read
@@ -269,18 +276,18 @@ func sendForward(pool *ConnPool, req ForwardRequest, timeout time.Duration) erro
 	// be the caller's ApplyTimeout, not a shorter network timeout.
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("rpc: set deadline: %w", err)
+		return 0, fmt.Errorf("rpc: set deadline: %w", err)
 	}
 
 	if err := conn.writeMsg(req); err != nil {
 		_ = conn.Close()
-		return err
+		return 0, err
 	}
 
 	var resp ForwardResponse
 	if err := conn.readMsg(&resp); err != nil {
 		_ = conn.Close()
-		return err
+		return 0, err
 	}
 
 	// Clear the deadline before returning the connection to the pool so it
@@ -294,9 +301,9 @@ func sendForward(pool *ConnPool, req ForwardRequest, timeout time.Duration) erro
 		// drive retry logic without string-matching.
 		switch resp.ErrCode {
 		case "ErrNotLeader":
-			return fmt.Errorf("%w: forwarded: %s", ErrNotLeader, resp.ErrMsg)
+			return 0, fmt.Errorf("%w: forwarded: %s", ErrNotLeader, resp.ErrMsg)
 		}
-		return errors.New(resp.ErrMsg)
+		return 0, errors.New(resp.ErrMsg)
 	}
-	return nil
+	return resp.RowsAffected, nil
 }

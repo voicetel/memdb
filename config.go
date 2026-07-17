@@ -219,7 +219,21 @@ type Config struct {
 	// submit the entry to the cluster and block until consensus is reached
 	// before returning. Return a non-nil error to propagate back to the caller.
 	// If nil, Exec operates locally only.
+	//
+	// With this hook, Exec's sql.Result always reports 0 rows affected —
+	// the func signature cannot carry the count back. Callers that gate on
+	// the affected-row count (including PostgreSQL wire-protocol clients
+	// served by the server package) should wire OnExecResult instead.
 	OnExec func(sql string, args []any) error
+
+	// OnExecResult is OnExec returning the number of rows the statement
+	// affected once the write is committed, so Exec can report the real
+	// count through sql.Result. Wire it to raft.Node.ExecResult; the count
+	// originates from the FSM's ExecDirectResult on the leader and travels
+	// back through the consensus (or write-forwarding) response.
+	//
+	// Setting both OnExec and OnExecResult is a configuration error.
+	OnExecResult func(sql string, args []any) (int64, error)
 
 	// Executed once against the memory DB after restore or on first open.
 	// Use for CREATE TABLE IF NOT EXISTS statements.
@@ -241,6 +255,9 @@ func (c *Config) validate() error {
 	}
 	if c.RestoreMaxBytes < 0 {
 		return fmt.Errorf("memdb: RestoreMaxBytes must be >= 0 (got %d)", c.RestoreMaxBytes)
+	}
+	if c.OnExec != nil && c.OnExecResult != nil {
+		return fmt.Errorf("memdb: OnExec and OnExecResult are mutually exclusive; set only OnExecResult")
 	}
 	return nil
 }

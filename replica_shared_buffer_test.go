@@ -2,6 +2,7 @@ package memdb
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -36,9 +37,22 @@ func TestReplica_ReadOnlyEnforced(t *testing.T) {
 	// directly and confirm a write fails with SQLITE_READONLY.
 	waitForReplicaCount_t(t, db, "SELECT COUNT(*) FROM t", 1, 2*time.Second)
 
-	r, releaser := db.replica.checkout()
-	if r == nil {
-		t.Fatal("could not check out a replica (refresh in progress?)")
+	// checkout legitimately returns nil while a refresh tick is in
+	// progress (the 20 ms interval above makes that window easy to hit
+	// under -race scheduling jitter) — retry briefly rather than treating
+	// one unlucky attempt as a failure.
+	var r *sql.DB
+	var releaser replicaReleaser
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		r, releaser = db.replica.checkout()
+		if r != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("could not check out a replica within 2s (refresh never yielded)")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	defer releaser.Release()
 
