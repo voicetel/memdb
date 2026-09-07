@@ -1,13 +1,11 @@
 module github.com/voicetel/memdb
 
-go 1.24
-
-toolchain go1.24.4
+go 1.25
 
 require (
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/raft v1.7.3
-	github.com/klauspost/compress v1.19.0
+	github.com/klauspost/compress v1.20.0
 	github.com/lib/pq v1.12.3
 	github.com/mattn/go-sqlite3 v1.14.48
 	github.com/peterh/liner v1.2.2
