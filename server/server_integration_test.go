@@ -691,12 +691,18 @@ func TestServer_Stop_RejectsNewConnections(t *testing.T) {
 	}
 }
 
-// TestServer_Stop_WaitsForInFlight verifies that Stop() does not return
-// until all in-flight handler goroutines have finished. We open a connection,
-// start a slow operation (by sending a query and holding the connection open),
-// call Stop() in a separate goroutine, and verify Stop() does not return
-// until we close the connection.
-func TestServer_Stop_WaitsForInFlight(t *testing.T) {
+// TestServer_Stop_TerminatesInFlight verifies that Stop() closes live
+// handler connections and returns promptly instead of waiting for the
+// clients to disconnect on their own.
+//
+// The previous contract — Stop blocks until every client closes — let a
+// single connected-but-idle client hold Stop hostage for the handler's
+// full 5-minute idle deadline, which in an embedding process (a daemon
+// stopping under systemd's TimeoutStopSec) turned every restart into a
+// SIGKILL. Postgres makes the same choice for `pg_ctl stop -m fast`:
+// sessions the server owns are terminated, not waited on. Only the
+// listener-level "smart" courtesy (refuse new connections) is kept.
+func TestServer_Stop_TerminatesInFlight(t *testing.T) {
 	db := integrationDB(t)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -727,30 +733,23 @@ func TestServer_Stop_WaitsForInFlight(t *testing.T) {
 	}
 	doStartup(t, conn, "memdb")
 
-	// Call Stop() in a goroutine; it should block until conn is closed.
+	// Stop must return while the client is still connected and idle.
 	stopped := make(chan struct{})
 	go func() {
 		srv.Stop()
 		close(stopped)
 	}()
 
-	// Stop should not have returned yet — the handler is still running.
 	select {
 	case <-stopped:
-		t.Error("Stop() returned before in-flight connection was closed")
-	case <-time.After(100 * time.Millisecond):
-		// Expected: Stop is still waiting.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() did not return within 2s while an idle client was connected")
 	}
 
-	// Close the client connection — the handler should exit.
-	_ = conn.Close()
-
-	// Now Stop() must complete within a generous timeout.
-	select {
-	case <-stopped:
-		// Pass.
-	case <-time.After(3 * time.Second):
-		t.Error("Stop() did not return within 3s after client connection closed")
+	// The idle client observes its session being terminated.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Error("idle client read succeeded after Stop; connection was not closed")
 	}
 }
 

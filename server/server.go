@@ -85,8 +85,9 @@ func (a BasicAuth) Authenticate(username, password string) bool {
 type Server struct {
 	db       *memdb.DB
 	cfg      Config
-	mu       sync.Mutex // protects listener
+	mu       sync.Mutex // protects listener and conns
 	listener net.Listener
+	conns    map[net.Conn]struct{}
 	wg       sync.WaitGroup
 	stopOnce sync.Once
 	quit     chan struct{}
@@ -95,9 +96,10 @@ type Server struct {
 // New creates a new Server. Call ListenAndServe to start accepting connections.
 func New(db *memdb.DB, cfg Config) *Server {
 	return &Server{
-		db:   db,
-		cfg:  cfg,
-		quit: make(chan struct{}),
+		db:    db,
+		cfg:   cfg,
+		conns: make(map[net.Conn]struct{}),
+		quit:  make(chan struct{}),
 	}
 }
 
@@ -144,9 +146,16 @@ func (s *Server) ListenAndServe() error {
 		default:
 		}
 		s.wg.Add(1)
+		s.conns[conn] = struct{}{}
 		s.mu.Unlock()
 		go func() {
 			defer s.wg.Done()
+			// Deregister before Done so Stop's close sweep (which runs
+			// under mu) never closes a connection whose handler already
+			// exited — a redundant Close on a live fd recycled by the OS
+			// would be harmless for us but could disturb a replacement
+			// listener bound after Stop returned.
+			defer s.removeConn(conn)
 			defer func() {
 				if r := recover(); r != nil {
 					// A panicking handler must not crash the server process.
@@ -165,13 +174,27 @@ func (s *Server) ListenAndServe() error {
 	}
 }
 
-// Stop gracefully shuts down the server.
+// removeConn drops a finished handler's connection from the Stop sweep.
+func (s *Server) removeConn(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, conn)
+	s.mu.Unlock()
+}
+
+// Stop shuts down the server. It stops accepting new connections and
+// terminates every live handler connection, so a client that is connected
+// but idle (blocked in a read with up to idleTimeout left on its read
+// deadline) cannot hold Stop hostage: closing the socket unblocks the
+// handler's read with an error and the connection WaitGroup drains.
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() {
 		s.mu.Lock()
 		close(s.quit)
 		if s.listener != nil {
 			_ = s.listener.Close()
+		}
+		for conn := range s.conns {
+			_ = conn.Close()
 		}
 		s.mu.Unlock()
 	})
