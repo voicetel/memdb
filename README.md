@@ -896,6 +896,54 @@ MEMDB_AUTH_PASSWORD=hunter2 memdb serve --auth-user alice --auth-method scram
 memdb serve --auth-user alice --auth-method cleartext --auth-password ...
 ```
 
+### Shutdown
+
+`Stop` closes the listener and then **terminates every live client
+connection**, returning once all handler goroutines have exited.
+`ListenAndServe` returns `nil` on the way out. `Stop` is idempotent and safe
+to call concurrently — every caller blocks until the handlers have drained.
+
+```go
+stopped := make(chan struct{})
+go func() {
+	<-ctx.Done()   // or a SIGTERM channel
+	srv.Stop()     // refuses new connections, terminates existing sessions
+	close(stopped)
+}()
+
+if err := srv.ListenAndServe(); err != nil {
+	log.Fatalf("memdb server: %v", err)
+}
+
+// ListenAndServe returns as soon as the listener is closed, which can be
+// before the last handler has unwound — wait on Stop, not on
+// ListenAndServe, if you are about to tear the DB down underneath them.
+<-stopped
+
+if err := db.Close(); err != nil {   // Close flushes to the backend
+	log.Printf("close: %v", err)
+}
+```
+
+This matches `pg_ctl stop -m fast`: sessions the server owns are terminated,
+not waited on. Only the listener-level courtesy is kept — connections that
+arrive after `Stop` are refused rather than served.
+
+> **Why not wait for clients to disconnect?** Handlers sit in a read with an
+> idle timeout of 5 minutes. If `Stop` waited for the client to hang up, a
+> single connected-but-idle session could hold shutdown open for that full
+> window — long enough that an embedding daemon under `systemd`'s
+> `TimeoutStopSec` gets `SIGKILL`ed on every restart. A client whose session
+> is terminated mid-query sees its connection close rather than a completed
+> response; treat a truncated reply during shutdown the way you would treat
+> one from a real PostgreSQL fast shutdown, and retry on reconnect.
+
+Durability is not tied to the connection lifecycle: rows committed before
+`Stop` are in the in-memory DB regardless of how their session ended. Call
+`db.Flush(ctx)` or `db.Close()` **after** `Stop` returns to get them to the
+backend; `memdb serve` flushes via a deferred `db.Close()` once
+`ListenAndServe` returns.
+
 ### Protocol compatibility
 
 The server implements the PostgreSQL Simple Query protocol **and** the Extended Query protocol (Parse / Bind / Describe / Execute / Sync / Close / Flush). Parameterised queries with `$1`-style placeholders, server-side prepared statements, and binary result-format codes for the basic scalar types are all supported, so `pgx` (default `QueryExecModeCacheStatement` with binary format), `lib/pq` (extended query, prepared statements), and any ORM that builds on `database/sql` work without configuration.
@@ -1254,8 +1302,12 @@ make tag VERSION_TAG=v1.2.0
 
 | Version | Status |
 |---|---|
-| 1.24 | Minimum (required by dependency graph) |
-| 1.24+ | Fully supported |
+| 1.25 | Minimum (required by dependency graph) |
+| 1.25+ | Fully supported |
+
+The floor moved from 1.24 to 1.25 when `klauspost/compress` v1.20.0 raised its
+own `go` directive to 1.25 — `go.mod` declares `go 1.25` and the module will
+not build against an older language version.
 
 ### Operating Systems
 
@@ -1279,7 +1331,7 @@ recommended approach for CI is Docker with `tonistiigi/xx`, which installs
 the correct cross toolchain automatically:
 
 ```dockerfile
-FROM --platform=$BUILDPLATFORM golang:1.24 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
 COPY --from=tonistiigi/xx / /
 ARG TARGETPLATFORM
 RUN xx-apt install -y gcc libc6-dev
@@ -1360,14 +1412,15 @@ matching C toolchain to be available on the build host.
 
 ## Benchmarks
 
-> **For the current v1.9.x report see [BENCHMARKS.md](./BENCHMARKS.md).**
+> **For the current v1.10.0 report see [BENCHMARKS.md](./BENCHMARKS.md).**
 > It contains the full throughput table (core DB + Postgres wire server),
 > the `ReplicaRefreshInterval` parameter sweep, the side-by-side vs
 > file-SQLite comparison, and a section-by-section pprof analysis of
-> where the remaining CPU is spent. v1.7.x and v1.8.0 are feature
-> releases that do not touch the measured hot paths; per-release shifts
-> are within run-to-run variance. Re-run locally with `make bench`,
-> `make pprof`, and `make pprof-server`.
+> where the remaining CPU is spent. Its headline tables are a fresh
+> v1.10.0 capture; the microbenchmarks reproduced below are the v1.8.0
+> capture and remain representative for the paths v1.9.x/v1.10.0 did not
+> touch. Re-run locally with `make bench`, `make pprof`, and
+> `make pprof-server`.
 
 The section below is a short summary of the most frequently-cited
 microbenchmarks for quick reference.
@@ -1803,8 +1856,8 @@ memdb/
 │   ├── local.go            # Atomic local file backend
 │   ├── compressed.go       # zstd compression wrapper (fixed at SpeedFastest)
 │   └── encrypted.go        # AES-256-GCM encryption wrapper (implements AuthenticatedBackend)
-├── stmt_cache.go           # Prepared-statement cache (writer); multi-statement bypass
-├── BENCHMARKS.md           # v1.9.x benchmark report with pprof analysis
+├── stmt_cache.go           # Prepared-statement cache (writer + one per replica); multi-statement bypass
+├── BENCHMARKS.md           # v1.10.0 benchmark report with pprof analysis
 ├── Makefile                # Build, test, lint, benchmark, profiling, release
 └── cmd/
     ├── memdb/              # Server CLI: serve [--pprof], snapshot, restore
