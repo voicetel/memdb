@@ -13,10 +13,12 @@ import (
 // forwarder listens for incoming ForwardRequests from follower nodes and
 // applies them through Raft consensus on the leader.
 type forwarder struct {
-	ln   net.Listener
-	node *Node
-	wg   sync.WaitGroup
-	done atomic.Bool
+	ln    net.Listener
+	node  *Node
+	wg    sync.WaitGroup
+	done  atomic.Bool
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
 }
 
 // newForwarder creates a TLS listener on addr and starts accepting connections.
@@ -25,7 +27,7 @@ func newForwarder(addr string, tlsCfg *tls.Config, node *Node) (*forwarder, erro
 	if err != nil {
 		return nil, fmt.Errorf("forwarder: listen %s: %w", addr, err)
 	}
-	f := &forwarder{ln: ln, node: node}
+	f := &forwarder{ln: ln, node: node, conns: map[net.Conn]struct{}{}}
 	go f.serve()
 	return f, nil
 }
@@ -42,9 +44,18 @@ func (f *forwarder) serve() {
 			}
 			return
 		}
+		f.mu.Lock()
+		if f.done.Load() {
+			f.mu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		f.conns[conn] = struct{}{}
 		f.wg.Add(1)
+		f.mu.Unlock()
 		go func() {
 			defer f.wg.Done()
+			defer f.removeConn(conn)
 			defer func() {
 				if r := recover(); r != nil {
 					// A panicking handler must not crash the forwarder or
@@ -60,6 +71,12 @@ func (f *forwarder) serve() {
 			f.handleConn(conn)
 		}()
 	}
+}
+
+func (f *forwarder) removeConn(conn net.Conn) {
+	f.mu.Lock()
+	delete(f.conns, conn)
+	f.mu.Unlock()
 }
 
 func (f *forwarder) handleConn(conn net.Conn) {
@@ -115,10 +132,15 @@ func (f *forwarder) handleConn(conn net.Conn) {
 }
 
 func (f *forwarder) close() error {
+	f.mu.Lock()
 	// Signal serve() that this close is intentional before closing the
 	// listener so that the Accept error is not logged as unexpected.
 	f.done.Store(true)
 	err := f.ln.Close()
+	for conn := range f.conns {
+		_ = conn.Close()
+	}
+	f.mu.Unlock()
 	// Wait for all in-flight handleConn goroutines to complete so that
 	// callers (e.g. Node.Shutdown) can be sure no goroutines are still
 	// running after close returns.
