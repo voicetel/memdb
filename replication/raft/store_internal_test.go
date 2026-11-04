@@ -277,6 +277,22 @@ func TestFileStableStore_GetMissingKey(t *testing.T) {
 	}
 }
 
+// TestFileStableStore_MissingKeyErrorMatchesRaft holds Get's error to the text
+// hashicorp/raft expects, read from its own in-memory store. requestVote compares
+// the text, so a missing vote record with any other wording makes a node refuse
+// every vote until it has campaigned once.
+func TestFileStableStore_MissingKeyErrorMatchesRaft(t *testing.T) {
+	store, err := newStableStore(filepath.Join(t.TempDir(), "stable"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, got := store.Get([]byte("LastVoteCand"))
+	_, want := hraft.NewInmemStore().Get([]byte("LastVoteCand"))
+	if got == nil || want == nil || got.Error() != want.Error() {
+		t.Errorf("Get of a missing key = %v, want the text raft's own store returns, %v", got, want)
+	}
+}
+
 func TestFileStableStore_Uint64(t *testing.T) {
 	dir := t.TempDir()
 	store, err := newStableStore(filepath.Join(dir, "stable"))
