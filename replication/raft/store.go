@@ -365,7 +365,12 @@ func (s *fileLogStore) DeleteRange(min, max uint64) error {
 // satisfies the storeCloser interface used in node.go error paths.
 
 // errStableKeyNotFound is the sentinel returned by Get when a key is absent.
-var errStableKeyNotFound = errors.New("stable store: key not found")
+//
+// hashicorp/raft compares this error's text, not its identity: requestVote treats
+// a missing vote record as normal only if err.Error() == "not found", as its own
+// in-memory store returns, and otherwise declines to vote. So the text must stay
+// exactly this, or a node that has never voted refuses every vote.
+var errStableKeyNotFound = errors.New("not found")
 
 type fileStableStore struct {
 	mu   sync.Mutex
