@@ -632,8 +632,10 @@ func TestApply_Timeout(t *testing.T) {
 	}()
 
 	select {
-	case <-done:
-		// ok — returned in time
+	case err := <-done:
+		if err != nil {
+			t.Log(err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Apply did not return within 5 seconds with 1ns timeout")
 	}
