@@ -758,7 +758,26 @@ data model rather than building a distributed deduplication layer.
 
 ### Membership changes
 
+A node that joins a running cluster, to grow it or to replace a lost
+member, starts with `NodeConfig.Join` set. It then waits, holding no
+configuration and starting no election, until the leader adds it.
+Without `Join`, a node with an empty `DataDir` bootstraps a cluster of its
+own from `Peers`: it writes a first configuration at index 1, term 1, which
+is the same index and term as the running cluster's first entry, so the
+leader never sends its own and Raft's log matching does not hold there.
+`Join` is ignored once the node has state, so it can stay set across
+restarts. Give a replacement a new node ID, never the lost one's.
+
 ```go
+// On the new node: start it in join mode
+node, err := mraft.NewNode(adapter, mraft.NodeConfig{
+    NodeID:   "node-4",
+    BindAddr: "10.0.0.4:7000",
+    Peers:    peers, // the cluster, including this node
+    Join:     true,
+    // ...
+})
+
 // Add a new node (call on the leader)
 if err := node.AddVoter("node-4", "10.0.0.4:7000", 10*time.Second); err != nil {
     log.Fatal(err)

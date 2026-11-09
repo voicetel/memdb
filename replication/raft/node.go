@@ -50,6 +50,18 @@ type NodeConfig struct {
 	// Only used during first bootstrap. Ignored if state already exists.
 	Peers []string
 
+	// Join starts a node that has no Raft state without bootstrapping a
+	// cluster. It holds no configuration and starts no election until the
+	// leader of a running cluster adds it with AddVoter, and from then on it
+	// is an ordinary member. Use it for a node that replaces a lost one or
+	// grows a running cluster: bootstrapping would give it a first
+	// configuration of its own at index 1 and term 1, the same index and term
+	// as the cluster's first entry, so the leader would never send its own and
+	// Raft's log matching would not hold at that index. Peers must still be
+	// set, but is not bootstrapped from, and its size need not be odd. A node
+	// that already has state ignores Join.
+	Join bool
+
 	// DataDir is the directory where Raft stores its logs, stable state, and
 	// snapshots. Must be persistent across restarts.
 	DataDir string
@@ -176,8 +188,9 @@ type storeCloser interface {
 // loop).
 //
 // On the very first start (no existing state in DataDir), the cluster is
-// bootstrapped using NodeConfig.Peers. On subsequent starts the existing
-// state is recovered automatically.
+// bootstrapped using NodeConfig.Peers, unless NodeConfig.Join is set, in which
+// case the node waits to be added to a running cluster. On subsequent starts
+// the existing state is recovered automatically.
 func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	cfg.applyDefaults()
 
@@ -262,10 +275,11 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 		}
 		return nil, fmt.Errorf("raft node: check state: %w", err)
 	}
-	if !hasState {
+	if !hasState && !cfg.Join {
 		// Even-sized clusters have no fault-tolerance advantage over the next
 		// smaller odd size. Only enforce this on first boot — a node restarting
-		// into an existing cluster uses whatever membership is already stored.
+		// into an existing cluster uses whatever membership is already stored,
+		// and a joining one takes the membership the leader sends it.
 		if len(cfg.Peers)%2 == 0 {
 			if c, ok := logStore.(storeCloser); ok {
 				_ = c.Close()
@@ -356,7 +370,12 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	node.raft = r
 
 	// ── bootstrap if no existing state ───────────────────────────────────────
-	if !hasState {
+	switch {
+	case !hasState && cfg.Join:
+		node.logger().Info("memdb raft: joining; waiting for the leader to add this node",
+			"nodeID", cfg.NodeID,
+		)
+	case !hasState:
 		node.logger().Info("memdb raft: bootstrapping new cluster",
 			"nodeID", cfg.NodeID,
 			"peers", len(cfg.Peers),
