@@ -91,6 +91,13 @@ type NodeConfig struct {
 	// Default: 10s.
 	ApplyTimeout time.Duration
 
+	// ForwardPoolSize is how many idle connections to the leader a follower
+	// keeps warm for forwarding writes. It does not cap concurrent forwards:
+	// a forward that finds none idle dials a connection of its own, which is
+	// closed afterwards rather than kept, at the cost of a TLS handshake. Raise
+	// it toward a follower's usual number of concurrent writes. Default: 8.
+	ForwardPoolSize int
+
 	// Logger is used for structured log output from this node and the underlying
 	// hashicorp/raft instance. If nil, slog.Default() is used.
 	// Use logging.NewSyslogHandler, logging.NewJSONHandler, or
@@ -122,6 +129,9 @@ func (c *NodeConfig) applyDefaults() {
 	}
 	if c.ApplyTimeout == 0 {
 		c.ApplyTimeout = 10 * time.Second
+	}
+	if c.ForwardPoolSize <= 0 {
+		c.ForwardPoolSize = defaultPoolSize
 	}
 }
 
@@ -569,7 +579,7 @@ func (n *Node) poolForLeader(leaderID string) *ConnPool {
 	if !ok {
 		return nil
 	}
-	return NewConnPool(fwdAddr, n.cfg.TLSConfig, defaultPoolSize)
+	return NewConnPool(fwdAddr, n.cfg.TLSConfig, n.cfg.ForwardPoolSize)
 }
 
 // IsLeader reports whether this node is the current Raft leader.
