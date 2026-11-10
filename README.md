@@ -775,6 +775,16 @@ This is the standard recommendation for all distributed databases that
 use Raft (etcd, CockroachDB, rqlite, Consul) — push idempotency into the
 data model rather than building a distributed deduplication layer.
 
+### Leadership transfer
+
+`node.TransferLeadership()` hands leadership to the voter with the most of
+the log, and `node.TransferLeadershipTo(id)` to a named one. Each returns
+once this node has stepped down, and fails after about the election timeout
+if no voter answers. While a transfer runs, writes on the leader are
+refused. `node.Shutdown()` on a leader transfers first, so the cluster has
+a new leader at once instead of after an election timeout with none; if
+the transfer fails, it logs a warning and stops anyway.
+
 ### Membership changes
 
 A node that joins a running cluster, to grow it or to replace a lost

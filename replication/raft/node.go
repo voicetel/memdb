@@ -617,6 +617,36 @@ func (n *Node) AddVoter(nodeID, addr string, timeout time.Duration) error {
 	return nil
 }
 
+// TransferLeadership hands leadership to the voter with the most of the log, and
+// returns once this node has stepped down. It must be called on the leader.
+// hashicorp/raft brings the target up to date, tells it to start an election at
+// once, and refuses writes on this node meanwhile; it gives up after about the
+// election timeout, so a cluster with no other voter, or none that answers,
+// fails it in bounded time.
+func (n *Node) TransferLeadership() error {
+	if err := n.raft.LeadershipTransfer().Error(); err != nil {
+		return fmt.Errorf("raft node: transfer leadership: %w", err)
+	}
+	return nil
+}
+
+// TransferLeadershipTo is TransferLeadership to a named voter.
+func (n *Node) TransferLeadershipTo(nodeID string) error {
+	cfg := n.raft.GetConfiguration()
+	if err := cfg.Error(); err != nil {
+		return fmt.Errorf("raft node: transfer leadership: %w", err)
+	}
+	for _, s := range cfg.Configuration().Servers {
+		if string(s.ID) == nodeID {
+			if err := n.raft.LeadershipTransferToServer(s.ID, s.Address).Error(); err != nil {
+				return fmt.Errorf("raft node: transfer leadership to %s: %w", nodeID, err)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("raft node: transfer leadership: %s is not a member", nodeID)
+}
+
 // RemoveServer removes a node from the cluster. Must be called on the leader.
 func (n *Node) RemoveServer(nodeID string, timeout time.Duration) error {
 	f := n.raft.RemoveServer(hraft.ServerID(nodeID), 0, timeout)
@@ -629,9 +659,20 @@ func (n *Node) RemoveServer(nodeID string, timeout time.Duration) error {
 // Shutdown gracefully stops this Raft node.
 // It is safe to call Shutdown more than once; subsequent calls are no-ops
 // that return nil.
+//
+// A leader first hands leadership to another voter (TransferLeadership), so the
+// cluster has a new leader at once rather than after an election timeout with
+// no leader. That is bounded by about the election timeout; if it fails, for
+// want of a voter that answers, the failure is logged and the node stops
+// anyway.
 func (n *Node) Shutdown() error {
 	var retErr error
 	n.shutdownOnce.Do(func() {
+		if n.raft.State() == hraft.Leader {
+			if err := n.TransferLeadership(); err != nil {
+				n.logger().Warn("memdb raft: could not hand leadership over before shutting down", "error", err)
+			}
+		}
 		if n.forwarder != nil {
 			_ = n.forwarder.close()
 		}
