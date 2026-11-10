@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"crypto/tls"
 	"database/sql"
 	"errors"
@@ -77,7 +78,7 @@ func TestForwardedErrorsKeepTheirType(t *testing.T) {
 
 	for name, onLeader := range leaderErrs {
 		t.Run(name, func(t *testing.T) {
-			_, forwarded := sendForward(pool, ForwardRequest{SQL: name}, 5*time.Second)
+			_, forwarded := sendForward(context.Background(), pool, ForwardRequest{SQL: name}, 5*time.Second)
 			if forwarded == nil {
 				t.Fatal("the forwarded write succeeded")
 			}

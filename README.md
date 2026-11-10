@@ -261,10 +261,17 @@ type Config struct {
 	// If nil (and OnExec is nil), Exec operates locally (standalone mode).
 	OnExecResult func(sql string, args []any) (int64, error)
 
+	// OnExecResult with the caller's context: the context given to
+	// ExecContext bounds the consensus round trip, and its cancellation
+	// reaches the forward to the leader. Wire it to
+	// raft.Node.ExecResultContext. A write whose context ends first may
+	// still commit, since Raft cannot recall an entry it has taken.
+	OnExecContext func(ctx context.Context, sql string, args []any) (int64, error)
+
 	// Legacy variant of OnExecResult without the count — still supported,
 	// but Exec then reports 0 rows affected for every statement. Clients
 	// that gate on the count (e.g. OpenSIPS msilo over the pg-wire
-	// server) need OnExecResult. Setting both is a configuration error.
+	// server) need OnExecResult. Set at most one of the three hooks.
 	OnExec func(sql string, args []any) error
 }
 ```
@@ -684,7 +691,13 @@ func openClusterNode(tlsCfg *tls.Config, nodeID string) (*memdb.DB, *mraft.Node,
 > The legacy `OnExec` hook (error-only signature) still works but reports
 > `RowsAffected() == 0` for every statement — clients that gate on the
 > affected-row count (e.g. OpenSIPS msilo over the pg-wire server) need
-> `OnExecResult`. Setting both hooks is a configuration error.
+> `OnExecResult`. Setting more than one of `OnExec`, `OnExecResult`, and
+> `OnExecContext` is a configuration error.
+>
+> `OnExecContext`, wired to `node.ExecResultContext`, also carries the
+> context given to `db.ExecContext`: once it ends, the leader stops waiting
+> for the commit and a follower ends its forward, each returning an error
+> that wraps the context's. Such a write may still commit.
 
 ### Write flow
 

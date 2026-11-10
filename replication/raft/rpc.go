@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/gob"
@@ -285,7 +286,7 @@ func (p *ConnPool) IdleCount() int {
 // and — if both succeeded — returns the connection to the pool for reuse. On
 // any transport error the connection is discarded rather than pooled, so
 // a broken connection is never handed to the next caller.
-func sendForward(pool *ConnPool, req ForwardRequest, timeout time.Duration) (int64, error) {
+func sendForward(ctx context.Context, pool *ConnPool, req ForwardRequest, timeout time.Duration) (int64, error) {
 	conn, err := pool.Get(timeout)
 	if err != nil {
 		return 0, err
@@ -298,22 +299,31 @@ func sendForward(pool *ConnPool, req ForwardRequest, timeout time.Duration) (int
 		_ = conn.Close()
 		return 0, fmt.Errorf("rpc: set deadline: %w", err)
 	}
-
-	if err := conn.writeMsg(req); err != nil {
-		_ = conn.Close()
-		return 0, err
+	// A context that can end, by cancellation or its own deadline, expires
+	// the connection's deadline when it does, which ends the exchange at
+	// once with the context's error. A context that cannot costs nothing.
+	stop := func() bool { return true }
+	if ctx.Done() != nil {
+		stop = context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
 	}
 
-	var resp ForwardResponse
-	if err := conn.readMsg(&resp); err != nil {
+	resp, err := exchange(conn, req)
+	if !stop() || err != nil {
+		// The context ended during the exchange, or the exchange failed: the
+		// connection's state is unknown, so it is not reused.
 		_ = conn.Close()
-		return 0, err
+		if ctxErr := ctx.Err(); ctxErr != nil && err != nil {
+			return 0, fmt.Errorf("rpc: forward stopped, and the write may still commit: %w", ctxErr)
+		}
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		// Clear the deadline before returning the connection to the pool so
+		// it doesn't expire while idle.
+		_ = conn.SetDeadline(time.Time{})
+		pool.Put(conn)
 	}
-
-	// Clear the deadline before returning the connection to the pool so it
-	// doesn't expire while idle.
-	_ = conn.SetDeadline(time.Time{})
-	pool.Put(conn)
 
 	if resp.ErrMsg != "" {
 		// Translate known sentinel codes back into typed errors so callers
@@ -326,6 +336,16 @@ func sendForward(pool *ConnPool, req ForwardRequest, timeout time.Duration) (int
 		return 0, forwardedError(resp)
 	}
 	return resp.RowsAffected, nil
+}
+
+// exchange sends one request and reads its answer.
+func exchange(conn *RPCConn, req ForwardRequest) (ForwardResponse, error) {
+	var resp ForwardResponse
+	if err := conn.writeMsg(req); err != nil {
+		return resp, err
+	}
+	err := conn.readMsg(&resp)
+	return resp, err
 }
 
 // ForwardedError is an error a forwarded write met on the leader, as the

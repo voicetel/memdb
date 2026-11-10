@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -514,6 +515,17 @@ func (n *Node) Exec(sql string, args ...any) error {
 // ResultDB); on the forwarded-follower path it arrives in ForwardResponse.
 // A cluster whose DB does not implement ResultDB reports 0.
 func (n *Node) ExecResult(sql string, args ...any) (int64, error) {
+	return n.ExecResultContext(context.Background(), sql, args...)
+}
+
+// ExecResultContext is ExecResult bounded by ctx as well as by ApplyTimeout. On
+// the leader it stops waiting for the commit once ctx ends; on a follower it
+// ends the forward. Either way the error wraps ctx's, and the write may still
+// commit, since Raft cannot recall an entry it has taken.
+func (n *Node) ExecResultContext(ctx context.Context, sql string, args ...any) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	// If we are the leader, apply directly through Raft.
 	if n.raft.State() == hraft.Leader {
 		entry := replication.WALEntry{
@@ -526,7 +538,7 @@ func (n *Node) ExecResult(sql string, args ...any) (int64, error) {
 			SQL:       sql,
 			Args:      args,
 		}
-		return ApplyResult(n.raft, entry, n.cfg.ApplyTimeout)
+		return ApplyResultContext(ctx, n.raft, entry, n.cfg.ApplyTimeout)
 	}
 
 	// We are not the leader. Check the arguments as the leader will encode
@@ -563,7 +575,7 @@ func (n *Node) ExecResult(sql string, args ...any) (int64, error) {
 		}
 	}
 
-	return sendForward(pool, ForwardRequest{
+	return sendForward(ctx, pool, ForwardRequest{
 		SQL:  sql,
 		Args: args,
 	}, n.cfg.ApplyTimeout)
