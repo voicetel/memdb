@@ -708,8 +708,14 @@ Forwarded writes reuse TLS connections from a per-leader channel-based
 connection pool, eliminating the TLS handshake cost on every write when
 the leader is stable.
 
+The pool bounds the connections kept idle, not the writes in flight: a
+forward that finds no idle connection dials one of its own, and the pool
+closes it afterwards if it is already full. `NodeConfig.ForwardPoolSize`
+sets the capacity (default 8); raise it toward a follower's usual number of
+concurrent writes so they stop paying for handshakes.
+
 ```
-pool (buffered channel of idle *tls.Conn, capacity 8)
+pool (buffered channel of idle *tls.Conn, capacity ForwardPoolSize, default 8)
 
 Get()  → non-blocking receive from channel
              hit  → return warm connection (no handshake)
