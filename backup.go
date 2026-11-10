@@ -67,29 +67,29 @@ func copyMemToWriter(ctx context.Context, d *DB, w io.Writer, stepPages int) err
 // Memory is O(1) regardless of snapshot size — the verifier uses a
 // 64 KiB sliding window and writes the verified payload straight to
 // disk; the temp file is then handed to the SQLite backup API.
-func restoreVerifiedSnapshot(ctx context.Context, d *DB, r io.Reader) (isLegacy bool, err error) {
+func restoreVerifiedSnapshot(ctx context.Context, d *DB, r io.Reader) (snapSeq uint64, isLegacy bool, err error) {
 	tmp, err := os.CreateTemp("", ".memdb-restore-*.db")
 	if err != nil {
-		return false, fmt.Errorf("memdb: restore temp: %w", err)
+		return 0, false, fmt.Errorf("memdb: restore temp: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }()
 
-	isLegacy, verr := verifyAndStreamPayload(r, tmp)
+	snapSeq, isLegacy, verr := verifyAndStreamPayload(r, tmp)
 	if cerr := tmp.Close(); cerr != nil && verr == nil {
 		verr = cerr
 	}
 	if verr != nil {
-		return isLegacy, verr
+		return snapSeq, isLegacy, verr
 	}
 
 	fileDB, err := openFileDB(tmpName)
 	if err != nil {
-		return isLegacy, err
+		return snapSeq, isLegacy, err
 	}
 	defer func() { _ = fileDB.Close() }()
 
-	return isLegacy, withRawConn(ctx, fileDB, func(fileConn *sqlite3.SQLiteConn) error {
+	return snapSeq, isLegacy, withRawConn(ctx, fileDB, func(fileConn *sqlite3.SQLiteConn) error {
 		return withRawConn(ctx, d.mem, func(memConn *sqlite3.SQLiteConn) error {
 			return copyDB(ctx, fileConn, memConn, d.cfg.BackupStepPages)
 		})

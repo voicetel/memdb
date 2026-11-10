@@ -82,6 +82,11 @@ func (w *WAL) NextSeq() uint64 {
 	return w.seq.Add(1)
 }
 
+// Seq returns the highest sequence number handed out so far.
+func (w *WAL) Seq() uint64 {
+	return w.seq.Load()
+}
+
 // Append encodes entry in the binary v1 format, writes the length-prefixed
 // record, and fsyncs.
 //
@@ -129,16 +134,33 @@ func (w *WAL) Append(entry WALEntry) error {
 	return w.f.Sync()
 }
 
-// Replay reads every entry from the log and calls fn for each.
-// fn is called without holding the WAL mutex so it can safely call
-// Append — but note the replay callback is typically db.mem.Exec which
-// does NOT re-enter the WAL, so this is not actually exercised.
+// Replay reads every entry from the log and calls fn for each. It is
+// ReplayFrom(0, fn): every entry is replayed.
 func (w *WAL) Replay(fn func(WALEntry) error) error {
+	return w.ReplayFrom(0, fn)
+}
+
+// ReplayFrom reads every entry whose Seq is greater than from and calls fn for
+// each. from is the snapshot's checkpoint: entries at or below it were already
+// in the snapshot the caller restored, so re-applying them would fail (or
+// double-apply), and skipping them is what makes recovery idempotent across a
+// crash between writing the snapshot and truncating the WAL.
+//
+// The sequence counter is seeded to at least from so a later Append never
+// reuses a sequence number an already-snapshotted entry holds. fn is called
+// without holding the WAL mutex.
+func (w *WAL) ReplayFrom(from uint64, fn func(WALEntry) error) error {
 	entries, err := w.readAll()
 	if err != nil {
 		return err
 	}
+	if from > w.seq.Load() {
+		w.seq.Store(from)
+	}
 	for _, entry := range entries {
+		if entry.Seq <= from {
+			continue
+		}
 		if err := fn(entry); err != nil {
 			return err
 		}
@@ -164,6 +186,7 @@ func (w *WAL) readAll() ([]WALEntry, error) {
 
 	var entries []WALEntry
 	var lenBuf [4]byte
+	offset := int64(0) // offset of the next record's length prefix
 	for {
 		// Read the 4-byte length prefix.
 		_, err := io.ReadFull(w.f, lenBuf[:])
@@ -196,8 +219,33 @@ func (w *WAL) readAll() ([]WALEntry, error) {
 			break
 		}
 		entries = append(entries, entry)
+		offset += 4 + int64(length)
+	}
+	// A torn or corrupt tail is cut off now, so later Appends land right after
+	// the last valid entry instead of behind the torn bytes. Without this, a
+	// second crash left acknowledged writes after a torn record unreachable,
+	// because replay stopped at the torn record and never saw them.
+	if err := w.cutTail(offset); err != nil {
+		return nil, err
 	}
 	return entries, nil
+}
+
+// cutTail truncates the file to offset and fsyncs the truncation, so replay's
+// view of the tail is durable. offset is the end of the last valid record, or
+// the current end when every record was valid.
+func (w *WAL) cutTail(offset int64) error {
+	end, err := w.f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("memdb: wal seek end: %w", err)
+	}
+	if offset == end {
+		return nil
+	}
+	if err := w.f.Truncate(offset); err != nil {
+		return fmt.Errorf("memdb: wal truncate torn tail: %w", err)
+	}
+	return w.f.Sync()
 }
 
 // Truncate clears the WAL after a successful snapshot.
