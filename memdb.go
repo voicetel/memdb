@@ -32,16 +32,23 @@ import (
 // Transactions (Begin, BeginTx, WithTx) are not supported in this mode
 // because they cannot span consensus rounds.
 type DB struct {
-	mem      *sql.DB // single writer connection (also used for Flush/WAL)
-	cfg      Config
-	wal      *WAL
-	replica  *replicaPool // nil when ReadPoolSize == 0
-	stmts    *stmtCache   // prepared-statement cache for d.mem
-	mu       sync.Mutex   // serialises Flush calls
-	stopOnce sync.Once
-	stop     chan struct{}
-	wg       sync.WaitGroup
-	closed   atomic.Bool
+	mem     *sql.DB // single writer connection (also used for Flush/WAL)
+	cfg     Config
+	wal     *WAL
+	replica *replicaPool // nil when ReadPoolSize == 0
+	stmts   *stmtCache   // prepared-statement cache for d.mem
+	// writeMu serialises a write (its SQL apply plus its WAL append) with a
+	// Flush, so the checkpoint a snapshot records never races a write: every
+	// entry at or below the checkpoint is in the snapshot, and every entry
+	// above it survives in the WAL after the truncate.
+	writeMu sync.Mutex
+	// snapshotSeq is the checkpoint the last restore read from the snapshot;
+	// WAL entries at or below it are skipped on replay.
+	snapshotSeq uint64
+	stopOnce    sync.Once
+	stop        chan struct{}
+	wg          sync.WaitGroup
+	closed      atomic.Bool
 
 	// writeGen is a monotonic counter bumped on every successful write
 	// against the in-memory DB (Exec, ExecContext, execDirect, and any
@@ -132,7 +139,7 @@ func Open(cfg Config) (*DB, error) {
 		// Replay any entries written after the last snapshot. Use the stmt
 		// cache so repeated SQL strings (the common case for replay — many
 		// INSERTs into the same table) don't re-prepare per entry.
-		if err := db.wal.Replay(func(e WALEntry) error {
+		if err := db.wal.ReplayFrom(db.snapshotSeq, func(e WALEntry) error {
 			_, err := db.stmts.ExecContext(context.Background(), e.SQL, e.Args...)
 			return err
 		}); err != nil {
@@ -218,10 +225,10 @@ func (d *DB) writeDurability(ctx context.Context, query string, args []any) erro
 		}
 	}
 	if d.cfg.Durability == DurabilitySync {
-		// Full synchronous flush to the backend. flushUnchecked serialises
-		// with background flushes via d.mu so there is no risk of two
-		// overlapping backend writes.
-		if err := d.flushUnchecked(ctx); err != nil {
+		// Full synchronous flush to the backend. The caller holds writeMu, so
+		// flushLocked (which does not re-acquire it) writes the checkpoint and
+		// truncates the WAL under the same exclusion as this write.
+		if err := d.flushLocked(ctx); err != nil {
 			return err
 		}
 	}
@@ -236,6 +243,8 @@ func (d *DB) execDirect(query string, args ...any) (int64, error) {
 	if d.closed.Load() {
 		return 0, ErrClosed
 	}
+	unlock := d.lockWrite()
+	defer unlock()
 	result, err := d.stmts.ExecContext(context.Background(), query, args...)
 	if err != nil {
 		return 0, err
@@ -327,7 +336,10 @@ func (d *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Re
 		return driver.RowsAffected(0), nil
 	}
 
-	// Standalone (no replication): write locally.
+	// Standalone (no replication): write locally, under the write lock when
+	// the WAL is active, so a Flush cannot snapshot a half-written state.
+	unlock := d.lockWrite()
+	defer unlock()
 	result, err := d.stmts.ExecContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -337,6 +349,18 @@ func (d *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Re
 		return nil, err
 	}
 	return result, nil
+}
+
+// lockWrite returns the unlock function for a write. With the WAL active it
+// takes writeMu, which Flush also takes, so the two are mutually exclusive.
+// Without a WAL (DurabilityNone) there is no checkpoint or truncate to keep
+// consistent, so the hot path stays lock-free.
+func (d *DB) lockWrite() func() {
+	if d.wal == nil {
+		return func() {}
+	}
+	d.writeMu.Lock()
+	return d.writeMu.Unlock
 }
 
 // Query executes a query that returns rows. When a read pool is configured
@@ -469,11 +493,25 @@ func (d *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) 
 // Flush guard must be bypassed. All background goroutines have exited by the
 // time this is called, so no concurrent writes can occur.
 func (d *DB) flushUnchecked(ctx context.Context) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	return d.flushLocked(ctx)
+}
 
+// flushLocked performs a flush with writeMu already held, so no write can land
+// between the checkpoint capture, the snapshot, and the WAL truncate.
+func (d *DB) flushLocked(ctx context.Context) error {
 	start := time.Now()
-	err := d.cfg.Backend.flush(ctx, d)
+
+	// Capture the checkpoint first: every entry at or below snapSeq is about
+	// to be in the snapshot, and no write is in flight, so truncating up to it
+	// loses nothing and leaves nothing the snapshot already holds.
+	var snapSeq uint64
+	if d.wal != nil {
+		snapSeq = d.wal.Seq()
+	}
+
+	err := d.cfg.Backend.flush(ctx, d, snapSeq)
 	if err != nil {
 		err = fmt.Errorf("%w: %w", ErrFlushFailed, err)
 	}
@@ -583,7 +621,12 @@ func (d *DB) restore() error {
 	if !exists {
 		return nil
 	}
-	return d.cfg.Backend.restore(context.Background(), d)
+	snapSeq, err := d.cfg.Backend.restore(context.Background(), d)
+	if err != nil {
+		return err
+	}
+	d.snapshotSeq = snapSeq
+	return nil
 }
 
 // replicaRefreshLoop periodically serializes the writer and deserializes into

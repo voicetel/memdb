@@ -21,10 +21,16 @@ import (
 // Wire layout (all multi-byte fields big-endian):
 //
 //	[4]byte  magic         = snapMagic  ("MDBK")
-//	[4]byte  version       = 1          (uint32)
+//	[4]byte  version       = 2          (uint32)
+//	[8]byte  walSeq        = highest WAL sequence number the snapshot includes
 //	[N]byte  payload       = raw SQLite bytes
 //	[8]byte  payloadLen    = uint64(N)
 //	[32]byte sha256        = SHA-256 of payload
+//
+// walSeq is the snapshot's checkpoint. On restore, WAL entries at or below it
+// are skipped, because their effect is already in the snapshot. That makes
+// recovery idempotent across a crash between the snapshot's rename and the WAL
+// truncate. Version 1 snapshots have no walSeq and replay every entry.
 //
 // Why footer (not header) hash: the SHA-256 cannot be known until the
 // payload has been seen in full. A header-hash format forced us to buffer
@@ -48,9 +54,12 @@ import (
 var snapMagic = [4]byte{'M', 'D', 'B', 'K'}
 
 const (
-	// snapPrefixLen is the leading [magic][version] = 8 bytes that
-	// identifies the wrapped format and selects a decoder version.
-	snapPrefixLen = 4 + 4
+	// snapVersion is the current snapshot format. Version 2 added the walSeq
+	// checkpoint after the version word; version 1 had neither.
+	snapVersion uint32 = 2
+
+	// snapHeaderLen is the whole header: [magic][version][walSeq].
+	snapHeaderLen = 4 + 4 + 8
 
 	// snapFooterLen is the trailing [payloadLen][sha256] = 40 bytes
 	// written after the payload. The reader uses this as the size of
@@ -72,13 +81,16 @@ type snapshotWriter struct {
 	finished bool
 }
 
-// newSnapshotWriter writes the leading [magic][version] header to dst
-// and returns a writer that streams payload bytes to dst while hashing
-// them. The caller must invoke Finish to write the trailing footer.
-func newSnapshotWriter(dst io.Writer) (*snapshotWriter, error) {
-	var hdr [snapPrefixLen]byte
+// newSnapshotWriter writes the leading [magic][version][walSeq] header to dst
+// and returns a writer that streams payload bytes to dst while hashing them.
+// walSeq is the snapshot's checkpoint: the highest WAL sequence number whose
+// effect the snapshot includes. The caller must invoke Finish to write the
+// trailing footer.
+func newSnapshotWriter(dst io.Writer, walSeq uint64) (*snapshotWriter, error) {
+	var hdr [snapHeaderLen]byte
 	copy(hdr[0:4], snapMagic[:])
-	binary.BigEndian.PutUint32(hdr[4:8], 1) // version
+	binary.BigEndian.PutUint32(hdr[4:8], snapVersion)
+	binary.BigEndian.PutUint64(hdr[8:16], walSeq)
 	if _, err := dst.Write(hdr[:]); err != nil {
 		return nil, fmt.Errorf("snapshot: write header: %w", err)
 	}
@@ -132,12 +144,15 @@ func (s *snapshotWriter) Finish() error {
 // arbitrarily large stream without buffering it. This is the public
 // entry point used by external tooling such as cmd/memdb-cli.
 func UnwrapSnapshot(r io.Reader, dst io.Writer) (isLegacy bool, err error) {
-	return verifyAndStreamPayload(r, dst)
+	_, isLegacy, err = verifyAndStreamPayload(r, dst)
+	return isLegacy, err
 }
 
 // verifyAndStreamPayload reads a wrapped snapshot from r, verifies its
 // integrity, and writes the raw SQLite payload bytes to dst as it streams.
-// Memory is O(1) — only a 64 KiB read buffer plus the running SHA-256 state.
+// It returns the snapshot's checkpoint walSeq (0 for a version-1 or legacy
+// snapshot), and isLegacy. Memory is O(1) — only a 64 KiB read buffer plus the
+// running SHA-256 state.
 //
 // If r does not begin with snapMagic, the data is assumed to be a legacy
 // (unwrapped) raw SQLite file. The 4 bytes already read are emitted to dst,
@@ -146,10 +161,10 @@ func UnwrapSnapshot(r io.Reader, dst io.Writer) (isLegacy bool, err error) {
 //
 // Returns ErrSnapshotCorrupt for a wrapped snapshot whose footer indicates
 // a length or hash mismatch, or whose footer is truncated.
-func verifyAndStreamPayload(r io.Reader, dst io.Writer) (isLegacy bool, err error) {
+func verifyAndStreamPayload(r io.Reader, dst io.Writer) (snapSeq uint64, isLegacy bool, err error) {
 	var magic [4]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
-		return false, fmt.Errorf("%w: too short to read magic", ErrSnapshotCorrupt)
+		return 0, false, fmt.Errorf("%w: too short to read magic", ErrSnapshotCorrupt)
 	}
 
 	if magic != snapMagic {
@@ -157,19 +172,28 @@ func verifyAndStreamPayload(r io.Reader, dst io.Writer) (isLegacy bool, err erro
 		// actually the start of the SQLite header) and stream the rest
 		// unchanged.
 		if _, werr := dst.Write(magic[:]); werr != nil {
-			return true, werr
+			return 0, true, werr
 		}
 		if _, cerr := io.Copy(dst, r); cerr != nil {
-			return true, cerr
+			return 0, true, cerr
 		}
-		return true, nil
+		return 0, true, nil
 	}
 
 	var verBuf [4]byte
 	if _, err := io.ReadFull(r, verBuf[:]); err != nil {
-		return false, fmt.Errorf("%w: truncated version", ErrSnapshotCorrupt)
+		return 0, false, fmt.Errorf("%w: truncated version", ErrSnapshotCorrupt)
 	}
-	// version := binary.BigEndian.Uint32(verBuf[:]) — reserved for future use.
+	version := binary.BigEndian.Uint32(verBuf[:])
+
+	var walSeq uint64
+	if version >= 2 {
+		var seqBuf [8]byte
+		if _, err := io.ReadFull(r, seqBuf[:]); err != nil {
+			return 0, false, fmt.Errorf("%w: truncated checkpoint", ErrSnapshotCorrupt)
+		}
+		walSeq = binary.BigEndian.Uint64(seqBuf[:])
+	}
 
 	hasher := sha256.New()
 	var payloadLen uint64
@@ -186,21 +210,21 @@ func verifyAndStreamPayload(r io.Reader, dst io.Writer) (isLegacy bool, err erro
 	for {
 		peek, perr := br.Peek(peekSize)
 		if perr != nil && perr != io.EOF {
-			return false, fmt.Errorf("%w: read: %v", ErrSnapshotCorrupt, perr)
+			return walSeq, false, fmt.Errorf("%w: read: %v", ErrSnapshotCorrupt, perr)
 		}
 
 		if perr == io.EOF {
 			// Final batch — everything left is in peek. Trailing
 			// snapFooterLen bytes are the footer.
 			if len(peek) < snapFooterLen {
-				return false, fmt.Errorf("%w: footer truncated (got %d bytes, want >= %d)",
+				return walSeq, false, fmt.Errorf("%w: footer truncated (got %d bytes, want >= %d)",
 					ErrSnapshotCorrupt, len(peek), snapFooterLen)
 			}
 			payload := peek[:len(peek)-snapFooterLen]
 			footer := peek[len(peek)-snapFooterLen:]
 			if len(payload) > 0 {
 				if _, werr := dst.Write(payload); werr != nil {
-					return false, werr
+					return walSeq, false, werr
 				}
 				_, _ = hasher.Write(payload)
 				payloadLen += uint64(len(payload))
@@ -211,16 +235,16 @@ func verifyAndStreamPayload(r io.Reader, dst io.Writer) (isLegacy bool, err erro
 			copy(storedSum[:], footer[8:40])
 
 			if storedLen != payloadLen {
-				return false, fmt.Errorf("%w: payload length mismatch (footer claims %d, got %d)",
+				return walSeq, false, fmt.Errorf("%w: payload length mismatch (footer claims %d, got %d)",
 					ErrSnapshotCorrupt, storedLen, payloadLen)
 			}
 			var computed [32]byte
 			copy(computed[:], hasher.Sum(nil))
 			if computed != storedSum {
-				return false, fmt.Errorf("%w: SHA-256 mismatch (expected %x, got %x)",
+				return walSeq, false, fmt.Errorf("%w: SHA-256 mismatch (expected %x, got %x)",
 					ErrSnapshotCorrupt, storedSum, computed)
 			}
-			return false, nil
+			return walSeq, false, nil
 		}
 
 		// More data follows after this peek window — safe to consume
@@ -229,16 +253,16 @@ func verifyAndStreamPayload(r io.Reader, dst io.Writer) (isLegacy bool, err erro
 		if consume <= 0 {
 			// Buffer is full but smaller than snapFooterLen would require —
 			// impossible since peekSize >> snapFooterLen, but defensive.
-			return false, fmt.Errorf("%w: peek returned %d bytes, expected at least %d",
+			return walSeq, false, fmt.Errorf("%w: peek returned %d bytes, expected at least %d",
 				ErrSnapshotCorrupt, len(peek), snapFooterLen+1)
 		}
 		if _, werr := dst.Write(peek[:consume]); werr != nil {
-			return false, werr
+			return walSeq, false, werr
 		}
 		_, _ = hasher.Write(peek[:consume])
 		payloadLen += uint64(consume)
 		if _, derr := br.Discard(consume); derr != nil {
-			return false, fmt.Errorf("%w: discard: %v", ErrSnapshotCorrupt, derr)
+			return walSeq, false, fmt.Errorf("%w: discard: %v", ErrSnapshotCorrupt, derr)
 		}
 	}
 }
@@ -253,12 +277,15 @@ type Backend interface {
 	// Exists reports whether a snapshot already exists in the backend.
 	Exists(ctx context.Context) (bool, error)
 
-	// flush writes the current in-memory DB state to the backend.
-	// Called by Flush; the d argument is the owning DB.
-	flush(ctx context.Context, d *DB) error
+	// flush writes the current in-memory DB state to the backend. snapSeq
+	// is the WAL checkpoint to record in the snapshot: the highest WAL
+	// sequence number whose effect the snapshot includes. Called by Flush;
+	// the d argument is the owning DB.
+	flush(ctx context.Context, d *DB, snapSeq uint64) error
 
-	// restore reads a snapshot from the backend into the memory DB.
-	restore(ctx context.Context, d *DB) error
+	// restore reads a snapshot from the backend into the memory DB and
+	// returns the checkpoint the snapshot records (0 when it records none).
+	restore(ctx context.Context, d *DB) (uint64, error)
 }
 
 // LocalBackend persists snapshots to the local filesystem using an atomic
@@ -278,7 +305,7 @@ func (b *LocalBackend) Exists(_ context.Context) (bool, error) {
 // flush streams the in-memory DB through the snapshot writer to a temp
 // file (hashing as the bytes pass through), writes the integrity footer,
 // then renames into place.
-func (b *LocalBackend) flush(ctx context.Context, d *DB) error {
+func (b *LocalBackend) flush(ctx context.Context, d *DB, snapSeq uint64) error {
 	dir := filepath.Dir(b.Path)
 	tmp, err := os.CreateTemp(dir, ".memdb-snap-*.db")
 	if err != nil {
@@ -286,7 +313,7 @@ func (b *LocalBackend) flush(ctx context.Context, d *DB) error {
 	}
 	tmpName := tmp.Name()
 
-	sw, err := newSnapshotWriter(tmp)
+	sw, err := newSnapshotWriter(tmp, snapSeq)
 	if err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
@@ -325,22 +352,22 @@ func (b *LocalBackend) flush(ctx context.Context, d *DB) error {
 // in-memory DB. Verification is incremental — bytes flow to a temp file
 // while the SHA-256 is computed and the trailing footer is checked on
 // EOF, so peak memory is independent of snapshot size.
-func (b *LocalBackend) restore(ctx context.Context, d *DB) error {
+func (b *LocalBackend) restore(ctx context.Context, d *DB) (uint64, error) {
 	f, err := os.Open(b.Path)
 	if err != nil {
-		return fmt.Errorf("local backend: open for restore: %w", err)
+		return 0, fmt.Errorf("local backend: open for restore: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
-	isLegacy, err := restoreVerifiedSnapshot(ctx, d, f)
+	snapSeq, isLegacy, err := restoreVerifiedSnapshot(ctx, d, f)
 	if err != nil {
-		return fmt.Errorf("local backend: %w", err)
+		return 0, fmt.Errorf("local backend: %w", err)
 	}
 	if isLegacy {
 		d.logger().Warn("memdb: snapshot has no integrity checksum (legacy format); " +
 			"the next flush will upgrade it to the checksummed format")
 	}
-	return nil
+	return snapSeq, nil
 }
 
 // copyMemToWriter and copyReaderToMem are declared in backup.go alongside
@@ -421,7 +448,7 @@ func (a *externalBackendAdapter) Exists(ctx context.Context) (bool, error) {
 // copyMemToWriter through the optional snapshotWriter (which hashes as
 // it streams) into the pipe, with the backend's Write consuming from
 // the read end.
-func (a *externalBackendAdapter) flush(ctx context.Context, d *DB) error {
+func (a *externalBackendAdapter) flush(ctx context.Context, d *DB, snapSeq uint64) error {
 	pr, pw := io.Pipe()
 
 	var copyErr error
@@ -432,7 +459,7 @@ func (a *externalBackendAdapter) flush(ctx context.Context, d *DB) error {
 		var sw *snapshotWriter
 		if !a.skipHeader() {
 			var err error
-			sw, err = newSnapshotWriter(pw)
+			sw, err = newSnapshotWriter(pw, snapSeq)
 			if err != nil {
 				copyErr = err
 				pw.CloseWithError(err)
@@ -482,22 +509,22 @@ func (a *externalBackendAdapter) skipHeader() bool {
 // Authenticated, an absent MDBK prefix is treated as the headerless
 // format rather than a legacy snapshot — no warning is emitted because
 // the AEAD tag has already authenticated the bytes.
-func (a *externalBackendAdapter) restore(ctx context.Context, d *DB) error {
+func (a *externalBackendAdapter) restore(ctx context.Context, d *DB) (uint64, error) {
 	rc, err := a.inner.Read(ctx)
 	if err != nil {
-		return fmt.Errorf("external backend: read: %w", err)
+		return 0, fmt.Errorf("external backend: read: %w", err)
 	}
 	defer func() { _ = rc.Close() }()
 
-	isLegacy, err := restoreVerifiedSnapshot(ctx, d, rc)
+	snapSeq, isLegacy, err := restoreVerifiedSnapshot(ctx, d, rc)
 	if err != nil {
-		return fmt.Errorf("external backend: %w", err)
+		return 0, fmt.Errorf("external backend: %w", err)
 	}
 	if isLegacy && !a.skipHeader() {
 		d.logger().Warn("memdb: snapshot has no integrity checksum (legacy format); " +
 			"the next flush will upgrade it to the checksummed format")
 	}
-	return nil
+	return snapSeq, nil
 }
 
 // Ensure the adapter satisfies the internal interface at compile time.

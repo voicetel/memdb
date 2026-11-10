@@ -1042,8 +1042,8 @@ func TestSnapshot_Checksum_Corruption(t *testing.T) {
 	}
 }
 
-// TestSnapshot_Checksum_HeaderCorruption verifies that corrupting the stored
-// SHA-256 in the header itself (bytes 8–39) also triggers ErrSnapshotCorrupt.
+// TestSnapshot_Checksum_HeaderCorruption verifies that corrupting a payload
+// byte — which the trailing SHA-256 covers — triggers ErrSnapshotCorrupt.
 func TestSnapshot_Checksum_HeaderCorruption(t *testing.T) {
 	cfg := extraTestConfig(t)
 	db := mustOpen(t, cfg)
@@ -1057,16 +1057,18 @@ func TestSnapshot_Checksum_HeaderCorruption(t *testing.T) {
 	}
 	_ = db.Close()
 
-	// Flip a byte inside the SHA-256 field of the header (offset 8).
+	// Flip the first payload byte, just past the [magic][version][walSeq]
+	// header, which the trailing SHA-256 covers.
+	const headerLen = 16
 	path := cfg.FilePath
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	if len(data) < 44 {
-		t.Skipf("snapshot too small (%d bytes) to have a full header", len(data))
+	if len(data) < headerLen+1 {
+		t.Skipf("snapshot too small (%d bytes) to hold a payload byte", len(data))
 	}
-	data[8] ^= 0x01
+	data[headerLen] ^= 0x01
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -1099,17 +1101,17 @@ func TestSnapshot_Legacy_NoChecksum(t *testing.T) {
 	}
 	_ = db.Close()
 
-	// Strip the snapshot wrapping ([magic][version] prefix at the front,
-	// [payloadLen][sha256] footer at the back), leaving a raw SQLite
-	// file. This simulates a snapshot written by some other tool — or
-	// by a pre-wrapping version of memdb — that begins directly with
-	// the SQLite header bytes.
+	// Strip the snapshot wrapping ([magic][version][walSeq] prefix at the
+	// front, [payloadLen][sha256] footer at the back), leaving a raw SQLite
+	// file. This simulates a snapshot written by some other tool — or by a
+	// pre-wrapping version of memdb — that begins directly with the SQLite
+	// header bytes.
 	path := cfg.FilePath
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	const prefixLen = 8  // snapPrefixLen: magic(4) + version(4)
+	const prefixLen = 16 // snapHeaderLen: magic(4) + version(4) + walSeq(8)
 	const footerLen = 40 // snapFooterLen: payloadLen(8) + sha256(32)
 	if len(data) < prefixLen+footerLen {
 		t.Skipf("snapshot too small (%d bytes) to strip wrapping", len(data))
