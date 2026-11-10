@@ -1042,9 +1042,10 @@ func TestSnapshot_Checksum_Corruption(t *testing.T) {
 	}
 }
 
-// TestSnapshot_Checksum_HeaderCorruption verifies that corrupting a payload
-// byte — which the trailing SHA-256 covers — triggers ErrSnapshotCorrupt.
-func TestSnapshot_Checksum_HeaderCorruption(t *testing.T) {
+// TestSnapshot_Checksum_FirstPayloadByteCorruption verifies that corrupting
+// the first payload byte — the one right after the header, which the trailing
+// SHA-256 covers — triggers ErrSnapshotCorrupt.
+func TestSnapshot_Checksum_FirstPayloadByteCorruption(t *testing.T) {
 	cfg := extraTestConfig(t)
 	db := mustOpen(t, cfg)
 	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES ('hdr', 'test')`); err != nil {
@@ -1075,10 +1076,56 @@ func TestSnapshot_Checksum_HeaderCorruption(t *testing.T) {
 
 	_, err = memdb.Open(cfg)
 	if err == nil {
-		t.Fatal("expected error from Open with corrupt header, got nil")
+		t.Fatal("expected error from Open with a corrupt first payload byte, got nil")
 	}
 	if !errors.Is(err, memdb.ErrSnapshotCorrupt) {
 		t.Errorf("expected ErrSnapshotCorrupt in chain, got: %v", err)
+	}
+}
+
+// TestSnapshot_HeaderCorruption corrupts the [magic][version] words of the
+// header itself (the payload tests above never touch them) and verifies Open
+// refuses the file each time rather than loading something.
+//
+// The walSeq word is deliberately absent: the trailing SHA-256 covers the
+// payload only, so a flipped checkpoint is not detectable by this format.
+func TestSnapshot_HeaderCorruption(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt func(data []byte)
+		// wantErr is the sentinel Open must return; nil means "any error".
+		wantErr error
+	}{
+		// No longer "MDBK": the file is taken for a legacy raw SQLite file,
+		// which it is not, so SQLite itself rejects it.
+		{"magic", func(d []byte) { d[0] ^= 0xFF }, nil},
+		// 2 → 1: a version-1 reader takes the walSeq word for payload, so the
+		// footer's length and hash no longer match.
+		{"version lowered to 1", func(d []byte) { d[7] = 1 }, memdb.ErrSnapshotCorrupt},
+		// A version this build does not know.
+		{"version raised", func(d []byte) { d[4] ^= 0x80 }, memdb.ErrSnapshotVersion},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, path := writeSnapshotForCorruption(t)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+			tc.corrupt(data)
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			db, err := memdb.Open(cfg)
+			if err == nil {
+				_ = db.Close()
+				t.Fatal("Open succeeded on a snapshot with a corrupt header")
+			}
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Errorf("Open error = %v, want %v in chain", err, tc.wantErr)
+			}
+		})
 	}
 }
 

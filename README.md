@@ -409,8 +409,9 @@ type AuthenticatedBackend interface {
 }
 ```
 
-Returning `true` causes the adapter to write the SQLite payload directly
-and to suppress the legacy-snapshot warning on restore when the bytes
+Returning `true` causes the adapter to write the SQLite payload behind a
+16-byte `MDBC` checkpoint prefix instead of the SHA-256 envelope, and to
+suppress the legacy-snapshot warning on restore when the bytes
 do not start with the `MDBK` header.
 
 ---
@@ -732,7 +733,7 @@ pool (buffered channel of idle *tls.Conn, capacity ForwardPoolSize, default 8)
 
 Get()  → non-blocking receive from channel
              hit  → return warm connection (no handshake)
-             miss → tls.DialWithDialer (new handshake)
+             miss → TLS dial (new handshake; ends with the caller's context, 2 s at most)
 
 Put()  → non-blocking send to channel
              channel not full → connection returned for reuse
@@ -781,9 +782,21 @@ data model rather than building a distributed deduplication layer.
 the log, and `node.TransferLeadershipTo(id)` to a named one. Each returns
 once this node has stepped down, and fails after about the election timeout
 if no voter answers. While a transfer runs, writes on the leader are
-refused. `node.Shutdown()` on a leader transfers first, so the cluster has
-a new leader at once instead of after an election timeout with none; if
-the transfer fails, it logs a warning and stops anyway.
+refused with an error that matches `mraft.ErrNotLeader`, whether made on
+the leader or forwarded to it: the write was not made, and can be retried
+once there is a leader. Calls only the leader can serve
+(`TransferLeadership`, `AddVoter`, `RemoveServer`) fail with the same
+`ErrNotLeader` on any other node.
+
+`node.Shutdown()` on a leader transfers first, so the cluster has a new
+leader at once instead of after an election timeout with none. Raft's own
+choice of target takes no account of whether that voter is alive, so if it
+fails, `Shutdown` asks each other voter by name. The whole handover is
+bounded by three election timeouts (1.5 s with the default); when that is
+spent or no voter takes over, it logs a warning and stops anyway. A
+single-voter cluster has nobody to hand over to and skips it silently.
+`NodeConfig.DisableShutdownHandover` skips it always, so that `Shutdown`
+looks like a crash to the other nodes — useful for rehearsing one.
 
 ### Membership changes
 
@@ -797,23 +810,61 @@ leader never sends its own and Raft's log matching does not hold there.
 `Join` is ignored once the node has state, so it can stay set across
 restarts. Give a replacement a new node ID, never the lost one's.
 
+`Peers` is not read in join mode and may be left out: the node takes its
+membership from the leader that adds it. Until then it is idle — no data,
+no votes, writes refused — and logs that at `Warn` on startup, because a
+node left in join mode by mistake looks no different from one waiting.
+
+Three things to get right when membership changes:
+
+- **Every existing node needs the joiner's forward address.**
+  `ForwardPeers` is read once, at startup, so a node that was already
+  running has no entry for a node added later. As soon as the new node
+  becomes leader — which any handover, including a routine `Shutdown` of
+  the old leader, can bring about — writes on such a node fail with
+  `ErrNotLeader` ("leader is node-4, and this node has no forward address
+  for it"). After `AddVoter`, call `node.SetForwardPeer("node-4",
+  "10.0.0.4:7001")` on every running node; it takes effect on the next
+  write. Also add the entry to each node's `ForwardPeers` configuration,
+  so it survives a restart (configuration plus a restart alone works too).
+- **Remove a dead member before adding its replacement.** Adding first
+  grows the cluster and raises the quorum while the dead node still counts:
+  three voters with one dead need 2 of 3, but add a fourth and they need
+  3 of 4, with only three alive — one more failure, or a joiner slow to
+  catch up, and the cluster cannot commit. `RemoveServer` first, then
+  `AddVoter`.
+- **Pair `RemoveServer` with `RemoveForwardPeer`** on every remaining
+  node, so none keeps an address for a node that has left.
+
+`memdb serve` does not expose any of this: it has no join mode and no way
+to call `AddVoter`, `RemoveServer`, or `SetForwardPeer`. Membership changes
+are a library feature, for applications that embed `replication/raft`; a
+`memdb serve` cluster keeps the membership it was bootstrapped with.
+
 ```go
 // On the new node: start it in join mode
 node, err := mraft.NewNode(adapter, mraft.NodeConfig{
     NodeID:   "node-4",
     BindAddr: "10.0.0.4:7000",
-    Peers:    peers, // the cluster, including this node
     Join:     true,
+    ForwardAddr:  "10.0.0.4:7001",
+    ForwardPeers: fwdPeers, // every node's forward address, including this node's
     // ...
 })
 
-// Add a new node (call on the leader)
+// Remove a dead node first (call on the leader), and forget its forward
+// address (call on every remaining node)
+if err := node.RemoveServer("node-2", 10*time.Second); err != nil {
+    log.Fatal(err)
+}
+node.RemoveForwardPeer("node-2")
+
+// Then add the new node (call on the leader) ...
 if err := node.AddVoter("node-4", "10.0.0.4:7000", 10*time.Second); err != nil {
     log.Fatal(err)
 }
-
-// Remove a node (call on the leader)
-if err := node.RemoveServer("node-2", 10*time.Second); err != nil {
+// ... and tell every node already running where it takes forwarded writes
+if err := node.SetForwardPeer("node-4", "10.0.0.4:7001"); err != nil {
     log.Fatal(err)
 }
 
@@ -989,8 +1040,8 @@ arrive after `Stop` are refused rather than served.
 Durability is not tied to the connection lifecycle: rows committed before
 `Stop` are in the in-memory DB regardless of how their session ended. Call
 `db.Flush(ctx)` or `db.Close()` **after** `Stop` returns to get them to the
-backend; `memdb serve` flushes via a deferred `db.Close()` once
-`ListenAndServe` returns.
+backend; `memdb serve` waits on `Stop` after `ListenAndServe` returns and
+then flushes via a deferred `db.Close()`.
 
 ### Protocol compatibility
 
@@ -1225,9 +1276,17 @@ log is already the durability layer — keeping memdb's WAL on top would be a
 redundant per-write fsync. Override with `--durability wal` to opt in.
 
 Followers transparently forward writes to the leader over the
-`-raft-forward-bind` port; clients can connect to any node. Outbound
+`-raft-forward-bind` port; clients can connect to any node.
+`-raft-forward-pool-size` sets how many idle connections to the leader a
+node keeps warm for that (default 8; it requires `-raft-forward-peers`) —
+raise it toward the node's usual number of concurrent writes, since a
+forward that finds no idle connection pays for a TLS handshake. Outbound
 inter-node TLS dials reuse session tickets, so handshakes after a leader
 change or idle drop are 1-RTT PSK rather than full asymmetric.
+
+The cluster's membership is fixed at bootstrap: `memdb serve` has no join
+mode and no way to add or remove a node (see
+[Membership changes](#membership-changes), a library feature).
 
 Each sub-command accepts `-h` for flag details:
 
@@ -1596,29 +1655,53 @@ the WAL hot path and ~31% on the FSM apply path before the swap.
 Supported argument types: `nil`, all signed integers (widened to `int64` on
 decode), all unsigned integers (widened to `uint64`), `float32`/`float64`
 (widened to `float64`), `bool`, `string`, `[]byte`, and `time.Time` (stored
-as `UnixNano` and decoded in UTC). Arguments of any other Go type are
+as `UnixNano` when the instant fits in an `int64` of nanoseconds, roughly
+1677–2262, and otherwise as Unix seconds + nanoseconds under a separate
+tag, so the zero `time.Time{}` and far-future dates round-trip exactly;
+decoded in UTC). Arguments of any other Go type are
 rejected with `memdb.ErrWALUnsupportedArgType` (aliased to
 `replication.ErrUnsupportedArgType`) so callers see the failure at `Exec`
 time rather than losing the entry silently.
 
-Records with a corrupt header, truncated body, or unknown binary version
-tag cause `Replay` to stop at that record and return every prior valid
-entry — matching the behaviour expected after an unclean shutdown.
+`Replay` tells a torn tail from corruption:
+
+- **Torn tail** — a partial length prefix, a body that runs past the end
+  of the file, or a zero-filled tail. This is what an unclean shutdown
+  leaves behind; the tail is cut off silently so later appends land right
+  after the last valid record.
+- **Corruption** — a bad length or an undecodable record with data after
+  it. The valid prefix is replayed, and everything from the bad record on
+  is first copied to a sidecar file `<wal>.corrupt-<UTC timestamp>` (mode
+  0600, fsynced) and then cut from the WAL. `Open` logs this at Error
+  level with the sidecar path, offset and byte count, and
+  `(*WAL).Quarantine()` reports it. Nothing removes sidecar files; they
+  are there for salvage. If the sidecar cannot be written, `Open` fails
+  and the WAL is left untouched.
+- **Read errors** other than end-of-file are returned as errors and
+  nothing is truncated.
 
 ### Snapshot integrity
 
-Since v1.6.2, snapshots are wrapped with an 8-byte prefix and a 40-byte
+Snapshots are wrapped with a 16-byte header and a 40-byte
 footer; the writer streams the SQLite payload through an incremental
 `sha256.New()` so memory cost is O(1) regardless of payload size:
 
 ```
 Offset            Length  Content
      0                4   "MDBK" magic
-     4                4   version = 1 (uint32 big-endian)
-     8                ∞   Raw SQLite database bytes
+     4                4   version = 2 (uint32 big-endian)
+     8                8   walSeq — highest WAL sequence number the snapshot includes (uint64 big-endian)
+    16                ∞   Raw SQLite database bytes
    end-40             8   payloadLen (uint64 big-endian)
-   end-32            32   SHA-256 of the raw SQLite payload
+   end-32            32   SHA-256 of the raw SQLite payload (the header is not covered)
 ```
+
+`walSeq` is the checkpoint that lets WAL replay skip entries the snapshot
+already holds, which is what makes recovery correct after a crash between
+writing a snapshot and truncating the WAL. Version 1 snapshots (v1.6.2 –
+v1.16.0: an 8-byte prefix with no `walSeq`) are still read, with a
+checkpoint of 0. A version newer than this build understands is refused
+with `ErrSnapshotVersion` rather than misparsed.
 
 On restore the reader uses a 40-byte sliding window via
 `bufio.Reader.Peek(64 KiB)` and verifies the footer at EOF; a mismatch
@@ -1626,18 +1709,25 @@ returns `ErrSnapshotCorrupt`. Legacy snapshots without the `MDBK`
 prefix are accepted with a warning unless the inner backend is
 authenticated (see below).
 
-**AEAD backends skip the wrap entirely.** External backends that implement
+**AEAD backends skip the SHA-256 wrap.** External backends that implement
 `memdb.AuthenticatedBackend` with a `true` return advertise that they
 already authenticate their payload (e.g. `backends.EncryptedBackend`'s
-AES-256-GCM tag). For these the adapter writes the SQLite bytes directly
-— the redundant SHA-256 pass would double the integrity work without
-adding security. On restore, an absent `MDBK` prefix is treated as the
-new headerless format (no warning) when the inner backend is
-authenticated; otherwise it is treated as legacy as before.
+AES-256-GCM tag). For these the adapter writes only a 16-byte checkpoint
+prefix — `"MDBC"`, `version = 1` (uint32 big-endian), `walSeq` (uint64
+big-endian) — followed by the raw SQLite bytes, with no footer: the
+redundant SHA-256 pass would double the integrity work without adding
+security, but the checkpoint is still needed for WAL replay. On restore,
+a stream from an authenticated backend that starts with neither magic is
+a snapshot written before the prefix existed; it loads without a warning
+and with a checkpoint of 0.
+
+> **Downgrade note:** encrypted snapshots written with the `MDBC` prefix
+> cannot be read by earlier versions, which expect the stream to begin
+> with the SQLite magic.
 
 > **Wire-format break (v1.6.2):** v1.6.1 snapshots use a 40-byte
 > *header* (`magic | version | sha256` at offsets 0–40); v1.6.2+ uses
-> the 8-byte prefix + 40-byte footer above. Flush before upgrading
+> a prefix + 40-byte footer as above. Flush before upgrading
 > across that boundary; v1.6.1 snapshots cannot be read by v1.6.2+ and
 > vice versa.
 
@@ -1842,7 +1932,7 @@ has a doc comment citing its source so the audit trail stays clear. The
 - Serverless or ephemeral container environments without persistent volume mounts
 - Workflows that require opening the database file directly with the
   `sqlite3` CLI or other SQLite tooling — snapshot files are wrapped with
-  an 8-byte `MDBK` prefix and a 40-byte length+SHA-256 footer that
+  a 16-byte `MDBK` header and a 40-byte length+SHA-256 footer that
   third-party tools do not understand. Use the bundled `memdb-cli` for
   inspection (see [Inspecting snapshots with memdb-cli](#inspecting-snapshots-with-memdb-cli))
 - Administrator schema-browsing via `psql` backslash commands (`\d`, `\dt`,

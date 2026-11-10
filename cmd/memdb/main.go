@@ -210,11 +210,18 @@ func runServe(file, addr string, flush time.Duration, durability string,
 		}()
 	}
 
-	// nodeExec is assigned after the Raft node is built. The OnExecResult
+	// nodeExec is assigned after the Raft node is built. The OnExecContext
 	// closure captures it by reference so memdb.Open can be called before
 	// the node exists — ListenAndServe only starts after assignment, so the
 	// nil window is never observable to a concurrent caller.
-	var nodeExec func(sql string, args ...any) (int64, error)
+	//
+	// OnExecContext rather than OnExecResult, so a context given to
+	// db.ExecContext bounds the consensus round trip and the forward to the
+	// leader. The pg-wire server passes none today (context.Background on
+	// every statement), and for a context that cannot end ExecResultContext
+	// is ExecResult exactly — ExecResult is that call — so this costs
+	// nothing now and takes effect when a caller does carry one.
+	var nodeExec func(ctx context.Context, sql string, args ...any) (int64, error)
 	memCfg := memdb.Config{
 		FilePath:      file,
 		FlushInterval: flush,
@@ -224,8 +231,8 @@ func runServe(file, addr string, flush time.Duration, durability string,
 		},
 	}
 	if raftCfg.enabled() {
-		memCfg.OnExecResult = func(sql string, args []any) (int64, error) {
-			return nodeExec(sql, args...)
+		memCfg.OnExecContext = func(ctx context.Context, sql string, args []any) (int64, error) {
+			return nodeExec(ctx, sql, args...)
 		}
 	}
 
@@ -242,7 +249,7 @@ func runServe(file, addr string, flush time.Duration, durability string,
 			slog.Error("raft start failed", "error", err)
 			os.Exit(1)
 		}
-		nodeExec = node.ExecResult
+		nodeExec = node.ExecResultContext
 		defer func() {
 			if err := node.Shutdown(); err != nil {
 				slog.Warn("raft shutdown error", "error", err)
@@ -278,6 +285,11 @@ func runServe(file, addr string, flush time.Duration, durability string,
 		slog.Error("server stopped unexpectedly", "error", err)
 		os.Exit(1)
 	}
+	// ListenAndServe returns as soon as the listener closes, which can be
+	// before the last handler has unwound. Stop is idempotent and blocks
+	// until every handler has exited, so wait on it here: the deferred Raft
+	// shutdown and db.Close must not run underneath a live handler.
+	srv.Stop()
 }
 
 func runSnapshot(file string) {

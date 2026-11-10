@@ -33,6 +33,7 @@ type raftFlags struct {
 	HeartbeatTimeout  time.Duration
 	ElectionTimeout   time.Duration
 	ApplyTimeout      time.Duration
+	ForwardPoolSize   int
 }
 
 // registerRaftFlags binds raft flags to fs and returns a pointer to the
@@ -70,6 +71,9 @@ func registerRaftFlags(fs *flag.FlagSet) *raftFlags {
 		"Raft election timeout (0 uses library default)")
 	fs.DurationVar(&r.ApplyTimeout, "raft-apply-timeout", 0,
 		"timeout for a single Apply call (0 uses library default)")
+	fs.IntVar(&r.ForwardPoolSize, "raft-forward-pool-size", 0,
+		"idle connections to the leader kept warm for forwarded writes; "+
+			"raise toward this node's usual number of concurrent writes (0 uses library default)")
 	return r
 }
 
@@ -110,6 +114,12 @@ func (r raftFlags) validate() error {
 	}
 	if r.ForwardPeers != "" && r.ForwardBindAddr == "" {
 		return fmt.Errorf("-raft-forward-peers is set but -raft-forward-bind is empty")
+	}
+	if r.ForwardPoolSize < 0 {
+		return fmt.Errorf("-raft-forward-pool-size must not be negative (got %d)", r.ForwardPoolSize)
+	}
+	if r.ForwardPoolSize > 0 && r.ForwardPeers == "" {
+		return fmt.Errorf("-raft-forward-pool-size is set but -raft-forward-peers is empty")
 	}
 	return nil
 }
@@ -175,14 +185,10 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// buildRaftNode constructs a Raft node bound to db. The caller must invoke
-// node.Shutdown() before db.Close() so in-flight FSM applies can drain.
-func buildRaftNode(db *memdb.DB, r raftFlags, logger *slog.Logger) (*mraft.Node, error) {
-	tlsCfg, err := loadRaftTLS(r.TLSCertFile, r.TLSKeyFile, r.TLSCAFile)
-	if err != nil {
-		return nil, err
-	}
-	cfg := mraft.NodeConfig{
+// nodeConfig maps the raft flags onto a NodeConfig. Zero values are passed
+// through: the library applies its own defaults to them.
+func (r raftFlags) nodeConfig(tlsCfg *tls.Config, logger *slog.Logger) mraft.NodeConfig {
+	return mraft.NodeConfig{
 		NodeID:            r.NodeID,
 		BindAddr:          r.BindAddr,
 		AdvertiseAddr:     r.AdvertiseAddr,
@@ -196,6 +202,7 @@ func buildRaftNode(db *memdb.DB, r raftFlags, logger *slog.Logger) (*mraft.Node,
 		HeartbeatTimeout:  r.HeartbeatTimeout,
 		ElectionTimeout:   r.ElectionTimeout,
 		ApplyTimeout:      r.ApplyTimeout,
+		ForwardPoolSize:   r.ForwardPoolSize,
 		Logger:            logger,
 		OnLeaderChange: func(isLeader bool) {
 			logger.Info("memdb raft: leadership changed",
@@ -205,5 +212,14 @@ func buildRaftNode(db *memdb.DB, r raftFlags, logger *slog.Logger) (*mraft.Node,
 			logger.Error("memdb raft: apply error", "error", err)
 		},
 	}
-	return mraft.NewNode(raftDBAdapter{db: db}, cfg)
+}
+
+// buildRaftNode constructs a Raft node bound to db. The caller must invoke
+// node.Shutdown() before db.Close() so in-flight FSM applies can drain.
+func buildRaftNode(db *memdb.DB, r raftFlags, logger *slog.Logger) (*mraft.Node, error) {
+	tlsCfg, err := loadRaftTLS(r.TLSCertFile, r.TLSKeyFile, r.TLSCAFile)
+	if err != nil {
+		return nil, err
+	}
+	return mraft.NewNode(raftDBAdapter{db: db}, r.nodeConfig(tlsCfg, logger))
 }

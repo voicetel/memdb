@@ -150,7 +150,8 @@ func (s *fsmSnapshot) Release() {}
 // Only the leader may call this. Followers receive the entry via FSM.Apply.
 //
 // No pre-check of r.State() is performed here — hashicorp/raft returns
-// raft.ErrNotLeader from r.Apply if this node is not the leader. A pre-check
+// raft.ErrNotLeader from r.Apply if this node is not the leader, which is
+// returned matching this package's ErrNotLeader too. A pre-check
 // would introduce a TOCTOU race (leadership can be lost between the check and
 // the actual Apply call).
 //
@@ -207,7 +208,9 @@ func ApplyResultContext(ctx context.Context, r *raft.Raft, entry replication.WAL
 // error the FSM or Raft reported.
 func applied(future raft.ApplyFuture) (int64, error) {
 	if err := future.Error(); err != nil {
-		return 0, fmt.Errorf("raft: apply: %w", err)
+		// A write refused for want of leadership, or by a leader handing
+		// leadership over, is ErrNotLeader to the caller: see notLeader.
+		return 0, fmt.Errorf("raft: apply: %w", notLeader(err))
 	}
 	switch resp := future.Response().(type) {
 	case error:

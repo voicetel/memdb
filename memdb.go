@@ -37,11 +37,28 @@ type DB struct {
 	wal     *WAL
 	replica *replicaPool // nil when ReadPoolSize == 0
 	stmts   *stmtCache   // prepared-statement cache for d.mem
-	// writeMu serialises a write (its SQL apply plus its WAL append) with a
-	// Flush, so the checkpoint a snapshot records never races a write: every
-	// entry at or below the checkpoint is in the snapshot, and every entry
-	// above it survives in the WAL after the truncate.
-	writeMu sync.Mutex
+	// writeSem is the write lock: a one-slot semaphore that serialises a
+	// write (its SQL apply plus its WAL append) with a Flush, so the
+	// checkpoint a snapshot records never races a write: every entry at or
+	// below the checkpoint is in the snapshot, and every entry above it
+	// survives in the WAL after the truncate.
+	//
+	// It is a channel rather than a sync.Mutex so a waiter can give up when
+	// its context ends (see acquireWrite). No user callback is ever invoked
+	// while it is held — OnFlushComplete / OnFlushError run after release, so
+	// they may call Exec or Flush themselves.
+	//
+	// Every standalone write takes it, even under DurabilityNone where no
+	// flush-race exists: it serialises concurrent writers ahead of the
+	// database/sql pool, so the single writer connection is never requested
+	// by more than one goroutine at a time. A buffered-channel handoff is
+	// markedly cheaper than the pool's wait queue (per-waiter channel
+	// allocation, futex sleeps, time.Now bookkeeping on both checkout and
+	// return) — pprof of the contended-writer benchmark showed ~10% of CPU
+	// in db.conn/putConn before this, and the lock-free variant measured
+	// ~17% slower end-to-end than the WAL variant whose writes were
+	// already serialised here.
+	writeSem chan struct{}
 	// snapshotSeq is the checkpoint the last restore read from the snapshot;
 	// WAL entries at or below it are skipped on replay.
 	snapshotSeq uint64
@@ -113,10 +130,11 @@ func Open(cfg Config) (*DB, error) {
 	mem.SetMaxIdleConns(1)
 
 	db := &DB{
-		mem:   mem,
-		cfg:   cfg,
-		stop:  make(chan struct{}),
-		stmts: newStmtCache(mem),
+		mem:      mem,
+		cfg:      cfg,
+		stop:     make(chan struct{}),
+		stmts:    newStmtCache(mem),
+		writeSem: make(chan struct{}, 1),
 	}
 
 	// restore() checks Exists internally and is a no-op when no snapshot
@@ -147,7 +165,21 @@ func Open(cfg Config) (*DB, error) {
 			_ = db.wal.Close()
 			return nil, fmt.Errorf("memdb: wal replay: %w", err)
 		}
-		db.logger().Info("memdb: WAL replayed")
+		// Corruption in the middle of the WAL is not silently dropped: the
+		// replay moved it to a sidecar file and carried on with the valid
+		// prefix. Entries after the corrupt record were NOT applied, so say so
+		// loudly — the sidecar is the only copy of them.
+		q := db.wal.Quarantine()
+		if q != nil {
+			db.logger().Error("memdb: WAL corruption quarantined; entries from the corrupt record on were not replayed",
+				"wal", walPath,
+				"sidecar", q.Path,
+				"offset", q.Offset,
+				"bytes", q.Bytes,
+				"reason", q.Reason,
+			)
+		}
+		db.logger().Info("memdb: WAL replayed", "corruption_quarantined", q != nil)
 	}
 
 	if cfg.InitSchema != nil {
@@ -206,7 +238,11 @@ func (d *DB) DB() *sql.DB {
 //
 // ctx scopes both the WAL append (which is effectively synchronous already)
 // and the optional backend flush so a caller-supplied deadline is honoured.
-func (d *DB) writeDurability(ctx context.Context, query string, args []any) error {
+//
+// The caller holds the write lock. Nothing here invokes a user callback: what
+// the callbacks must be told is recorded in note, and the caller delivers it
+// with notifyWrite after releasing the lock.
+func (d *DB) writeDurability(ctx context.Context, query string, args []any, note *writeNotice) error {
 	if d.cfg.Durability == DurabilityNone {
 		return nil
 	}
@@ -218,21 +254,67 @@ func (d *DB) writeDurability(ctx context.Context, query string, args []any) erro
 			Args:      args,
 		}
 		if walErr := d.wal.Append(entry); walErr != nil {
-			if d.cfg.OnFlushError != nil {
-				d.cfg.OnFlushError(fmt.Errorf("%w: wal: %w", ErrFlushFailed, walErr))
-			}
+			note.walErr = walErr
 			return fmt.Errorf("%w: wal append: %w", ErrFlushFailed, walErr)
 		}
 	}
 	if d.cfg.Durability == DurabilitySync {
-		// Full synchronous flush to the backend. The caller holds writeMu, so
-		// flushLocked (which does not re-acquire it) writes the checkpoint and
-		// truncates the WAL under the same exclusion as this write.
-		if err := d.flushLocked(ctx); err != nil {
-			return err
+		// Full synchronous flush to the backend. The caller holds the write
+		// lock, so flushLocked (which does not re-acquire it) writes the
+		// checkpoint and truncates the WAL under the same exclusion as this
+		// write.
+		note.flushed = true
+		note.metrics = d.flushLocked(ctx)
+		if note.metrics.Error != nil {
+			return note.metrics.Error
 		}
 	}
 	return nil
+}
+
+// writeNotice records what a write must tell the user's callbacks once the
+// write lock has been released. The zero value means "nothing".
+type writeNotice struct {
+	walErr  error        // WAL append failed → OnFlushError
+	flushed bool         // a DurabilitySync flush ran → reportFlush(metrics)
+	metrics FlushMetrics // valid when flushed
+}
+
+// notifyWrite delivers a writeNotice. Must be called WITHOUT the write lock.
+func (d *DB) notifyWrite(note writeNotice) {
+	if note.walErr != nil && d.cfg.OnFlushError != nil {
+		safeDo(d.logger(), nil, func() {
+			d.cfg.OnFlushError(fmt.Errorf("%w: wal: %w", ErrFlushFailed, note.walErr))
+		})
+	}
+	if note.flushed {
+		d.reportFlush(note.metrics)
+	}
+}
+
+// execLocked applies one write to the in-memory DB and performs its
+// durability side effects, all under the write lock, so a Flush cannot
+// snapshot a half-written state and concurrent writers reach the single
+// writer connection one at a time (see writeSem). The lock is released
+// before returning; the caller must pass the returned notice to notifyWrite.
+//
+// A ctx that ends while waiting for the lock returns ctx.Err() with nothing
+// applied.
+func (d *DB) execLocked(ctx context.Context, query string, args []any) (sql.Result, writeNotice, error) {
+	var note writeNotice
+	if err := d.acquireWrite(ctx); err != nil {
+		return nil, note, err
+	}
+	defer d.releaseWrite()
+	result, err := d.stmts.ExecContext(ctx, query, args...)
+	if err != nil {
+		return nil, note, err
+	}
+	d.bumpWriteGen()
+	if err := d.writeDurability(ctx, query, args, &note); err != nil {
+		return nil, note, err
+	}
+	return result, note, nil
 }
 
 // execDirect writes SQL directly to the local in-memory database, bypassing
@@ -243,9 +325,8 @@ func (d *DB) execDirect(query string, args ...any) (int64, error) {
 	if d.closed.Load() {
 		return 0, ErrClosed
 	}
-	unlock := d.lockWrite()
-	defer unlock()
-	result, err := d.stmts.ExecContext(context.Background(), query, args...)
+	result, note, err := d.execLocked(context.Background(), query, args)
+	d.notifyWrite(note)
 	if err != nil {
 		return 0, err
 	}
@@ -253,10 +334,6 @@ func (d *DB) execDirect(query string, args ...any) (int64, error) {
 	// mattn/go-sqlite3 always does, but treat a failure as "0 rows" rather
 	// than failing a write that already applied.
 	rowsAffected, _ := result.RowsAffected()
-	d.bumpWriteGen()
-	if err := d.writeDurability(context.Background(), query, args); err != nil {
-		return 0, err
-	}
 	return rowsAffected, nil
 }
 
@@ -336,31 +413,52 @@ func (d *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Re
 		return driver.RowsAffected(0), nil
 	}
 
-	// Standalone (no replication): write locally, under the write lock when
-	// the WAL is active, so a Flush cannot snapshot a half-written state.
-	unlock := d.lockWrite()
-	defer unlock()
-	result, err := d.stmts.ExecContext(ctx, query, args...)
+	// Standalone (no replication): write locally, under the write lock, so a
+	// Flush cannot snapshot a half-written state and concurrent writers reach
+	// the single writer connection one at a time. Callbacks run only after the
+	// lock is released.
+	result, note, err := d.execLocked(ctx, query, args)
+	d.notifyWrite(note)
 	if err != nil {
-		return nil, err
-	}
-	d.bumpWriteGen()
-	if err := d.writeDurability(ctx, query, args); err != nil {
 		return nil, err
 	}
 	return result, nil
 }
 
-// lockWrite returns the unlock function for a write. With the WAL active it
-// takes writeMu, which Flush also takes, so the two are mutually exclusive.
-// Without a WAL (DurabilityNone) there is no checkpoint or truncate to keep
-// consistent, so the hot path stays lock-free.
-func (d *DB) lockWrite() func() {
-	if d.wal == nil {
-		return func() {}
+// acquireWrite takes the write lock, or returns ctx.Err() if ctx ends first.
+//
+// The uncontended case is a single non-blocking channel send — no allocation,
+// and ctx is not consulted. A context that can never end (Done() == nil, e.g.
+// context.Background) waits with a plain send rather than a two-way select.
+//
+// Do not add a spin phase here. A bounded Gosched-spin before parking was
+// tried (2026-11-10): with one waiter per P — the common shape of a
+// write-heavy workload — the spinners saturate every P, handoffp hands the
+// holder's P away across its cgo call, and the holder then queues behind the
+// spinners on return. BenchmarkExec_Insert regressed ~3× (2.2µs → 6.2µs).
+// The park/wake round trip is the cheaper handoff at this contention level.
+func (d *DB) acquireWrite(ctx context.Context) error {
+	select {
+	case d.writeSem <- struct{}{}:
+		return nil
+	default:
 	}
-	d.writeMu.Lock()
-	return d.writeMu.Unlock
+	done := ctx.Done()
+	if done == nil {
+		d.writeSem <- struct{}{}
+		return nil
+	}
+	select {
+	case d.writeSem <- struct{}{}:
+		return nil
+	case <-done:
+		return ctx.Err()
+	}
+}
+
+// releaseWrite releases the write lock taken by acquireWrite.
+func (d *DB) releaseWrite() {
+	<-d.writeSem
 }
 
 // Query executes a query that returns rows. When a read pool is configured
@@ -492,15 +590,37 @@ func (d *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) 
 // from Close() after d.closed has already been set to true, so the normal
 // Flush guard must be bypassed. All background goroutines have exited by the
 // time this is called, so no concurrent writes can occur.
+//
+// The wait for the write lock honours ctx: a caller whose ctx ends while a
+// write or another flush holds the lock gets ErrFlushFailed wrapping
+// ctx.Err() instead of blocking. That is what makes the flush loop's
+// per-tick timeout and Close's 30s bound effective. Such an attempt is
+// reported to the callbacks like any other failed flush.
 func (d *DB) flushUnchecked(ctx context.Context) error {
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-	return d.flushLocked(ctx)
+	start := time.Now()
+	var m FlushMetrics
+	if err := d.acquireWrite(ctx); err != nil {
+		m = FlushMetrics{
+			Duration: time.Since(start),
+			Error:    fmt.Errorf("%w: waiting for the write lock: %w", ErrFlushFailed, err),
+		}
+	} else {
+		func() {
+			defer d.releaseWrite()
+			m = d.flushLocked(ctx)
+		}()
+	}
+	d.reportFlush(m)
+	return m.Error
 }
 
-// flushLocked performs a flush with writeMu already held, so no write can land
-// between the checkpoint capture, the snapshot, and the WAL truncate.
-func (d *DB) flushLocked(ctx context.Context) error {
+// flushLocked performs a flush with the write lock already held, so no write
+// can land between the checkpoint capture, the snapshot, and the WAL truncate.
+//
+// It only does the work and computes the outcome. It must not invoke user
+// callbacks — the caller passes the returned metrics to reportFlush after
+// releasing the lock, so a callback that calls Exec or Flush cannot deadlock.
+func (d *DB) flushLocked(ctx context.Context) FlushMetrics {
 	start := time.Now()
 
 	// Capture the checkpoint first: every entry at or below snapSeq is about
@@ -517,32 +637,45 @@ func (d *DB) flushLocked(ctx context.Context) error {
 	}
 
 	if d.wal != nil && err == nil {
-		_ = d.wal.Truncate()
+		// A failed (or, after a crash, lost — the truncate is not fsynced)
+		// truncate is not a correctness problem: the snapshot just written
+		// records snapSeq as its checkpoint, so the entries left behind are
+		// skipped on replay. It only costs disk space and replay time until
+		// the next flush truncates again, hence a warning and not an error.
+		if terr := d.wal.Truncate(); terr != nil {
+			d.logger().Warn("memdb: WAL truncate after flush failed; "+
+				"the entries stay on disk and are skipped on replay",
+				"error", terr,
+				"checkpoint", snapSeq,
+			)
+		}
 	}
 
-	if d.cfg.OnFlushComplete != nil {
-		safeCallback(d.logger(), d.cfg.OnFlushError, d.cfg.OnFlushComplete, FlushMetrics{
-			Duration: time.Since(start),
-			Error:    err,
-		})
-	}
+	return FlushMetrics{Duration: time.Since(start), Error: err}
+}
 
-	if err != nil {
+// reportFlush tells the user (OnFlushComplete) and the log how a flush went.
+// Must be called WITHOUT the write lock, exactly once per flush.
+func (d *DB) reportFlush(m FlushMetrics) {
+	safeCallback(d.logger(), d.cfg.OnFlushError, d.cfg.OnFlushComplete, m)
+
+	if m.Error != nil {
 		d.logger().Error("memdb: flush failed",
-			"error", err,
+			"error", m.Error,
 			"backend", fmt.Sprintf("%T", d.cfg.Backend),
 		)
 	} else {
 		d.logger().Info("memdb: flushed to backend",
-			"duration", time.Since(start).String(),
+			"duration", m.Duration.String(),
 			"backend", fmt.Sprintf("%T", d.cfg.Backend),
 		)
 	}
-	return err
 }
 
 // Flush copies the current in-memory state to the backend.
-// Safe to call concurrently — serialised internally.
+// Safe to call concurrently — serialised internally. If ctx ends while
+// waiting for a concurrent write or flush, Flush returns ErrFlushFailed
+// wrapping ctx.Err() without flushing.
 func (d *DB) Flush(ctx context.Context) error {
 	if d.closed.Load() {
 		return ErrClosed
@@ -731,8 +864,12 @@ func (d *DB) flushLoop() {
 		select {
 		case <-ticker.C:
 			// Cap the per-flush timeout at half the interval so timeouts are
-			// always shorter than the tick. The mutex in Flush prevents
-			// overlap; this timeout is about giving up on a stuck backend.
+			// always shorter than the tick. Flushes cannot overlap — each
+			// holds the write lock (writeSem) for its duration — and the
+			// wait for that lock honours ctx too, so this timeout bounds
+			// both a stuck backend and a tick queued behind a slow write or
+			// another flush. OnFlushComplete / OnFlushError run after the
+			// lock is released.
 			timeout := d.cfg.FlushInterval / 2
 			if timeout <= 0 {
 				// Shouldn't happen — flushLoop only starts when FlushInterval > 0.

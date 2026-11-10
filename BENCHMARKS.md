@@ -1,12 +1,14 @@
-# memdb v1.10.0 — Benchmark Report
+# memdb v1.17.0 — Benchmark Report
 
 Consolidated results from the full benchmark suite and the pprof-driven
-throughput scenarios. The headline throughput tables below were captured
-in a single fresh session against the v1.10.0 tree (replica
+throughput scenarios. The **v1.17.0** section directly below reports a
+fresh whole-tree capture against the v1.16.1 tag (write serialisation +
+flush serialize fast path). The headline throughput tables further down
+were captured in a single fresh session against the v1.10.0 tree (replica
 prepared-statement cache + cache-policy fix — see the v1.10.0 section
-under "What changed"); the microbenchmark tables further down are from
-the v1.8.0 capture and remain representative for the paths v1.9.x/v1.10.0
-did not touch. See the Setup section for the exact environment.
+under "What changed"); the microbenchmark tables are from the v1.8.0
+capture and remain representative for the paths later releases did not
+touch. See the Setup section for the exact environment.
 
 > **Headline change vs the v1.5.0 baseline** — repeated `Exec`/`Query`
 > calls now skip per-call Prepare/Close on the writer (prepared-statement
@@ -70,6 +72,96 @@ timings reflect only the operation under measurement, not periodic I/O.
 ---
 
 ## What changed since v1.5.0
+
+### v1.17.0 — write serialisation + flush serialize fast path (4-round hot-path sweep)
+
+A four-round profile → fix → re-profile sweep. The table is a **whole-tree
+v1.17.0 vs the v1.16.1 tag** (fresh `go test -bench` on the reference
+hardware, 6 repetitions per benchmark, `benchstat` p-values), so it
+captures every perf-relevant change shipped in this release, not only the
+two hot-path removals below.
+
+| Benchmark | v1.16.1 | v1.17.0 | Δ |
+|---|---:|---:|---:|
+| Exec_Insert | 2.841µs | 2.190µs | **−22.9 %** |
+| Exec_Insert_WAL | 3.052µs | 2.679µs | **−12.2 %** |
+| Exec_Update | 1.614µs | 1.286µs | **−20.3 %** |
+| ConcurrentRW 90 % writes | 2.494µs | 2.207µs | **−11.5 %** |
+| ConcurrentRW 50 % writes | 2.338µs | 2.126µs | **−9.1 %** |
+| Flush (100 rows) | 56.12µs | 21.57µs | **−61.6 %** |
+| Flush (1 000 rows) | 102.59µs | 61.56µs | **−40.0 %** |
+| Flush (10 000 rows) | 496.1µs | 362.8µs | **−26.9 %** |
+| Exec_Delete | 1.592µs | 1.607µs | ~ (floor) |
+| QueryRow | 2.042µs | 2.015µs | ~ (floor) |
+| Query_RangeScan | 26.50µs | 26.37µs | ~ (floor) |
+| WithTx_SingleInsert | 4.831µs | 4.897µs | +1.4 % (see below) |
+| WithTx_BatchInsert | 106.8µs | 107.5µs | ~ |
+| ConcurrentRW 10 % writes | 2.161µs | 2.233µs | +3.3 % (see below) |
+| **geomean (14 benches)** | 8.985µs | 7.478µs | **−16.8 %** |
+
+What landed (the two hot-path removals):
+
+- **Every standalone write takes `writeSem` before the `database/sql`
+  pool** (`memdb.go`). Previously only WAL / `DurabilitySync` writes took
+  the write lock; under `DurabilityNone` the writers stampeded the
+  single-connection pool's wait queue directly — per-waiter channel
+  allocation, futex sleeps, and `time.Now` on both checkout and return,
+  ~10 % of write CPU in `db.conn`/`putConn`. Serialising writers on the
+  1-slot channel *ahead of* the pool makes the pool checkout uncontended
+  (the WAL variant was already faster than the unlocked one despite
+  paying an fsync, which is what flagged the pool queue as the cost).
+  `isMultiStatement` was also rewritten to drop a per-call
+  `strings.TrimRight` multi-byte cutset that built a 256-bit ASCII set on
+  every statement (`makeASCIISet` in pprof).
+- **Flush payload producer uses `sqlite3_serialize` for DBs ≤ 64 MiB**
+  (`backup.go`). The old path ran the Online Backup API memory → temp
+  file → read back → `io.Copy` → snapshot file: two full disk writes, a
+  read-back, and a whole `*sql.DB` open/close *per flush*.
+  `copyMemToWriter` now produces the image in one C→Go memcpy streamed
+  straight to the hasher for small DBs, and falls back to the O(1)-memory
+  streaming path (`copyMemToWriterViaBackup`) above the threshold or if
+  serialize itself OOMs. Flush allocs 95 → 47/op; the B/op rise on large
+  DBs is the (gated, transient) image buffer. Guarded by
+  `TestFlushSerializeAndBackupPathsAgree`, which pins both paths and the
+  size gate.
+
+Two small regressions, both understood and accepted: `WithTx_SingleInsert`
++1.4 % and `ConcurrentReadWrite/writes=10 %` +3.3 %. The latter is a
+read-heavy mix with no read pool — writes now pay a second handoff via
+`writeSem`, and there are too few writes to recoup it against the
+dominant reads. Net across the suite is strongly positive (−16.8 %
+geomean).
+
+**Hot paths profiled in rounds 3–4 and deliberately NOT changed** — all
+now at the architectural floor, with fresh pprof evidence:
+
+1. **`database/sql` single-conn plumbing** on reads and writes: pool
+   checkout/return, `driverArgsConnLocked`, per-row `Rows.closemu.RLock`
+   (the `Int32.Add` dominating range-scan), result wrapping. A
+   raw-`driver.Stmt` bypass is *structurally blocked*, not merely
+   effortful: the one writer connection is shared by reads, flush, and
+   the public `DB()` surface, so it cannot be held outside the pool.
+   (Still the ≤8 %-upside / high-risk rejection first recorded in
+   v1.10.0.)
+2. **Replica refresh `C→Go→C` round trip** — measured this sweep at
+   **~62 % of refresh CPU** (`mattn.Serialize` ~49 % +
+   `allocSharedSnapshotBuffer` ~13 %). This is the exact path documented
+   to regress **40–90×** when replaced by a direct-cgo serialize, because
+   the Go-side memcpy is a load-bearing scheduler preemption point on the
+   mixed workload. The cost is now quantified (the "hard pprof evidence"
+   the invariant asked for) but no *safe* removal exists; the structural
+   unlock remains session-extension v2.0 (row-level changesets).
+3. **`writeSem` futex handoff at saturation** (~14 % of pure-write CPU):
+   a bounded `Gosched`-spin before parking was implemented and measured
+   — it **regressed ~3×** (with one waiter per P the spinners saturate
+   every P and the holder loses its P across the cgo call, queueing
+   behind its own waiters). Reverted; the failure is documented in
+   `acquireWrite` so it is not retried.
+4. **Flush SHA-256, WAL/backend `fsync`, pg-wire per-query
+   `bufio.Flush`** — integrity, durability, and protocol contracts
+   respectively; not optimisable away. The pg-wire server row/cell path
+   is already buffer-pooled (`rowBuffers`, `sendDataRowInto`) and its
+   SELECT cost is `database/sql Rows.Next` (item 1).
 
 ### v1.10.0 — replica statement cache + cache-policy fix (pprof round sweep)
 

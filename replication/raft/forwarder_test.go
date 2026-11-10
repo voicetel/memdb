@@ -7,8 +7,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"math/big"
 	"net"
+	"os"
 	"runtime"
 	"testing"
 	"time"
@@ -185,13 +187,108 @@ func TestForwarderCloseLetsAnInFlightForwardAnswer(t *testing.T) {
 	if err := <-answered; err != nil || resp.RowsAffected != 7 || resp.ErrMsg != "" {
 		t.Fatalf("the in-flight forward = %+v, %v; want its answer", resp, err)
 	}
-	if err := <-closed; err != nil {
-		t.Fatal(err)
+	// The handler has answered and must now see the forwarder closing, not arm
+	// the connection for another request and wait out the idle window on it.
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("close still waiting 5 s after the in-flight forward was answered")
 	}
 	if _, err := forward(rc, "INSERT INTO t VALUES (2)"); err == nil {
 		t.Error("a forward after close was answered")
 	}
 	if n := settledGoroutines(base); n > base {
 		t.Errorf("%d goroutines after close, %d before", n, base)
+	}
+}
+
+// TestForwarderAnswersAfterIdleAndASlowApply sends a request on a connection
+// that has sat idle, and whose apply then outlasts what was left of the window
+// the request was read under, and all of that window. The write was applied, so
+// its answer must reach the follower: the answer has a deadline of its own, and
+// the one the request arrived under must not cut it off.
+func TestForwarderAnswersAfterIdleAndASlowApply(t *testing.T) {
+	const window = 500 * time.Millisecond
+	f, err := newForwarderWithTimeout("127.0.0.1:0", forwarderTLS(t), nil, func(string, ...any) (int64, error) {
+		time.Sleep(window + 100*time.Millisecond)
+		return 3, nil
+	}, window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.close() })
+	rc := dialForwarder(t, f)
+	time.Sleep(window / 5) // idle, as a pooled connection is, well inside the window
+	resp, err := forward(rc, "UPDATE t SET x = 1")
+	if err != nil || resp.RowsAffected != 3 || resp.ErrMsg != "" {
+		t.Fatalf("an applied write's answer = %+v, %v; want it delivered", resp, err)
+	}
+	// The connection is still good for the next request.
+	if resp, err := forward(rc, "UPDATE t SET x = 2"); err != nil || resp.RowsAffected != 3 {
+		t.Fatalf("the next forward on the connection = %+v, %v", resp, err)
+	}
+}
+
+// TestForwarderArmRefusesWhenClosing checks arm on a closing forwarder: it
+// reports the forwarder closed, and leaves alone the read deadline close has
+// expired, so the handler's next read ends at once instead of waiting out a
+// fresh idle window.
+func TestForwarderArmRefusesWhenClosing(t *testing.T) {
+	f := &forwarder{timeout: requestTimeout, conns: map[net.Conn]struct{}{}}
+	server, client := net.Pipe()
+	defer func() { _ = server.Close(); _ = client.Close() }()
+	rc := NewRPCConn(server)
+
+	if !f.arm(rc) {
+		t.Fatal("arm refused on a forwarder that is not closing")
+	}
+	// As close does: mark it done and expire the read deadline.
+	f.done.Store(true)
+	if err := server.SetReadDeadline(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if f.arm(rc) {
+		t.Error("arm accepted a connection on a closing forwarder")
+	}
+	read := make(chan error, 1)
+	go func() {
+		_, err := server.Read(make([]byte, 1))
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Errorf("read on the closing forwarder's connection: %v; want its expired deadline", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("arm pushed the expired read deadline of a closing forwarder back out")
+	}
+}
+
+// TestForwarderArmWaitsForClose checks arm takes the lock close holds while it
+// marks the forwarder done and expires the deadlines. Without it a handler could
+// read done as unset, lose the processor, and set its deadline after close had
+// expired it.
+func TestForwarderArmWaitsForClose(t *testing.T) {
+	f := &forwarder{timeout: requestTimeout, conns: map[net.Conn]struct{}{}}
+	server, client := net.Pipe()
+	defer func() { _ = server.Close(); _ = client.Close() }()
+
+	f.mu.Lock() // close, part way through
+	armed := make(chan bool, 1)
+	go func() { armed <- f.arm(NewRPCConn(server)) }()
+	select {
+	case <-armed:
+		f.mu.Unlock()
+		t.Fatal("arm did not wait for the lock close holds")
+	case <-time.After(100 * time.Millisecond):
+	}
+	f.done.Store(true)
+	f.mu.Unlock()
+	if <-armed {
+		t.Error("arm accepted a connection once close had marked the forwarder done")
 	}
 }

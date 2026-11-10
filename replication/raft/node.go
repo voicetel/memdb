@@ -42,13 +42,16 @@ type NodeConfig struct {
 	// ForwardPeers maps each peer's nodeID to its ForwardAddr, in the same
 	// "nodeID=addr" format as Peers. Used by followers to locate the leader's
 	// forwarding endpoint. Must include an entry for every node in the cluster,
-	// including this node.
+	// including this node. It is only the starting map: a node that joins the
+	// cluster later is added on each running node with SetForwardPeer, and one
+	// that leaves is dropped with RemoveForwardPeer.
 	// Example: ["node-1=10.0.0.1:7001", "node-2=10.0.0.2:7001"]
 	ForwardPeers []string
 
 	// Peers is the list of all nodes in the initial cluster, including this
 	// node. Format: "nodeID=addr", e.g. ["node-1=10.0.0.1:7000", "node-2=10.0.0.2:7000"].
 	// Only used during first bootstrap. Ignored if state already exists.
+	// Required unless Join is set.
 	Peers []string
 
 	// Join starts a node that has no Raft state without bootstrapping a
@@ -58,9 +61,14 @@ type NodeConfig struct {
 	// grows a running cluster: bootstrapping would give it a first
 	// configuration of its own at index 1 and term 1, the same index and term
 	// as the cluster's first entry, so the leader would never send its own and
-	// Raft's log matching would not hold at that index. Peers must still be
-	// set, but is not bootstrapped from, and its size need not be odd. A node
-	// that already has state ignores Join.
+	// Raft's log matching would not hold at that index. Peers is never read
+	// in join mode: it may be left empty, and if set it is not bootstrapped
+	// from, so its size need not be odd. A node that already has state ignores
+	// Join, so it can stay set across restarts.
+	//
+	// Until it is added the node is idle: it holds no data, answers no vote,
+	// and refuses writes. NewNode logs that at Warn, since nothing else will
+	// say why a node started this way by mistake never does anything.
 	Join bool
 
 	// DataDir is the directory where Raft stores its logs, stable state, and
@@ -91,6 +99,13 @@ type NodeConfig struct {
 	// ApplyTimeout is the timeout for a single Apply call (one write).
 	// Default: 10s.
 	ApplyTimeout time.Duration
+
+	// DisableShutdownHandover makes Shutdown on a leader stop without handing
+	// leadership to another voter first, as a crash would: the cluster then
+	// has no leader until an election timeout passes and a vote is won. Leave
+	// it unset in production. It is for rehearsing a leader's sudden loss, and
+	// for an operator who wants a node gone at once whatever it leads.
+	DisableShutdownHandover bool
 
 	// ForwardPoolSize is how many idle connections to the leader a follower
 	// keeps warm for forwarding writes. It does not cap concurrent forwards:
@@ -172,11 +187,19 @@ func (n *Node) logger() *slog.Logger {
 // Node is a member of a Raft cluster backed by a memdb database.
 // All writes go through Raft consensus before being applied to the local DB.
 type Node struct {
-	cfg          NodeConfig
-	raft         *hraft.Raft
-	transport    *hraft.NetworkTransport
-	forwarder    *forwarder               // nil when ForwardAddr is empty
+	cfg       NodeConfig
+	raft      *hraft.Raft
+	transport *hraft.NetworkTransport
+	forwarder *forwarder // nil when ForwardAddr is empty
+
+	// fwdMu guards forwardPeers, poolLeader, and poolClosed, and is held for
+	// every store to pool, so a pool is never installed for a peer address
+	// that has just changed, nor after Shutdown has closed the last one. The
+	// write path only loads pool and takes no lock while one is installed.
+	fwdMu        sync.Mutex
 	forwardPeers map[string]string        // nodeID → forwardAddr
+	poolLeader   string                   // the leader pool was last built for
+	poolClosed   bool                     // set by Shutdown; no pool is installed after it
 	pool         atomic.Pointer[ConnPool] // current leader's connection pool
 	isLeader     atomic.Bool
 	observerWg   sync.WaitGroup
@@ -231,10 +254,12 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	if cfg.TLSConfig.ClientSessionCache == nil {
 		cfg.TLSConfig.ClientSessionCache = tls.NewLRUClientSessionCache(0)
 	}
-	// Peers must always be provided — even on restart they are used to validate
-	// the caller's intent, and on first boot they define the cluster membership.
-	if len(cfg.Peers) == 0 {
-		return nil, fmt.Errorf("raft node: Peers must not be empty")
+	// Peers must be provided unless the node joins — even on restart they are
+	// used to validate the caller's intent, and on first boot they define the
+	// cluster membership. A joining node takes its membership from the leader
+	// that adds it and never reads Peers, so there it is optional.
+	if len(cfg.Peers) == 0 && !cfg.Join {
+		return nil, fmt.Errorf("raft node: Peers must not be empty (set Join to add this node to a running cluster instead)")
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("raft node: create data dir: %w", err)
@@ -301,6 +326,17 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 			return nil, fmt.Errorf("raft node: cluster size must be odd (got %d peers) — "+
 				"even-sized clusters have no fault tolerance advantage over the next smaller odd size; "+
 				"use 1, 3, 5, or 7 nodes", len(cfg.Peers))
+		}
+		// Parse the peers here too, before any socket is bound or Raft
+		// started, so a malformed entry costs nothing to refuse.
+		if _, err := parsePeers(cfg.Peers); err != nil {
+			if c, ok := logStore.(storeCloser); ok {
+				_ = c.Close()
+			}
+			if c, ok := stableStore.(storeCloser); ok {
+				_ = c.Close()
+			}
+			return nil, fmt.Errorf("raft node: parse peers: %w", err)
 		}
 		if len(cfg.Peers) == 1 {
 			l := cfg.Logger
@@ -383,8 +419,14 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	// ── bootstrap if no existing state ───────────────────────────────────────
 	switch {
 	case !hasState && cfg.Join:
-		node.logger().Info("memdb raft: joining; waiting for the leader to add this node",
+		// Warn, not Info: until some leader adds it this node does nothing at
+		// all, and a node left in join mode by mistake looks exactly like one
+		// that is waiting, so say so where an operator will see it.
+		node.logger().Warn("memdb raft: started in join mode with no existing state; "+
+			"this node stays idle (no data, no votes, writes refused) until the leader of a running cluster adds it with AddVoter",
 			"nodeID", cfg.NodeID,
+			"advertise", string(transport.LocalAddr()),
+			"peersIgnored", len(cfg.Peers),
 		)
 	case !hasState:
 		node.logger().Info("memdb raft: bootstrapping new cluster",
@@ -406,6 +448,7 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 	// ── forward peers map ────────────────────────────────────────────────────
 	// Must be built before the observer goroutine starts — the goroutine reads
 	// forwardPeers via poolForLeader and would race with this write otherwise.
+	// From here on it is read and changed only under fwdMu (SetForwardPeer).
 	node.forwardPeers = parseKVPairs(cfg.ForwardPeers)
 
 	// ── leader change observation ─────────────────────────────────────────────
@@ -460,9 +503,7 @@ func NewNode(db DB, cfg NodeConfig) (*Node, error) {
 					// Swap the connection pool to point at the new leader's
 					// ForwardAddr. Close the old pool so its idle connections are
 					// not handed to callers targeting the previous leader.
-					if old := node.pool.Swap(node.poolForLeader(string(lo.LeaderID))); old != nil {
-						old.Close()
-					}
+					node.setLeaderPool(string(lo.LeaderID))
 
 					if cfg.OnLeaderChange != nil {
 						// Wrap in another recover so a panicking OnLeaderChange
@@ -562,16 +603,11 @@ func (n *Node) ExecResultContext(ctx context.Context, sql string, args ...any) (
 
 	pool := n.pool.Load()
 	if pool == nil {
-		// Pool not yet initialised (leader just elected) — try to build one.
-		pool = n.poolForLeader(string(leaderID))
-		if pool == nil {
-			return 0, fmt.Errorf("%w: leader is %s (configure ForwardPeers to enable transparent forwarding)", ErrNotLeader, leaderID)
-		}
-		// Store only if nobody beat us to it; if they did, use theirs and
-		// discard the one we just created.
-		if !n.pool.CompareAndSwap(nil, pool) {
-			pool.Close()
-			pool = n.pool.Load()
+		// Pool not yet initialised (leader just elected, or its forward
+		// address only just set) — try to build one.
+		var err error
+		if pool, err = n.leaderPool(string(leaderID)); err != nil {
+			return 0, err
 		}
 	}
 
@@ -582,7 +618,7 @@ func (n *Node) ExecResultContext(ctx context.Context, sql string, args ...any) (
 }
 
 // poolForLeader returns a ConnPool for the given leader's ForwardAddr, or nil
-// if ForwardPeers is not configured for that leader ID.
+// if no forward address is known for that leader ID. The caller holds fwdMu.
 func (n *Node) poolForLeader(leaderID string) *ConnPool {
 	if leaderID == "" {
 		return nil
@@ -592,6 +628,120 @@ func (n *Node) poolForLeader(leaderID string) *ConnPool {
 		return nil
 	}
 	return NewConnPool(fwdAddr, n.cfg.TLSConfig, n.cfg.ForwardPoolSize)
+}
+
+// setLeaderPool replaces the pool with one for leaderID, or with none when no
+// forward address is known for it, and closes the pool it replaces. The
+// observer goroutine calls it on every leader change. After Shutdown has
+// closed the pool it installs nothing: a leader change seen between that and
+// the observer stopping, which the handover in Shutdown makes likely, would
+// otherwise leave a pool nobody closes.
+func (n *Node) setLeaderPool(leaderID string) {
+	n.fwdMu.Lock()
+	var next *ConnPool
+	if !n.poolClosed {
+		next = n.poolForLeader(leaderID)
+	}
+	n.poolLeader = leaderID
+	old := n.pool.Swap(next)
+	n.fwdMu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+}
+
+// leaderPool returns the pool to forward to leaderID through, building it if
+// there is none. It fails when no forward address is known for the leader, and
+// once the node is shut down.
+func (n *Node) leaderPool(leaderID string) (*ConnPool, error) {
+	n.fwdMu.Lock()
+	defer n.fwdMu.Unlock()
+	if n.poolClosed {
+		return nil, fmt.Errorf("raft: forward: %w", hraft.ErrRaftShutdown)
+	}
+	if pool := n.pool.Load(); pool != nil {
+		return pool, nil
+	}
+	pool := n.poolForLeader(leaderID)
+	if pool == nil {
+		return nil, fmt.Errorf("%w: leader is %s, and this node has no forward address for it "+
+			"(call SetForwardPeer(%q, addr) on this node, or add it to ForwardPeers and restart)",
+			ErrNotLeader, leaderID, leaderID)
+	}
+	n.poolLeader = leaderID
+	n.pool.Store(pool)
+	return pool, nil
+}
+
+// closePool closes the pool for good: nothing installs another afterwards.
+func (n *Node) closePool() {
+	n.fwdMu.Lock()
+	n.poolClosed = true
+	old := n.pool.Swap(nil)
+	n.fwdMu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+}
+
+// SetForwardPeer tells this node where nodeID listens for forwarded writes (its
+// ForwardAddr), adding it to the map NodeConfig.ForwardPeers started, or
+// replacing its address. It takes effect on the next write and is safe to call
+// at any time, from any goroutine.
+//
+// ForwardPeers is read once, when the node starts, so a node that was running
+// before another joined has no address for it: once the joiner leads, which
+// any handover can bring about, every write on the older node fails with
+// ErrNotLeader until this is called. After AddVoter, call it on every running
+// node for the node added. It changes this node's memory only: put the address
+// in ForwardPeers as well, so a restart keeps it.
+func (n *Node) SetForwardPeer(nodeID, addr string) error {
+	if nodeID == "" || addr == "" {
+		return fmt.Errorf("raft node: set forward peer: nodeID and addr must be non-empty")
+	}
+	n.fwdMu.Lock()
+	changed := n.forwardPeers[nodeID] != addr
+	n.forwardPeers[nodeID] = addr
+	var old *ConnPool
+	if changed && n.poolLeader == nodeID {
+		// The pool dials the leader's old address; the next write builds one
+		// for the new address.
+		old = n.pool.Swap(nil)
+	}
+	n.fwdMu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+	return nil
+}
+
+// RemoveForwardPeer forgets nodeID's forward address, and closes the idle
+// connections to it if it is the leader this node forwards to. Pair it with
+// RemoveServer, on every node, so no node keeps dialling one that has left.
+// Removing an unknown node does nothing.
+func (n *Node) RemoveForwardPeer(nodeID string) {
+	n.fwdMu.Lock()
+	delete(n.forwardPeers, nodeID)
+	var old *ConnPool
+	if n.poolLeader == nodeID {
+		old = n.pool.Swap(nil)
+	}
+	n.fwdMu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+}
+
+// ForwardPeers returns a copy of the forward addresses this node knows, by
+// node ID.
+func (n *Node) ForwardPeers() map[string]string {
+	n.fwdMu.Lock()
+	defer n.fwdMu.Unlock()
+	peers := make(map[string]string, len(n.forwardPeers))
+	for id, addr := range n.forwardPeers {
+		peers[id] = addr
+	}
+	return peers
 }
 
 // IsLeader reports whether this node is the current Raft leader.
@@ -608,11 +758,13 @@ func (n *Node) LeaderAddr() string {
 	return string(addr)
 }
 
-// AddVoter adds a new voting member to the cluster. Must be called on the leader.
+// AddVoter adds a new voting member to the cluster. Must be called on the
+// leader; anywhere else the error is ErrNotLeader. Each node already running
+// also needs the new node's forward address: see SetForwardPeer.
 func (n *Node) AddVoter(nodeID, addr string, timeout time.Duration) error {
 	f := n.raft.AddVoter(hraft.ServerID(nodeID), hraft.ServerAddress(addr), 0, timeout)
 	if err := f.Error(); err != nil {
-		return fmt.Errorf("raft node: add voter %s: %w", nodeID, err)
+		return fmt.Errorf("raft node: add voter %s: %w", nodeID, notLeader(err))
 	}
 	return nil
 }
@@ -622,10 +774,11 @@ func (n *Node) AddVoter(nodeID, addr string, timeout time.Duration) error {
 // hashicorp/raft brings the target up to date, tells it to start an election at
 // once, and refuses writes on this node meanwhile; it gives up after about the
 // election timeout, so a cluster with no other voter, or none that answers,
-// fails it in bounded time.
+// fails it in bounded time. Called on a node that is not the leader it fails
+// with ErrNotLeader.
 func (n *Node) TransferLeadership() error {
 	if err := n.raft.LeadershipTransfer().Error(); err != nil {
-		return fmt.Errorf("raft node: transfer leadership: %w", err)
+		return fmt.Errorf("raft node: transfer leadership: %w", notLeader(err))
 	}
 	return nil
 }
@@ -639,7 +792,7 @@ func (n *Node) TransferLeadershipTo(nodeID string) error {
 	for _, s := range cfg.Configuration().Servers {
 		if string(s.ID) == nodeID {
 			if err := n.raft.LeadershipTransferToServer(s.ID, s.Address).Error(); err != nil {
-				return fmt.Errorf("raft node: transfer leadership to %s: %w", nodeID, err)
+				return fmt.Errorf("raft node: transfer leadership to %s: %w", nodeID, notLeader(err))
 			}
 			return nil
 		}
@@ -647,11 +800,13 @@ func (n *Node) TransferLeadershipTo(nodeID string) error {
 	return fmt.Errorf("raft node: transfer leadership: %s is not a member", nodeID)
 }
 
-// RemoveServer removes a node from the cluster. Must be called on the leader.
+// RemoveServer removes a node from the cluster. Must be called on the leader;
+// anywhere else the error is ErrNotLeader. Pair it with RemoveForwardPeer on
+// every remaining node.
 func (n *Node) RemoveServer(nodeID string, timeout time.Duration) error {
 	f := n.raft.RemoveServer(hraft.ServerID(nodeID), 0, timeout)
 	if err := f.Error(); err != nil {
-		return fmt.Errorf("raft node: remove server %s: %w", nodeID, err)
+		return fmt.Errorf("raft node: remove server %s: %w", nodeID, notLeader(err))
 	}
 	return nil
 }
@@ -660,26 +815,30 @@ func (n *Node) RemoveServer(nodeID string, timeout time.Duration) error {
 // It is safe to call Shutdown more than once; subsequent calls are no-ops
 // that return nil.
 //
-// A leader first hands leadership to another voter (TransferLeadership), so the
-// cluster has a new leader at once rather than after an election timeout with
-// no leader. That is bounded by about the election timeout; if it fails, for
-// want of a voter that answers, the failure is logged and the node stops
-// anyway.
+// A leader first hands leadership to another voter, so the cluster has a new
+// leader at once rather than after an election timeout with no leader. It asks
+// hashicorp/raft for its own choice first, the voter with the most of the log;
+// that choice takes no account of whether the voter is alive, so if it fails
+// each other voter is asked by name. The whole handover, however many voters
+// are tried, is bounded by shutdownHandoverTimeouts (3) election timeouts, 1.5 s
+// with the default ElectionTimeout: when that is spent, or no voter takes
+// over, the failure is logged and the node stops anyway. A leader with no
+// other voter has nobody to hand over to and skips this, as does any node with
+// NodeConfig.DisableShutdownHandover set.
 func (n *Node) Shutdown() error {
 	var retErr error
 	n.shutdownOnce.Do(func() {
-		if n.raft.State() == hraft.Leader {
-			if err := n.TransferLeadership(); err != nil {
-				n.logger().Warn("memdb raft: could not hand leadership over before shutting down", "error", err)
-			}
+		if !n.cfg.DisableShutdownHandover {
+			n.handOverLeadership()
 		}
 		if n.forwarder != nil {
 			_ = n.forwarder.close()
 		}
-		// Close and discard the connection pool so idle connections are not leaked.
-		if pool := n.pool.Swap(nil); pool != nil {
-			pool.Close()
-		}
+		// Close and discard the connection pool so idle connections are not
+		// leaked. The observer goroutine is still running, and the handover
+		// above makes a leader change about now likely; closePool also stops
+		// it installing a new pool that nobody would close.
+		n.closePool()
 		// Deregister the observer FIRST so hashicorp/raft stops sending
 		// observations into obs. Then signal the observer goroutine to exit
 		// via the dedicated observerDone channel. We deliberately do NOT
@@ -698,13 +857,125 @@ func (n *Node) Shutdown() error {
 	return retErr
 }
 
+// shutdownHandoverTimeouts is how many election timeouts Shutdown may spend
+// handing leadership over, in total.
+const shutdownHandoverTimeouts = 3
+
+// handOverLeadership is the handover Shutdown makes on a leader: see Shutdown.
+func (n *Node) handOverLeadership() {
+	if n.raft.State() != hraft.Leader {
+		return
+	}
+	voters, err := n.otherVoters()
+	if err != nil {
+		n.logger().Warn("memdb raft: could not hand leadership over before shutting down", "error", err)
+		return
+	}
+	if len(voters) == 0 {
+		// The only voter: there is nobody to hand over to, and nothing wrong.
+		n.logger().Debug("memdb raft: no other voter to hand leadership over to", "nodeID", n.cfg.NodeID)
+		return
+	}
+	deadline := time.Now().Add(shutdownHandoverTimeouts * n.cfg.ElectionTimeout)
+	err = n.transferBy(deadline, n.raft.LeadershipTransfer)
+	// hashicorp/raft's own choice goes to the first voter in configuration
+	// order among those with the most of the log, alive or not, so the ones
+	// it did not choose are reached soonest from the other end.
+	for i := len(voters) - 1; i >= 0 && err != nil; i-- {
+		if n.raft.State() != hraft.Leader || !time.Now().Before(deadline) {
+			break
+		}
+		target := voters[i]
+		n.logger().Info("memdb raft: handing leadership over failed; trying another voter",
+			"error", err, "target", string(target.ID))
+		err = n.transferBy(deadline, func() hraft.Future {
+			return n.raft.LeadershipTransferToServer(target.ID, target.Address)
+		})
+	}
+	if err != nil && n.raft.State() == hraft.Leader {
+		n.logger().Warn("memdb raft: could not hand leadership over before shutting down",
+			"error", err, "votersTried", len(voters))
+	}
+}
+
+// otherVoters returns the cluster's voters other than this node, in
+// configuration order.
+func (n *Node) otherVoters() ([]hraft.Server, error) {
+	f := n.raft.GetConfiguration()
+	if err := f.Error(); err != nil {
+		return nil, err
+	}
+	var voters []hraft.Server
+	for _, s := range f.Configuration().Servers {
+		if s.Suffrage == hraft.Voter && string(s.ID) != n.cfg.NodeID {
+			voters = append(voters, s)
+		}
+	}
+	return voters, nil
+}
+
+// errHandoverBudget is the outcome of a handover that ran out of time.
+var errHandoverBudget = errors.New("raft node: transfer leadership: out of time")
+
+// transferBy starts a leadership transfer and waits for its outcome, but no
+// later than deadline. hashicorp/raft answers a transfer within an election
+// timeout by itself; the deadline is what holds if it ever does not. A transfer
+// refused because the one before it is still winding down inside raft, which it
+// does for a moment after reporting its outcome, is started again.
+func (n *Node) transferBy(deadline time.Time, start func() hraft.Future) error {
+	for {
+		outcome := make(chan error, 1)
+		go func() { outcome <- start().Error() }()
+		var err error
+		select {
+		case err = <-outcome:
+		case <-time.After(time.Until(deadline)):
+			return errHandoverBudget
+		}
+		if !errors.Is(err, hraft.ErrLeadershipTransferInProgress) && !errors.Is(err, hraft.ErrEnqueueTimeout) {
+			return err
+		}
+		if time.Until(deadline) < 10*time.Millisecond {
+			return err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // Stats returns internal Raft statistics for monitoring.
 func (n *Node) Stats() map[string]string {
 	return n.raft.Stats()
 }
 
-// ErrNotLeader is returned when a write is attempted on a non-leader node.
+// ErrNotLeader is returned when a write is attempted on a non-leader node
+// that cannot forward it, when the leader refuses a write because it is
+// handing leadership over, and when a call only the leader can serve
+// (AddVoter, RemoveServer, TransferLeadership) is made elsewhere. In each case
+// the operation did not happen and can be retried once there is a leader.
+// Where hashicorp/raft reported the condition, errors.Is also matches its own
+// error (raft.ErrNotLeader or raft.ErrLeadershipTransferInProgress).
 var ErrNotLeader = errors.New("raft: not leader")
+
+// notLeaderError is an error from hashicorp/raft that means this node is not,
+// or is ceasing to be, the leader. It reads exactly as the error it holds, and
+// matches both that error and ErrNotLeader.
+type notLeaderError struct{ err error }
+
+func (e *notLeaderError) Error() string   { return e.err.Error() }
+func (e *notLeaderError) Unwrap() []error { return []error{e.err, ErrNotLeader} }
+
+// notLeader returns err matching ErrNotLeader as well, if it is one of the
+// errors hashicorp/raft refuses an operation with for want of leadership:
+// ErrNotLeader, and ErrLeadershipTransferInProgress, which a leader answers
+// while it hands leadership over. Both refuse before anything is written to the
+// log, so the caller may retry. ErrLeadershipLost is deliberately not one: it
+// leaves an entry that may yet commit. Any other error is returned unchanged.
+func notLeader(err error) error {
+	if errors.Is(err, hraft.ErrNotLeader) || errors.Is(err, hraft.ErrLeadershipTransferInProgress) {
+		return &notLeaderError{err: err}
+	}
+	return err
+}
 
 // parsePeers converts "nodeID=addr" strings into raft.Server entries.
 func parsePeers(peers []string) ([]hraft.Server, error) {

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	hraft "github.com/hashicorp/raft"
 	"github.com/mattn/go-sqlite3"
 )
 
@@ -38,7 +39,8 @@ type ForwardResponse struct {
 	// ErrCode is an optional sentinel identifier that lets the caller
 	// reconstruct a typed Go error on the follower side. Known values:
 	//   "ErrNotLeader" — the forwarded request was sent to a node that is
-	//                    no longer the leader.
+	//                    no longer the leader, or that refused it because it
+	//                    is handing leadership over. The write was not made.
 	// An empty ErrCode with a non-empty ErrMsg means "some other error";
 	// callers should treat it as a generic failure.
 	ErrCode string
@@ -198,6 +200,18 @@ func NewConnPool(addr string, tlsCfg *tls.Config, size int) *ConnPool {
 // sendForward detects a dead connection when the write or read fails and
 // discards it rather than returning it to the pool.
 func (p *ConnPool) Get(timeout time.Duration) (*RPCConn, error) {
+	return p.GetContext(context.Background(), timeout)
+}
+
+// GetContext is Get whose dial also ends when ctx does. Both the TCP connect
+// and the TLS handshake stop then, still capped by min(timeout, dialTimeout),
+// so a peer that accepts the connection and then stalls the handshake does
+// not hold a caller past its own deadline. The error then wraps ctx's, and
+// nothing was sent.
+func (p *ConnPool) GetContext(ctx context.Context, timeout time.Duration) (*RPCConn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("rpc: connection to %s not taken: %w", p.addr, err)
+	}
 	// Reject early if the pool has been closed — avoids dialing a fresh
 	// connection that would be immediately closed by Put.
 	if p.closed.Load() {
@@ -232,9 +246,16 @@ drainLoop:
 	if d <= 0 {
 		return nil, fmt.Errorf("rpc: deadline exceeded before dial")
 	}
-	dialer := &net.Dialer{Timeout: d}
-	conn, err := tls.DialWithDialer(dialer, "tcp", p.addr, p.tlsCfg)
+	dialCtx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	dialer := &tls.Dialer{NetDialer: &net.Dialer{}, Config: p.tlsCfg}
+	conn, err := dialer.DialContext(dialCtx, "tcp", p.addr)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// The caller's context ended the dial, not the cap on it: say
+			// so with its error, whatever the network reported.
+			return nil, fmt.Errorf("rpc: dial %s: %w", p.addr, ctxErr)
+		}
 		return nil, fmt.Errorf("rpc: dial %s: %w", p.addr, err)
 	}
 	return NewRPCConn(conn), nil
@@ -287,7 +308,7 @@ func (p *ConnPool) IdleCount() int {
 // any transport error the connection is discarded rather than pooled, so
 // a broken connection is never handed to the next caller.
 func sendForward(ctx context.Context, pool *ConnPool, req ForwardRequest, timeout time.Duration) (int64, error) {
-	conn, err := pool.Get(timeout)
+	conn, err := pool.GetContext(ctx, timeout)
 	if err != nil {
 		return 0, err
 	}
@@ -329,14 +350,22 @@ func sendForward(ctx context.Context, pool *ConnPool, req ForwardRequest, timeou
 		// Translate known sentinel codes back into typed errors so callers
 		// on the follower side can use errors.Is(err, ErrNotLeader) to
 		// drive retry logic without string-matching.
-		switch resp.ErrCode {
-		case "ErrNotLeader":
+		switch {
+		case resp.ErrCode == "ErrNotLeader",
+			// A leader from before it sent the code for this: it refused the
+			// write because it was handing leadership over, in these words.
+			resp.ErrCode == "" && resp.ErrMsg == transferInProgressMsg:
 			return 0, fmt.Errorf("%w: forwarded: %s", ErrNotLeader, resp.ErrMsg)
 		}
 		return 0, forwardedError(resp)
 	}
 	return resp.RowsAffected, nil
 }
+
+// transferInProgressMsg is the whole message of a write a leader refused while
+// handing leadership over, as a leader that predates marking it ErrNotLeader
+// sends it: with no ErrCode.
+var transferInProgressMsg = "raft: apply: " + hraft.ErrLeadershipTransferInProgress.Error()
 
 // exchange sends one request and reads its answer.
 func exchange(conn *RPCConn, req ForwardRequest) (ForwardResponse, error) {

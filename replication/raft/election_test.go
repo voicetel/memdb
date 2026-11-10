@@ -12,6 +12,12 @@ import (
 // leader has never voted or campaigned, so it has no vote record. If the leader is
 // lost while that node is behind, it cannot win, and the other node needs its vote.
 // A node with no vote record must therefore be able to grant one.
+//
+// The leader must be lost, not stopped in good order: Shutdown hands leadership
+// to the node that is ahead before it stops, and then the node behind is never
+// asked for the deciding vote and the test proves nothing. So every node here
+// runs with DisableShutdownHandover, and stopping the leader is a crash as far
+// as the others can tell.
 func TestNode_ElectsLeaderWhenNodeBehindHasNeverVoted(t *testing.T) {
 	t.Parallel()
 	tlsCfg := generateTLSConfig(t)
@@ -36,6 +42,8 @@ func TestNode_ElectsLeaderWhenNodeBehindHasNeverVoted(t *testing.T) {
 			ElectionTimeout:  1500 * time.Millisecond,
 			CommitTimeout:    10 * time.Millisecond,
 			ApplyTimeout:     10 * time.Second,
+
+			DisableShutdownHandover: true,
 		})
 		if err != nil {
 			t.Fatalf("NewNode %s: %v", id, err)
@@ -90,6 +98,9 @@ func TestNode_ElectsLeaderWhenNodeBehindHasNeverVoted(t *testing.T) {
 	}
 	if err := leader.Shutdown(); err != nil {
 		t.Fatal(err)
+	}
+	if survivor.IsLeader() {
+		t.Fatal("the leader handed leadership over as it stopped, so the node behind will not be asked to vote")
 	}
 	third, _ = start("node-3")
 

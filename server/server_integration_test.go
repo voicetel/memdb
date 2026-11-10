@@ -691,6 +691,43 @@ func TestServer_Stop_RejectsNewConnections(t *testing.T) {
 	}
 }
 
+// TestServer_Stop_BeforeListenAndServe verifies that a Stop which wins the
+// race against ListenAndServe still stops the server: ListenAndServe must
+// return without serving and must not leave its listener bound. Before the
+// fix Stop found no listener to close, so ListenAndServe bound the socket
+// afterwards and blocked in Accept with nothing left to unblock it.
+func TestServer_Stop_BeforeListenAndServe(t *testing.T) {
+	db := integrationDB(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	srv := server.New(db, server.Config{ListenAddr: addr})
+	srv.Stop()
+
+	served := make(chan error, 1)
+	go func() { served <- srv.ListenAndServe() }()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("ListenAndServe after Stop = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe kept serving after Stop had already been called")
+	}
+
+	// The address must be free again.
+	ln, err = net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("listener left bound after ListenAndServe returned: %v", err)
+	}
+	_ = ln.Close()
+}
+
 // TestServer_Stop_TerminatesInFlight verifies that Stop() closes live
 // handler connections and returns promptly instead of waiting for the
 // clients to disconnect on their own.

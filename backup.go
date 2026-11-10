@@ -16,10 +16,56 @@ import (
 // rejects payloads that do not start with this prefix.
 var sqliteFileHeader = []byte("SQLite format 3\x00")
 
-// copyMemToWriter serialises the in-memory DB into w using the SQLite Online
-// Backup API: memory → temp file on disk → stream temp file → delete temp file.
-// stepPages controls pages per backup step; -1 = all at once.
+// serializeFlushMaxBytes bounds the in-memory fast path in copyMemToWriter.
+// At or below this size, a flush uses sqlite3_serialize to produce the whole
+// image in one C→Go copy instead of the backup-API-via-temp-file round trip.
+// Serialize is markedly cheaper for a small DB — pprof of BenchmarkFlush
+// showed the temp-file path spending ~21% of CPU in file syscalls plus most
+// of a further ~33% in backup-API cgocall, all of which serialize replaces
+// with a single memcpy — but it costs an O(DB-size) allocation (transiently
+// ~3× during the C→Go copy), so above this threshold copyMemToWriter keeps
+// the streaming path whose flush memory stays O(1). 64 MiB comfortably covers
+// any realistic in-memory hot DB while bounding the serialize spike to
+// well under 200 MiB.
+const serializeFlushMaxBytes = 64 << 20
+
+// copyMemToWriter serialises the in-memory DB into w.
+//
+// Small DBs (≤ serializeFlushMaxBytes) take an in-memory fast path via
+// sqlite3_serialize, avoiding a temp-file write/read round trip. Larger DBs
+// stream through copyMemToWriterViaBackup (the SQLite Online Backup API),
+// which keeps flush memory O(1) at the cost of the extra disk I/O. stepPages
+// controls pages per backup step on the streaming path (-1 = all at once); it
+// is unused by the serialize path.
 func copyMemToWriter(ctx context.Context, d *DB, w io.Writer, stepPages int) error {
+	if size, ok := d.approxBytes(ctx); ok && size <= serializeFlushMaxBytes {
+		var data []byte
+		err := withRawConn(ctx, d.mem, func(conn *sqlite3.SQLiteConn) error {
+			var serr error
+			data, serr = conn.Serialize("main")
+			return serr
+		})
+		if err == nil {
+			_, werr := w.Write(data)
+			return werr
+		}
+		// Serialize failed before any byte reached w (typically OOM from
+		// the sqlite3_malloc64 of the image). Fall through to the streaming
+		// backup path, which flushes with O(1) memory. Falling through is
+		// only safe here because nothing has been written to w yet — a
+		// failure after w.Write began must not double-write, so that case
+		// returns above.
+	}
+	return copyMemToWriterViaBackup(ctx, d, w, stepPages)
+}
+
+// copyMemToWriterViaBackup streams the in-memory DB into w using the SQLite
+// Online Backup API: memory → temp file on disk → stream temp file → delete
+// temp file. Flush memory is O(io.Copy buffer) regardless of DB size, which
+// is why large DBs (> serializeFlushMaxBytes) use this path instead of the
+// whole-image sqlite3_serialize fast path. stepPages controls pages per backup
+// step; -1 = all at once.
+func copyMemToWriterViaBackup(ctx context.Context, d *DB, w io.Writer, stepPages int) error {
 	// Write to a temp file first (backup API needs a file path), then stream it.
 	tmp, err := os.CreateTemp("", ".memdb-backup-*.db")
 	if err != nil {
@@ -53,14 +99,32 @@ func copyMemToWriter(ctx context.Context, d *DB, w io.Writer, stepPages int) err
 	return err
 }
 
+// approxBytes returns the approximate on-disk size of the in-memory database
+// (page_count × page_size), used to choose the flush strategy. It reports
+// ok=false if the size cannot be determined, in which case callers fall back
+// to the streaming path. The query reads only DB-header metadata so it is
+// cheap relative to the flush it gates.
+func (d *DB) approxBytes(ctx context.Context) (int64, bool) {
+	var size int64
+	err := d.mem.QueryRowContext(ctx,
+		"SELECT (SELECT page_count FROM pragma_page_count) * "+
+			"(SELECT page_size FROM pragma_page_size)",
+	).Scan(&size)
+	if err != nil || size < 0 {
+		return 0, false
+	}
+	return size, true
+}
+
 // restoreVerifiedSnapshot streams a wrapped snapshot from r through
 // verifyAndStreamPayload directly into a temp file (combining the
 // verification and the temp-file staging that copyReaderToMem would do
 // in two passes), then loads the verified payload into d.mem via the
 // SQLite Online Backup API.
 //
-// Returns isLegacy=true when r contained an unwrapped raw SQLite file
-// (no "MDBK" prefix); the caller decides whether to log a warning. On
+// Returns isLegacy=true when r had no "MDBK" integrity wrap — an unwrapped
+// raw SQLite file, or the "MDBC" checkpoint prefix an authenticated
+// backend's stream carries; the caller decides whether to log a warning. On
 // verification failure (length or hash mismatch, truncated footer)
 // returns ErrSnapshotCorrupt without touching d.mem.
 //

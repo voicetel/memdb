@@ -50,8 +50,34 @@ import (
 // file written by some other tool — are loaded directly without
 // verification, with a warning logged. Any subsequent flush upgrades
 // them to the wrapped format.
+//
+// A version word greater than snapVersion is rejected with
+// ErrSnapshotVersion: the file was written by a newer memdb and its layout
+// is unknown here, so guessing would misread it.
+//
+// # Checkpoint prefix for authenticated backends
+//
+// A backend that authenticates its own payload (AuthenticatedBackend, e.g.
+// AES-GCM in backends.EncryptedBackend) skips the MDBK wrap, because its
+// tag already is the integrity check. It still needs the checkpoint, so the
+// stream handed to such a backend is:
+//
+//	[4]byte  magic         = snapCkptMagic ("MDBC")
+//	[4]byte  version       = 1             (uint32)
+//	[8]byte  walSeq        = highest WAL sequence number the snapshot includes
+//	[N]byte  payload       = raw SQLite bytes
+//
+// There is no footer and no SHA-256: the prefix travels inside the
+// authenticated stream, so the backend's tag covers it together with the
+// payload. A stream from an authenticated backend that starts with neither
+// magic is a snapshot from before this prefix existed (raw SQLite bytes,
+// "SQLite format 3\x00"): it loads as before, with checkpoint 0.
 
 var snapMagic = [4]byte{'M', 'D', 'B', 'K'}
+
+// snapCkptMagic opens the checkpoint-only prefix written for authenticated
+// backends. It differs from snapMagic because the layout does: no footer.
+var snapCkptMagic = [4]byte{'M', 'D', 'B', 'C'}
 
 const (
 	// snapVersion is the current snapshot format. Version 2 added the walSeq
@@ -60,6 +86,12 @@ const (
 
 	// snapHeaderLen is the whole header: [magic][version][walSeq].
 	snapHeaderLen = 4 + 4 + 8
+
+	// snapCkptVersion is the current version of the checkpoint-only prefix.
+	snapCkptVersion uint32 = 1
+
+	// snapCkptHeaderLen is the whole checkpoint prefix: [magic][version][walSeq].
+	snapCkptHeaderLen = 4 + 4 + 8
 
 	// snapFooterLen is the trailing [payloadLen][sha256] = 40 bytes
 	// written after the payload. The reader uses this as the size of
@@ -128,6 +160,20 @@ func (s *snapshotWriter) Finish() error {
 	return nil
 }
 
+// writeCheckpointPrefix writes the [magic][version][walSeq] checkpoint prefix
+// used for authenticated backends to dst. The raw SQLite payload follows it
+// directly; there is no footer.
+func writeCheckpointPrefix(dst io.Writer, walSeq uint64) error {
+	var hdr [snapCkptHeaderLen]byte
+	copy(hdr[0:4], snapCkptMagic[:])
+	binary.BigEndian.PutUint32(hdr[4:8], snapCkptVersion)
+	binary.BigEndian.PutUint64(hdr[8:16], walSeq)
+	if _, err := dst.Write(hdr[:]); err != nil {
+		return fmt.Errorf("snapshot: write checkpoint prefix: %w", err)
+	}
+	return nil
+}
+
 // UnwrapSnapshot reads a memdb snapshot from r, verifies its MDBK
 // integrity wrap, and writes the raw SQLite payload bytes to dst as
 // they stream. The result is a vanilla SQLite database file that can
@@ -136,9 +182,15 @@ func (s *snapshotWriter) Finish() error {
 // If r contains a legacy unwrapped snapshot — raw SQLite bytes
 // without the MDBK header — the bytes are passed through unchanged
 // and isLegacy is true so the caller may warn or upgrade the file.
+// The same goes for a stream carrying the "MDBC" checkpoint prefix
+// written for authenticated backends (what such a backend hands back
+// after authenticating it): the prefix is stripped, the payload is
+// passed through, and isLegacy is true because nothing here verified it.
 //
 // Returns ErrSnapshotCorrupt for a wrapped snapshot whose footer
-// indicates a length or hash mismatch, or whose footer is truncated.
+// indicates a length or hash mismatch, or whose footer is truncated,
+// and ErrSnapshotVersion for an envelope version newer than this
+// build understands.
 //
 // Memory is O(1) regardless of snapshot size: the caller may pass an
 // arbitrarily large stream without buffering it. This is the public
@@ -154,17 +206,40 @@ func UnwrapSnapshot(r io.Reader, dst io.Writer) (isLegacy bool, err error) {
 // snapshot), and isLegacy. Memory is O(1) — only a 64 KiB read buffer plus the
 // running SHA-256 state.
 //
-// If r does not begin with snapMagic, the data is assumed to be a legacy
+// If r begins with snapCkptMagic it carries the checkpoint-only prefix an
+// authenticated backend's stream has: the checkpoint is read, the rest of r
+// is copied unchecked (the backend authenticated it), and isLegacy == true is
+// returned — "legacy" here means only "no MDBK integrity wrap".
+//
+// If r begins with neither magic, the data is assumed to be a legacy
 // (unwrapped) raw SQLite file. The 4 bytes already read are emitted to dst,
 // the rest of r is copied unchecked, and isLegacy == true is returned. The
 // caller decides whether to log a warning.
 //
 // Returns ErrSnapshotCorrupt for a wrapped snapshot whose footer indicates
-// a length or hash mismatch, or whose footer is truncated.
+// a length or hash mismatch, or whose footer is truncated, and
+// ErrSnapshotVersion when either header names a version newer than this
+// build knows.
 func verifyAndStreamPayload(r io.Reader, dst io.Writer) (snapSeq uint64, isLegacy bool, err error) {
 	var magic [4]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
 		return 0, false, fmt.Errorf("%w: too short to read magic", ErrSnapshotCorrupt)
+	}
+
+	if magic == snapCkptMagic {
+		var hdr [snapCkptHeaderLen - 4]byte
+		if _, err := io.ReadFull(r, hdr[:]); err != nil {
+			return 0, false, fmt.Errorf("%w: truncated checkpoint prefix", ErrSnapshotCorrupt)
+		}
+		if version := binary.BigEndian.Uint32(hdr[0:4]); version == 0 || version > snapCkptVersion {
+			return 0, false, fmt.Errorf("%w: checkpoint prefix version %d (this build reads up to %d)",
+				ErrSnapshotVersion, version, snapCkptVersion)
+		}
+		walSeq := binary.BigEndian.Uint64(hdr[4:12])
+		if _, cerr := io.Copy(dst, r); cerr != nil {
+			return walSeq, true, cerr
+		}
+		return walSeq, true, nil
 	}
 
 	if magic != snapMagic {
@@ -185,6 +260,13 @@ func verifyAndStreamPayload(r io.Reader, dst io.Writer) (snapSeq uint64, isLegac
 		return 0, false, fmt.Errorf("%w: truncated version", ErrSnapshotCorrupt)
 	}
 	version := binary.BigEndian.Uint32(verBuf[:])
+	if version > snapVersion {
+		// Written by a newer memdb. Its layout past the version word is
+		// unknown here; reading it as version 2 would at best fail the hash
+		// and at worst load a misparsed checkpoint.
+		return 0, false, fmt.Errorf("%w: envelope version %d (this build reads up to %d)",
+			ErrSnapshotVersion, version, snapVersion)
+	}
 
 	var walSeq uint64
 	if version >= 2 {
@@ -397,8 +479,11 @@ type ExternalBackend interface {
 // may implement to declare that it provides its own authenticated
 // integrity (typically AEAD encryption such as AES-GCM). When the
 // adapter detects this marker and Authenticated returns true, the
-// 40-byte MDBK SHA-256 header normally prepended to every snapshot is
-// skipped — the backend's own authentication tag is the integrity check.
+// MDBK SHA-256 wrap normally put around every snapshot is skipped — the
+// backend's own authentication tag is the integrity check. The stream the
+// backend receives instead starts with a 16-byte checkpoint prefix
+// ([magic "MDBC"][version][walSeq]) followed by the raw SQLite bytes; the
+// backend must return exactly those bytes from Read.
 //
 // Why this matters: pprof of the encrypted-flush path showed sha256
 // blockSHANI at ~17% of CPU. AEAD wrappers like backends.EncryptedBackend
@@ -407,7 +492,8 @@ type ExternalBackend interface {
 // Backward compatibility on restore is preserved: the adapter inspects
 // the first four bytes of the stored payload. A snapshot written before
 // the marker was added still has the MDBK header and is verified
-// normally; a new headerless snapshot is loaded directly without a
+// normally; a snapshot with the checkpoint prefix, or a headerless one
+// from before that prefix existed, is loaded directly without a
 // "legacy" warning when the inner backend is Authenticated.
 type AuthenticatedBackend interface {
 	Authenticated() bool
@@ -438,11 +524,14 @@ func (a *externalBackendAdapter) Exists(ctx context.Context) (bool, error) {
 
 // flush streams the in-memory DB to the external backend through a
 // pipe. By default the stream is wrapped in the snapshot integrity
-// format ([magic][version][payload][len][sha256]); when the inner
+// format ([magic][version][walSeq][payload][len][sha256]); when the inner
 // backend implements AuthenticatedBackend and reports true the wrap is
 // skipped because the backend's own authenticator (e.g. AES-GCM tag) is
 // the integrity check, saving the SHA-256 pass measured at ~17% of CPU
-// on the encrypted-flush pprof.
+// on the encrypted-flush pprof. Such a stream still starts with the
+// 16-byte checkpoint prefix ([magic "MDBC"][version][walSeq]) so the
+// snapshot records which WAL entries it already holds; without it a crash
+// between the snapshot write and the WAL truncate replayed them twice.
 //
 // Memory is O(1) regardless of snapshot size: bytes flow from
 // copyMemToWriter through the optional snapshotWriter (which hashes as
@@ -457,7 +546,13 @@ func (a *externalBackendAdapter) flush(ctx context.Context, d *DB, snapSeq uint6
 		defer close(done)
 		var w io.Writer = pw
 		var sw *snapshotWriter
-		if !a.skipHeader() {
+		if a.skipHeader() {
+			if err := writeCheckpointPrefix(pw, snapSeq); err != nil {
+				copyErr = err
+				pw.CloseWithError(err)
+				return
+			}
+		} else {
 			var err error
 			sw, err = newSnapshotWriter(pw, snapSeq)
 			if err != nil {
@@ -506,9 +601,11 @@ func (a *externalBackendAdapter) skipHeader() bool {
 
 // restore streams a snapshot from the external backend through the
 // verifier into the in-memory DB. When the inner backend is
-// Authenticated, an absent MDBK prefix is treated as the headerless
-// format rather than a legacy snapshot — no warning is emitted because
-// the AEAD tag has already authenticated the bytes.
+// Authenticated, an absent MDBK prefix is the expected format — the
+// checkpoint prefix ("MDBC"), or raw SQLite bytes from before that
+// prefix existed (checkpoint 0) — rather than a legacy snapshot, and no
+// warning is emitted because the AEAD tag has already authenticated the
+// bytes.
 func (a *externalBackendAdapter) restore(ctx context.Context, d *DB) (uint64, error) {
 	rc, err := a.inner.Read(ctx)
 	if err != nil {

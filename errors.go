@@ -32,4 +32,11 @@ var (
 	// snapshot fails its integrity checksum. The file exists but its
 	// contents are untrustworthy and the database refuses to load it.
 	ErrSnapshotCorrupt = errors.New("memdb: snapshot integrity check failed")
+
+	// ErrSnapshotVersion is returned by Open/Restore when the snapshot's
+	// envelope names a format version newer than this build understands —
+	// typically a snapshot written by a newer memdb after a downgrade. The
+	// file is not corrupt (so this is deliberately not ErrSnapshotCorrupt);
+	// it has to be read by a build that knows the version.
+	ErrSnapshotVersion = errors.New("memdb: unsupported snapshot format version")
 )

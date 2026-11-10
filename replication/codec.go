@@ -44,6 +44,13 @@ const (
 	argString  byte = 5
 	argBytes   byte = 6
 	argTime    byte = 7 // time.Time as UnixNano int64
+	// argTimeWide carries a time.Time that UnixNano cannot represent
+	// (outside 1677-09-21 .. 2262-04-11, notably the zero time.Time and
+	// year 9999) as int64 Unix seconds + uint32 nanoseconds. Used ONLY for
+	// such times: every time argTime can hold is still written as argTime,
+	// byte for byte as before, so existing logs and older decoders are
+	// unaffected unless an out-of-range time is actually written.
+	argTimeWide byte = 8
 )
 
 // EncodeEntry appends the binary v1 representation of entry to dst and
@@ -69,7 +76,13 @@ const (
 //	     bool    — 1 byte (0 or 1)
 //	     string  — uint32 len + bytes
 //	     []byte  — uint32 len + bytes
-//	     time    — 8 bytes (UnixNano int64)
+//	     time    — 8 bytes (UnixNano int64), for times in the int64
+//	               nanosecond range
+//	     time (wide) — 8 bytes (Unix seconds int64) + 4 bytes
+//	               (nanoseconds uint32, < 1e9), for every other time
+//
+// A time.Time decodes to the same instant in UTC; its location and
+// monotonic reading are not carried.
 //
 // Rationale for the explicit types: the argument types accepted by
 // database/sql via the mattn/go-sqlite3 driver are a small finite set.
@@ -247,8 +260,17 @@ func appendArg(dst []byte, a any) ([]byte, error) {
 		dst = appendU32(dst, uint32(len(v)))
 		return append(dst, v...), nil
 	case time.Time:
-		dst = append(dst, argTime)
-		return appendU64(dst, uint64(v.UnixNano())), nil
+		// UnixNano is only defined for instants an int64 of nanoseconds can
+		// hold; outside that range it returns garbage (the zero time.Time
+		// came back as 1754-08-30). Converting the result back is the exact
+		// range test: it reproduces v if and only if nothing overflowed.
+		if ns := v.UnixNano(); time.Unix(0, ns).Equal(v) {
+			dst = append(dst, argTime)
+			return appendU64(dst, uint64(ns)), nil
+		}
+		dst = append(dst, argTimeWide)
+		dst = appendU64(dst, uint64(v.Unix()))
+		return appendU32(dst, uint32(v.Nanosecond())), nil
 	default:
 		return nil, fmt.Errorf("%w: %T", ErrUnsupportedArgType, a)
 	}
@@ -373,6 +395,19 @@ func (r *reader) readArg() (any, error) {
 			return nil, errors.New("truncated time")
 		}
 		return time.Unix(0, int64(v)).UTC(), nil
+	case argTimeWide:
+		sec, ok := r.readU64()
+		if !ok {
+			return nil, errors.New("truncated wide time seconds")
+		}
+		nsec, ok := r.readU32()
+		if !ok {
+			return nil, errors.New("truncated wide time nanoseconds")
+		}
+		if nsec >= 1e9 {
+			return nil, fmt.Errorf("wide time nanoseconds %d out of range", nsec)
+		}
+		return time.Unix(int64(sec), int64(nsec)).UTC(), nil
 	default:
 		return nil, fmt.Errorf("unknown arg tag %d", tag)
 	}

@@ -2,6 +2,7 @@ package replication_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"math"
 	"testing"
@@ -347,5 +348,135 @@ func TestEncode_TimePreservesUnixNano(t *testing.T) {
 	}
 	if tv.UnixNano() != want.UnixNano() {
 		t.Errorf("UnixNano: got %d, want %d", tv.UnixNano(), want.UnixNano())
+	}
+}
+
+// timeArgTagOffset is where the first arg's type tag sits in an encoded entry
+// whose SQL is the single byte "x": magic(4) + version(1) + seq(8) +
+// timestamp(8) + sqlLen(4) + sql(1) + nArgs(4).
+const timeArgTagOffset = 30
+
+// Wire tags, repeated here because they are a compatibility contract.
+const (
+	wireTagTime     = 7
+	wireTagTimeWide = 8
+)
+
+func encodeOneTime(t *testing.T, v time.Time) []byte {
+	t.Helper()
+	data, err := replication.EncodeEntry(nil, replication.WALEntry{Seq: 1, SQL: "x", Args: []any{v}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// TestEncode_Time_EveryInstantRoundTrips covers times UnixNano cannot
+// represent. They used to be written as the overflowed UnixNano and came back
+// as a different date: the zero time.Time as 1754-08-30T22:43:41.128654848Z.
+func TestEncode_Time_EveryInstantRoundTrips(t *testing.T) {
+	minNano := time.Unix(0, math.MinInt64).UTC() // 1677-09-21T00:12:43.145224192Z
+	maxNano := time.Unix(0, math.MaxInt64).UTC() // 2262-04-11T23:47:16.854775807Z
+
+	cases := []struct {
+		name string
+		v    time.Time
+		tag  byte
+	}{
+		{"zero time.Time", time.Time{}, wireTagTimeWide},
+		{"year 1 with nanoseconds", time.Date(1, 6, 15, 12, 30, 45, 123456789, time.UTC), wireTagTimeWide},
+		{"year 9999", time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC), wireTagTimeWide},
+		{"negative year", time.Date(-4000, 1, 1, 0, 0, 0, 1, time.UTC), wireTagTimeWide},
+		{"one nanosecond below the range", minNano.Add(-1), wireTagTimeWide},
+		{"one nanosecond above the range", maxNano.Add(1), wireTagTimeWide},
+		{"lower boundary of the range", minNano, wireTagTime},
+		{"upper boundary of the range", maxNano, wireTagTime},
+		{"unix epoch", time.Unix(0, 0).UTC(), wireTagTime},
+		{"just before the epoch", time.Unix(0, -1).UTC(), wireTagTime},
+		{"ordinary time", time.Date(2024, 5, 6, 7, 8, 9, 123456789, time.UTC), wireTagTime},
+		{"ordinary time in a zone", time.Date(2024, 5, 6, 7, 8, 9, 123456789, time.FixedZone("x", 2*3600)), wireTagTime},
+		{"zero wall clock in a zone", time.Date(1, 1, 1, 0, 0, 0, 0, time.FixedZone("x", -5*3600)), wireTagTimeWide},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := encodeOneTime(t, tc.v)
+			if got := data[timeArgTagOffset]; got != tc.tag {
+				t.Errorf("wire tag = %d, want %d", got, tc.tag)
+			}
+			entry, err := replication.DecodeEntry(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := entry.Args[0].(time.Time)
+			if !ok {
+				t.Fatalf("decoded %T, want time.Time", entry.Args[0])
+			}
+			if !got.Equal(tc.v) {
+				t.Errorf("decoded %s, want the same instant as %s",
+					got.Format(time.RFC3339Nano), tc.v.Format(time.RFC3339Nano))
+			}
+			if got.Location() != time.UTC {
+				t.Errorf("decoded location = %v, want UTC", got.Location())
+			}
+			// What the SQLite driver stores is the formatted time, so the
+			// decoded value must format identically to the original in UTC.
+			const layout = "2006-01-02 15:04:05.999999999-07:00"
+			if g, w := got.Format(layout), tc.v.UTC().Format(layout); g != w {
+				t.Errorf("decoded formats as %q, want %q", g, w)
+			}
+		})
+	}
+}
+
+// TestEncode_Time_InRangeEncodingUnchanged pins the bytes of an in-range time
+// to the pre-existing format (tag 7 + UnixNano), which logs and WALs already
+// on disk — and older decoders — depend on.
+func TestEncode_Time_InRangeEncodingUnchanged(t *testing.T) {
+	v := time.Unix(1700000000, 123456789)
+	want := []byte{
+		'M', 'D', 'B', 'W', 1, // magic, version
+		0, 0, 0, 0, 0, 0, 0, 1, // seq
+		0, 0, 0, 0, 0, 0, 0, 0, // timestamp
+		0, 0, 0, 1, 'x', // sql
+		0, 0, 0, 1, // nArgs
+		7,                                              // argTime
+		0x17, 0x97, 0x9c, 0xfe, 0x3d, 0x85, 0xcd, 0x15, // 1700000000123456789
+	}
+	if n := v.UnixNano(); n != 0x17979cfe3d85cd15 {
+		t.Fatalf("test constant is wrong: UnixNano = %#x", n)
+	}
+	if got := encodeOneTime(t, v); !bytes.Equal(got, want) {
+		t.Errorf("in-range time encoding changed:\n got %x\nwant %x", got, want)
+	}
+}
+
+// TestDecode_WideTime checks the decoder accepts the wide form for any
+// instant (including in-range ones, which the encoder never writes that way)
+// and rejects malformed payloads.
+func TestDecode_WideTime(t *testing.T) {
+	header := encodeOneTime(t, time.Time{})[:timeArgTagOffset]
+	wide := func(sec int64, nsec uint32) []byte {
+		b := append([]byte{}, header...)
+		b = append(b, wireTagTimeWide)
+		b = binary.BigEndian.AppendUint64(b, uint64(sec))
+		return binary.BigEndian.AppendUint32(b, nsec)
+	}
+
+	entry, err := replication.DecodeEntry(wide(1700000000, 123456789))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := entry.Args[0].(time.Time); !got.Equal(time.Unix(1700000000, 123456789)) {
+		t.Errorf("decoded %v", got)
+	}
+
+	if _, err := replication.DecodeEntry(wide(0, 1_000_000_000)); err == nil {
+		t.Error("nanoseconds = 1e9 was accepted")
+	}
+	full := wide(-62135596800, 0)
+	for cut := timeArgTagOffset + 1; cut < len(full); cut++ {
+		if _, err := replication.DecodeEntry(full[:cut]); err == nil {
+			t.Errorf("wide time truncated to %d of %d bytes was accepted", cut, len(full))
+		}
 	}
 }

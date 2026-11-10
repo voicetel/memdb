@@ -110,6 +110,15 @@ func (s *Server) ListenAndServe() error {
 		return err
 	}
 	s.mu.Lock()
+	select {
+	case <-s.quit:
+		// Stop ran before the listener existed, so it had nothing to
+		// close; close it here rather than leave the socket bound.
+		s.mu.Unlock()
+		_ = l.Close()
+		return nil
+	default:
+	}
 	s.listener = l
 	s.mu.Unlock()
 
@@ -150,11 +159,10 @@ func (s *Server) ListenAndServe() error {
 		s.mu.Unlock()
 		go func() {
 			defer s.wg.Done()
-			// Deregister before Done so Stop's close sweep (which runs
-			// under mu) never closes a connection whose handler already
-			// exited — a redundant Close on a live fd recycled by the OS
-			// would be harmless for us but could disturb a replacement
-			// listener bound after Stop returned.
+			// Deregister when the handler exits, or conns would grow by
+			// one entry per connection ever accepted. It runs before
+			// Done (defers are LIFO), so by the time Stop's Wait returns
+			// the map is empty.
 			defer s.removeConn(conn)
 			defer func() {
 				if r := recover(); r != nil {
