@@ -44,11 +44,15 @@ func (s *sqliteStore) ExecLocalResult(q string, args ...any) (int64, error) {
 func (s *sqliteStore) Serialize() ([]byte, error) { return nil, nil }
 func (s *sqliteStore) Restore([]byte) error       { return nil }
 
-// TestClusterErrorsMatchOnLeaderAndFollower makes the same failing writes on the
-// leader and through a follower of a three-node cluster, and gets the same
-// message and the same SQLite codes either way.
-func TestClusterErrorsMatchOnLeaderAndFollower(t *testing.T) {
-	t.Parallel()
+// sqliteCluster is a three-node cluster over real SQLite stores, with a leader
+// and a follower that knows it.
+type sqliteCluster struct {
+	leader, follower *memraft.Node
+	stores           map[*memraft.Node]*sqliteStore
+}
+
+func startSQLiteCluster(t *testing.T) sqliteCluster {
+	t.Helper()
 	tlsCfg := generateTLSConfig(t)
 	var peers, fwdPeers []string
 	ids := []string{"node-1", "node-2", "node-3"}
@@ -58,9 +62,11 @@ func TestClusterErrorsMatchOnLeaderAndFollower(t *testing.T) {
 		peers = append(peers, id+"="+raftAddrs[id])
 		fwdPeers = append(fwdPeers, id+"="+fwdAddrs[id])
 	}
+	c := sqliteCluster{stores: map[*memraft.Node]*sqliteStore{}}
 	var nodes []*memraft.Node
 	for _, id := range ids {
-		node, err := memraft.NewNode(newSQLiteStore(t), memraft.NodeConfig{
+		store := newSQLiteStore(t)
+		node, err := memraft.NewNode(store, memraft.NodeConfig{
 			NodeID: id, BindAddr: raftAddrs[id], ForwardAddr: fwdAddrs[id], Peers: peers, ForwardPeers: fwdPeers,
 			DataDir: t.TempDir(), TLSConfig: tlsCfg,
 			HeartbeatTimeout: 1500 * time.Millisecond, ElectionTimeout: 1500 * time.Millisecond,
@@ -71,22 +77,32 @@ func TestClusterErrorsMatchOnLeaderAndFollower(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = node.Shutdown() })
 		nodes = append(nodes, node)
+		c.stores[node] = store
 	}
-	var leader, follower *memraft.Node
-	for deadline := time.Now().Add(15 * time.Second); leader == nil || follower == nil || follower.LeaderAddr() == ""; {
+	for deadline := time.Now().Add(15 * time.Second); c.leader == nil || c.follower == nil || c.follower.LeaderAddr() == ""; {
 		if time.Now().After(deadline) {
 			t.Fatal("no leader, or a follower that does not know it")
 		}
-		leader, follower = nil, nil
+		c.leader, c.follower = nil, nil
 		for _, n := range nodes {
 			if n.IsLeader() {
-				leader = n
-			} else if follower == nil {
-				follower = n
+				c.leader = n
+			} else if c.follower == nil {
+				c.follower = n
 			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	return c
+}
+
+// TestClusterErrorsMatchOnLeaderAndFollower makes the same failing writes on the
+// leader and through a follower of a three-node cluster, and gets the same
+// message and the same SQLite codes either way.
+func TestClusterErrorsMatchOnLeaderAndFollower(t *testing.T) {
+	t.Parallel()
+	c := startSQLiteCluster(t)
+	leader, follower := c.leader, c.follower
 	if _, err := leader.ExecResult(`INSERT INTO kv VALUES ('a', '1')`); err != nil {
 		t.Fatal(err)
 	}
