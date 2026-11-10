@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
@@ -165,12 +166,46 @@ func Apply(r *raft.Raft, entry replication.WALEntry, timeout time.Duration) erro
 // for the committed entry (the Raft future response). An FSM built with
 // NewFSM (no count support) yields 0.
 func ApplyResult(r *raft.Raft, entry replication.WALEntry, timeout time.Duration) (int64, error) {
+	return ApplyResultContext(context.Background(), r, entry, timeout)
+}
+
+// ApplyResultContext is ApplyResult bounded by ctx as well. Once ctx ends, by
+// cancellation or its deadline, it stops waiting and returns an error wrapping
+// ctx's: Raft cannot recall an entry it has taken, so the write may still
+// commit after that. A context that never ends waits as ApplyResult always
+// did, with no goroutine of its own.
+func ApplyResultContext(ctx context.Context, r *raft.Raft, entry replication.WALEntry, timeout time.Duration) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	data, err := replication.EncodeEntry(nil, entry)
 	if err != nil {
 		return 0, fmt.Errorf("raft: encode entry: %w", err)
 	}
-
 	future := r.Apply(data, timeout)
+	if ctx.Done() == nil {
+		return applied(future)
+	}
+	type outcome struct {
+		n   int64
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		n, err := applied(future)
+		done <- outcome{n, err}
+	}()
+	select {
+	case o := <-done:
+		return o.n, o.err
+	case <-ctx.Done():
+		return 0, fmt.Errorf("raft: apply: stopped waiting, and the write may still commit: %w", ctx.Err())
+	}
+}
+
+// applied waits for an applied entry's outcome: the rows-affected count, or the
+// error the FSM or Raft reported.
+func applied(future raft.ApplyFuture) (int64, error) {
 	if err := future.Error(); err != nil {
 		return 0, fmt.Errorf("raft: apply: %w", err)
 	}

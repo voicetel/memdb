@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -46,7 +47,7 @@ func TestForwardPoolAboveTheDefault(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 1; i <= writes; i++ {
 		wg.Go(func() {
-			n, err := sendForward(pool, ForwardRequest{SQL: fmt.Sprintf("write %d", i)}, 5*time.Second)
+			n, err := sendForward(context.Background(), pool, ForwardRequest{SQL: fmt.Sprintf("write %d", i)}, 5*time.Second)
 			accepted.Add(1)
 			switch {
 			case i%5 == 0:

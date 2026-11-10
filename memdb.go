@@ -273,7 +273,7 @@ func (d *DB) ExecDirectResult(query string, args ...any) (int64, error) {
 // (OnExec or OnExecResult). Transactions are unsupported in this mode
 // because they cannot span consensus rounds.
 func (d *DB) replicated() bool {
-	return d.cfg.OnExec != nil || d.cfg.OnExecResult != nil
+	return d.cfg.OnExec != nil || d.cfg.OnExecResult != nil || d.cfg.OnExecContext != nil
 }
 
 // Exec executes a query against the in-memory DB.
@@ -302,6 +302,13 @@ func (d *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Re
 	// consensus first. The FSM will call execDirect on every node
 	// (including this one) once the entry is committed. Writing locally
 	// here would cause split-brain on non-leader nodes.
+	if d.cfg.OnExecContext != nil {
+		rowsAffected, err := d.cfg.OnExecContext(ctx, query, args)
+		if err != nil {
+			return nil, err
+		}
+		return driver.RowsAffected(rowsAffected), nil
+	}
 	if d.cfg.OnExecResult != nil {
 		rowsAffected, err := d.cfg.OnExecResult(query, args)
 		if err != nil {
