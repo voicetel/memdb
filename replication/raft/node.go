@@ -519,7 +519,15 @@ func (n *Node) ExecResult(sql string, args ...any) (int64, error) {
 		return ApplyResult(n.raft, entry, n.cfg.ApplyTimeout)
 	}
 
-	// We are not the leader. Forward to the leader using the connection pool.
+	// We are not the leader. Check the arguments as the leader will encode
+	// them into the log first, so an argument the log cannot carry is refused
+	// here with the leader's own error, not another one from the forwarding
+	// hop, and a statement behaves alike on every node.
+	if _, err := replication.EncodeEntry(nil, replication.WALEntry{SQL: sql, Args: args}); err != nil {
+		return 0, fmt.Errorf("raft: encode entry: %w", err)
+	}
+
+	// Forward to the leader using the connection pool.
 	leaderAddr, leaderID := n.raft.LeaderWithID()
 	if leaderAddr == "" {
 		return 0, fmt.Errorf("%w: no leader elected yet", ErrNotLeader)

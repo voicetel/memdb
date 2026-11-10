@@ -16,6 +16,14 @@ import (
 	"github.com/mattn/go-sqlite3"
 )
 
+// A forwarded write's arguments travel as []any, which gob carries only for
+// registered concrete types. It registers the basic ones itself; time.Time is
+// the one argument type the Raft log codec takes that it does not, so without
+// this a follower could not forward a time argument the leader would take.
+func init() {
+	gob.Register(time.Time{})
+}
+
 // ForwardRequest is sent from a follower to the leader to forward a write.
 type ForwardRequest struct {
 	SQL  string
