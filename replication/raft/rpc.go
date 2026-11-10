@@ -10,7 +10,10 @@ import (
 	"io"
 	"net"
 	"sync/atomic"
+	"syscall"
 	"time"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 // ForwardRequest is sent from a follower to the leader to forward a write.
@@ -36,6 +39,15 @@ type ForwardResponse struct {
 	// pre-count leader simply never encodes the field (the follower sees
 	// 0), and a pre-count follower ignores it on decode.
 	RowsAffected int64
+
+	// SQLiteCode, SQLiteExtendedCode, and SQLiteErrno carry the codes of a
+	// SQLite error the write met on the leader, so the follower can return
+	// the same typed error (ForwardedError). All three are zero for any other
+	// error. Like RowsAffected, an older peer leaves them out or ignores them,
+	// and the follower then sees a plain error, as before.
+	SQLiteCode         int
+	SQLiteExtendedCode int
+	SQLiteErrno        uint64
 }
 
 // ── wire helpers ──────────────────────────────────────────────────────────────
@@ -303,7 +315,51 @@ func sendForward(pool *ConnPool, req ForwardRequest, timeout time.Duration) (int
 		case "ErrNotLeader":
 			return 0, fmt.Errorf("%w: forwarded: %s", ErrNotLeader, resp.ErrMsg)
 		}
-		return 0, errors.New(resp.ErrMsg)
+		return 0, forwardedError(resp)
 	}
 	return resp.RowsAffected, nil
+}
+
+// ForwardedError is an error a forwarded write met on the leader, as the
+// follower that forwarded it sees it. Its message is the leader's. For a
+// SQLite error it unwraps to a sqlite3.Error with the leader's codes, so
+// errors.As finds one, and callers can tell a constraint or a busy error apart
+// on a follower as they do on the leader.
+type ForwardedError struct {
+	msg    string
+	sqlite *sqlite3.Error
+}
+
+// forwardedError rebuilds the error a response reports.
+func forwardedError(resp ForwardResponse) *ForwardedError {
+	e := &ForwardedError{msg: resp.ErrMsg}
+	if resp.SQLiteCode != 0 {
+		e.sqlite = &sqlite3.Error{
+			Code:         sqlite3.ErrNo(resp.SQLiteCode),
+			ExtendedCode: sqlite3.ErrNoExtended(resp.SQLiteExtendedCode),
+			SystemErrno:  syscall.Errno(resp.SQLiteErrno),
+		}
+	}
+	return e
+}
+
+// Error returns the leader's message.
+func (e *ForwardedError) Error() string { return e.msg }
+
+// Unwrap returns the SQLite error with the leader's codes, or nil for any
+// other error.
+func (e *ForwardedError) Unwrap() error {
+	if e.sqlite == nil {
+		return nil
+	}
+	return *e.sqlite
+}
+
+// sqliteCodes fills a response with the codes of the SQLite error err holds,
+// if it holds one.
+func sqliteCodes(resp *ForwardResponse, err error) {
+	var se sqlite3.Error
+	if errors.As(err, &se) {
+		resp.SQLiteCode, resp.SQLiteExtendedCode, resp.SQLiteErrno = int(se.Code), int(se.ExtendedCode), uint64(se.SystemErrno)
+	}
 }

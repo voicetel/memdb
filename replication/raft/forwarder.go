@@ -126,6 +126,7 @@ func (f *forwarder) handleConn(conn net.Conn) {
 			if errors.Is(err, ErrNotLeader) {
 				resp.ErrCode = "ErrNotLeader"
 			}
+			sqliteCodes(&resp, err)
 		}
 
 		if err := rc.writeMsg(resp); err != nil {
