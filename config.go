@@ -1,6 +1,7 @@
 package memdb
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
@@ -235,6 +236,15 @@ type Config struct {
 	// Setting both OnExec and OnExecResult is a configuration error.
 	OnExecResult func(sql string, args []any) (int64, error)
 
+	// OnExecContext is OnExecResult with the caller's context, so the
+	// context passed to ExecContext bounds the consensus round trip and a
+	// cancellation reaches the forward to the leader. Wire it to
+	// raft.Node.ExecResultContext. A write whose context ends before it is
+	// committed may still commit: Raft cannot recall an entry it has taken.
+	//
+	// Set at most one of OnExec, OnExecResult, and OnExecContext.
+	OnExecContext func(ctx context.Context, sql string, args []any) (int64, error)
+
 	// Executed once against the memory DB after restore or on first open.
 	// Use for CREATE TABLE IF NOT EXISTS statements.
 	InitSchema func(db *DB) error
@@ -256,8 +266,14 @@ func (c *Config) validate() error {
 	if c.RestoreMaxBytes < 0 {
 		return fmt.Errorf("memdb: RestoreMaxBytes must be >= 0 (got %d)", c.RestoreMaxBytes)
 	}
-	if c.OnExec != nil && c.OnExecResult != nil {
-		return fmt.Errorf("memdb: OnExec and OnExecResult are mutually exclusive; set only OnExecResult")
+	hooks := 0
+	for _, set := range []bool{c.OnExec != nil, c.OnExecResult != nil, c.OnExecContext != nil} {
+		if set {
+			hooks++
+		}
+	}
+	if hooks > 1 {
+		return fmt.Errorf("memdb: OnExec, OnExecResult, and OnExecContext are mutually exclusive; set only OnExecContext")
 	}
 	return nil
 }

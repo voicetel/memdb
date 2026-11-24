@@ -443,3 +443,84 @@ func writeSelfSignedTLS(t *testing.T, dir string) (certFile, keyFile, caFile str
 	caFile = certFile
 	return certFile, keyFile, caFile
 }
+
+func TestRaftFlags_Validate_ForwardPoolSize(t *testing.T) {
+	base := raftFlags{
+		NodeID:          "n1",
+		BindAddr:        "0.0.0.0:7000",
+		Peers:           "n1=127.0.0.1:7000",
+		DataDir:         "/tmp/raft",
+		TLSCertFile:     "cert.pem",
+		TLSKeyFile:      "key.pem",
+		TLSCAFile:       "ca.pem",
+		ForwardBindAddr: "0.0.0.0:7001",
+		ForwardPeers:    "n1=127.0.0.1:7001",
+	}
+
+	t.Run("unset-ok", func(t *testing.T) {
+		if err := base.validate(); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("positive-ok", func(t *testing.T) {
+		r := base
+		r.ForwardPoolSize = 64
+		if err := r.validate(); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("negative", func(t *testing.T) {
+		r := base
+		r.ForwardPoolSize = -1
+		err := r.validate()
+		if err == nil || !strings.Contains(err.Error(), "raft-forward-pool-size") {
+			t.Errorf("expected raft-forward-pool-size error, got: %v", err)
+		}
+	})
+
+	t.Run("without-forwarding", func(t *testing.T) {
+		// A pool size with no forwarding configured sizes nothing; refuse
+		// it like the other half-set forwarding flags.
+		r := base
+		r.ForwardBindAddr, r.ForwardPeers = "", ""
+		r.ForwardPoolSize = 64
+		err := r.validate()
+		if err == nil || !strings.Contains(err.Error(), "raft-forward-peers") {
+			t.Errorf("expected raft-forward-peers error, got: %v", err)
+		}
+	})
+}
+
+// TestRaftFlags_ForwardPoolSize_ReachesNodeConfig is a regression check that
+// -raft-forward-pool-size is parsed and handed to the node: the library
+// option existed before the server could set it.
+func TestRaftFlags_ForwardPoolSize_ReachesNodeConfig(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	r := registerRaftFlags(fs)
+	if fs.Lookup("raft-forward-pool-size") == nil {
+		t.Fatal(`flag "raft-forward-pool-size" not registered`)
+	}
+	if err := fs.Parse([]string{"-raft-node-id", "n1", "-raft-forward-pool-size", "64"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if r.ForwardPoolSize != 64 {
+		t.Errorf("ForwardPoolSize=%d", r.ForwardPoolSize)
+	}
+	if got := r.nodeConfig(nil, logger).ForwardPoolSize; got != 64 {
+		t.Errorf("NodeConfig.ForwardPoolSize=%d, want 64", got)
+	}
+
+	// Unset, the library default applies: the flag passes zero through.
+	fs = flag.NewFlagSet("t", flag.ContinueOnError)
+	r = registerRaftFlags(fs)
+	if err := fs.Parse([]string{"-raft-node-id", "n1"}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := r.nodeConfig(nil, logger).ForwardPoolSize; got != 0 {
+		t.Errorf("NodeConfig.ForwardPoolSize=%d with the flag unset, want 0", got)
+	}
+}

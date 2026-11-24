@@ -376,3 +376,72 @@ func TestFileStableStore_RejectsCorruptStore(t *testing.T) {
 		t.Fatal("expected error for corrupt stable store, got nil")
 	}
 }
+
+// TestStableStore_SetCopiesItsValue checks Set keeps a copy: a caller that
+// reuses its buffer afterwards does not change what the store holds.
+func TestStableStore_SetCopiesItsValue(t *testing.T) {
+	store, err := newStableStore(filepath.Join(t.TempDir(), "stable"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	val := []byte("node-1")
+	if err := store.Set([]byte("LastVoteCand"), val); err != nil {
+		t.Fatal(err)
+	}
+	copy(val, "XXXXXX")
+	got, err := store.Get([]byte("LastVoteCand"))
+	if err != nil || string(got) != "node-1" {
+		t.Errorf("after the caller changed its slice the store holds %q, %v; want node-1", got, err)
+	}
+}
+
+// TestStableStore_FailedSaveLeavesMemoryUnchanged makes every save fail, by
+// taking the store's directory away. A Set or SetUint64 that fails must leave
+// the store answering as before it: a key that was absent stays absent, with
+// the missing-key answers Raft depends on, and a key that was set keeps its
+// old value. Memory never holds what the disk refused.
+func TestStableStore_FailedSaveLeavesMemoryUnchanged(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "raft")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newStableStore(filepath.Join(dir, "stable"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set([]byte("LastVoteCand"), []byte("node-1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetUint64([]byte("CurrentTerm"), 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Set([]byte("LastVoteCand"), []byte("node-2")); err == nil {
+		t.Fatal("Set reported success with nowhere to save")
+	}
+	if err := store.SetUint64([]byte("CurrentTerm"), 4); err == nil {
+		t.Fatal("SetUint64 reported success with nowhere to save")
+	}
+	if err := store.Set([]byte("new"), []byte("value")); err == nil {
+		t.Fatal("Set of a new key reported success with nowhere to save")
+	}
+	if err := store.SetUint64([]byte("LastVoteTerm"), 4); err == nil {
+		t.Fatal("SetUint64 of a new key reported success with nowhere to save")
+	}
+
+	if got, err := store.Get([]byte("LastVoteCand")); err != nil || string(got) != "node-1" {
+		t.Errorf("after a failed Set the store holds %q, %v; want the old value node-1", got, err)
+	}
+	if got, err := store.GetUint64([]byte("CurrentTerm")); err != nil || got != 3 {
+		t.Errorf("after a failed SetUint64 the store holds %d, %v; want the old value 3", got, err)
+	}
+	if got, err := store.Get([]byte("new")); err == nil || err.Error() != "not found" {
+		t.Errorf("a key whose only Set failed: %q, %v; want the missing-key error", got, err)
+	}
+	if got, err := store.GetUint64([]byte("LastVoteTerm")); err != nil || got != 0 {
+		t.Errorf("a key whose only SetUint64 failed: %d, %v; want 0 and no error", got, err)
+	}
+}

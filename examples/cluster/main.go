@@ -13,6 +13,8 @@
 //   - Writes against a follower are forwarded to the leader over
 //     mutual TLS, replicated, and applied on every node before
 //     ReadyForQuery returns.
+//   - The command tag carries the real row count (INSERT 0 1,
+//     UPDATE 3) whichever node took the write.
 //   - SELECT against any follower sees the committed write.
 //
 // Run:
@@ -137,24 +139,35 @@ func main() {
 		}(i)
 	}
 
-	// Graceful shutdown: stop PG listeners → shutdown raft nodes →
-	// close DBs → run final flush via memdb.Close. Raft must come
-	// down before the DB so in-flight FSM applies have a writer to
-	// land on.
+	// Graceful shutdown, one layer at a time across the whole cluster:
+	// PG servers → raft nodes → DBs.
+	//
+	//  1. srv.Stop closes the listener and every live client connection,
+	//     and returns once all handlers have exited (pg_ctl stop -m fast).
+	//     Wait on Stop, not on ListenAndServe: the latter returns as soon
+	//     as the listener closes, which can be before the last handler
+	//     has unwound.
+	//  2. Raft comes down before the DB so in-flight FSM applies still
+	//     have a writer to land on.
+	//  3. memdb.Close runs the final flush.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Print("shutdown signal received")
-	for i, r := range nodes {
+	for _, r := range nodes {
 		r.srv.Stop()
+	}
+	wg.Wait()
+	for i, r := range nodes {
 		if err := r.rn.Shutdown(); err != nil {
 			log.Printf("%s raft shutdown: %v", ids[i], err)
 		}
+	}
+	for i, r := range nodes {
 		if err := r.db.Close(); err != nil {
 			log.Printf("%s db close: %v", ids[i], err)
 		}
 	}
-	wg.Wait()
 	log.Print("shutdown complete")
 }
 
@@ -168,8 +181,8 @@ type running struct {
 }
 
 // startNode brings up one cluster node: opens an in-memory DB,
-// creates its Raft membership, wires OnExec to forward writes through
-// consensus, and prepares (but does not start) a PG-wire listener.
+// creates its Raft membership, wires OnExecContext to send writes
+// through consensus, and prepares (but does not start) a PG-wire listener.
 //
 // Why prepare-but-not-start the listener? Because we want a single
 // log message per node before any goroutine starts accepting traffic
@@ -186,10 +199,10 @@ func startNode(
 		return running{}, fmt.Errorf("mkdir %s: %w", dataDir, err)
 	}
 
-	// nodeExec is captured by OnExec and assigned after the raft node
-	// is built. The PG server is started later, so this nil-assignment
-	// window is invisible to any concurrent goroutine.
-	var nodeExec func(sql string, args ...any) error
+	// nodeExec is captured by OnExecContext and assigned after the raft
+	// node is built. The PG server is started later, so this
+	// nil-assignment window is invisible to any concurrent goroutine.
+	var nodeExec func(ctx context.Context, sql string, args ...any) (int64, error)
 
 	db, err := memdb.Open(memdb.Config{
 		FilePath:      filepath.Join(dataDir, "memdb.db"),
@@ -197,8 +210,13 @@ func startNode(
 		// Raft's log is the durability layer in clustered mode, so
 		// memdb's WAL would be a redundant per-write fsync.
 		Durability: memdb.DurabilityNone,
-		OnExec: func(sql string, args []any) error {
-			return nodeExec(sql, args...)
+		// OnExecContext routes every db.Exec through consensus and
+		// returns the rows-affected count from the leader's apply, so
+		// the PG command tag is real. It also carries the caller's
+		// context to the leader. (The older OnExecResult drops the
+		// context; the legacy OnExec also reports 0 rows. Set only one.)
+		OnExecContext: func(ctx context.Context, sql string, args []any) (int64, error) {
+			return nodeExec(ctx, sql, args...)
 		},
 	})
 	if err != nil {
@@ -206,13 +224,23 @@ func startNode(
 	}
 
 	rn, err := mraft.NewNode(memdbAdapter{db: db}, mraft.NodeConfig{
-		NodeID:       nodeID,
-		BindAddr:     raftAddr,
-		ForwardAddr:  fwdAddr,
-		Peers:        peers,
+		NodeID:      nodeID,
+		BindAddr:    raftAddr,
+		ForwardAddr: fwdAddr,
+		Peers:       peers,
+		// ForwardPeers is the starting map of where each node takes
+		// forwarded writes. A node added to a running cluster later
+		// (NodeConfig.Join + AddVoter on the leader) is not in it: call
+		// SetForwardPeer for it on every node already running.
 		ForwardPeers: fwdPeers,
 		DataDir:      filepath.Join(dataDir, "raft"),
 		TLSConfig:    tlsCfg,
+		// All three nodes stop together here, so a leader handing
+		// leadership to a peer that is itself about to stop would only
+		// add a pointless election. Leave this unset in a real
+		// deployment: Shutdown then hands leadership over first, so a
+		// rolling restart never leaves the cluster without a leader.
+		DisableShutdownHandover: true,
 		OnApplyError: func(err error) {
 			log.Printf("%s FSM apply error: %v", nodeID, err)
 		},
@@ -221,7 +249,7 @@ func startNode(
 		_ = db.Close()
 		return running{}, fmt.Errorf("raft NewNode: %w", err)
 	}
-	nodeExec = rn.Exec
+	nodeExec = rn.ExecResultContext
 
 	srv := pgserver.New(db, pgserver.Config{ListenAddr: pgAddr})
 
@@ -229,12 +257,18 @@ func startNode(
 }
 
 // memdbAdapter bridges *memdb.DB to mraft.DB. ExecLocal maps to
-// ExecDirect so the FSM apply path bypasses the OnExec hook (which
-// would otherwise forward the write through Raft a second time).
+// ExecDirect so the FSM apply path bypasses the replication hook
+// (which would otherwise send the write through Raft a second time).
+// ExecLocalResult additionally satisfies mraft.ResultDB, which is what
+// lets the FSM report the real rows-affected count back to the caller.
 type memdbAdapter struct{ db *memdb.DB }
 
 func (a memdbAdapter) ExecLocal(sql string, args ...any) error {
 	return a.db.ExecDirect(sql, args...)
+}
+
+func (a memdbAdapter) ExecLocalResult(sql string, args ...any) (int64, error) {
+	return a.db.ExecDirectResult(sql, args...)
 }
 func (a memdbAdapter) Serialize() ([]byte, error) { return a.db.Serialize() }
 func (a memdbAdapter) Restore(data []byte) error  { return a.db.Restore(data) }
@@ -321,6 +355,3 @@ func resolveDataRoot(flagVal string) (string, func(), error) {
 		_ = os.RemoveAll(dir)
 	}, nil
 }
-
-// keep context imported in case future shutdown refactors thread one through
-var _ = context.Background

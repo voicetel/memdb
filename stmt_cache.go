@@ -263,9 +263,21 @@ func (c *stmtCache) QueryRowContext(ctx context.Context, query string, args ...a
 // False positives for ';' inside string literals or comments only cause
 // the query to skip the prepared-statement cache (slower, still correct),
 // so the heuristic does not need to be a full SQL parser.
+//
+// The trailing trim is a hand-rolled byte loop rather than
+// strings.TrimRight: a multi-byte cutset makes TrimRight build a 256-bit
+// ASCII set on every call, which pprof showed up as makeASCIISet on the
+// per-statement hot path.
 func isMultiStatement(query string) bool {
-	s := strings.TrimRight(query, " \t\r\n;")
-	return strings.IndexByte(s, ';') >= 0
+	end := len(query)
+	for end > 0 {
+		c := query[end-1]
+		if c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != ';' {
+			break
+		}
+		end--
+	}
+	return strings.IndexByte(query[:end], ';') >= 0
 }
 
 // Close releases every cached statement. Subsequent use is undefined.

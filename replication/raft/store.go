@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -439,10 +440,38 @@ func (s *fileStableStore) save() error {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("stable store: rename: %w", err)
 	}
-	// fsync the parent directory so the rename is durable across a crash.
-	if dir, err := os.Open(filepath.Dir(s.path)); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
+	// fsync the parent directory so the rename is durable across a crash. A
+	// failure is returned: until the directory entry is on disk a crash can
+	// bring the old file back, and Raft must not act on a term or a vote that
+	// could be forgotten.
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("stable store: open dir: %w", err)
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return fmt.Errorf("stable store: sync dir: %w", err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("stable store: close dir: %w", err)
+	}
+	return nil
+}
+
+// put sets key to val, which it takes ownership of, and saves. If the save
+// fails the key is put back as it was, so the map never holds a value that
+// save did not report durable, and a later save cannot write it out as though
+// it had been accepted. The caller holds mu.
+func (s *fileStableStore) put(key string, val []byte) error {
+	old, had := s.kv[key]
+	s.kv[key] = val
+	if err := s.save(); err != nil {
+		if had {
+			s.kv[key] = old
+		} else {
+			delete(s.kv, key)
+		}
+		return err
 	}
 	return nil
 }
@@ -450,8 +479,8 @@ func (s *fileStableStore) save() error {
 func (s *fileStableStore) Set(key []byte, val []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.kv[string(key)] = val
-	return s.save()
+	// Copy: the caller keeps val and may change it afterwards.
+	return s.put(string(key), bytes.Clone(val))
 }
 
 func (s *fileStableStore) Get(key []byte) ([]byte, error) {
@@ -469,8 +498,7 @@ func (s *fileStableStore) SetUint64(key []byte, val uint64) error {
 	defer s.mu.Unlock()
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, val)
-	s.kv[string(key)] = buf
-	return s.save()
+	return s.put(string(key), buf)
 }
 
 func (s *fileStableStore) GetUint64(key []byte) (uint64, error) {

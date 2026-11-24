@@ -28,10 +28,12 @@ func (b *EncryptedBackend) Exists(ctx context.Context) (bool, error) {
 
 // Authenticated reports true to signal to memdb.WrapBackend that this
 // backend already authenticates its payload (via the AES-GCM tag). The
-// adapter uses this to skip the redundant 40-byte MDBK SHA-256 header
-// it would otherwise prepend to every flushed snapshot — pprof showed
-// SHA-256 at ~17% of the encrypted-flush CPU profile, all of it
-// duplicating work GCM already did.
+// adapter uses this to skip the redundant MDBK SHA-256 wrap it would
+// otherwise put around every flushed snapshot — pprof showed SHA-256 at
+// ~17% of the encrypted-flush CPU profile, all of it duplicating work
+// GCM already did. The plaintext it hands to Write instead begins with a
+// 16-byte checkpoint prefix ("MDBC", version, WAL sequence number) ahead
+// of the raw SQLite bytes; it is sealed and authenticated with the rest.
 func (b *EncryptedBackend) Authenticated() bool { return true }
 
 func (b *EncryptedBackend) Write(ctx context.Context, r io.Reader) error {

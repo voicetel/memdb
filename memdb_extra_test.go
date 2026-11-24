@@ -1042,9 +1042,10 @@ func TestSnapshot_Checksum_Corruption(t *testing.T) {
 	}
 }
 
-// TestSnapshot_Checksum_HeaderCorruption verifies that corrupting the stored
-// SHA-256 in the header itself (bytes 8–39) also triggers ErrSnapshotCorrupt.
-func TestSnapshot_Checksum_HeaderCorruption(t *testing.T) {
+// TestSnapshot_Checksum_FirstPayloadByteCorruption verifies that corrupting
+// the first payload byte — the one right after the header, which the trailing
+// SHA-256 covers — triggers ErrSnapshotCorrupt.
+func TestSnapshot_Checksum_FirstPayloadByteCorruption(t *testing.T) {
 	cfg := extraTestConfig(t)
 	db := mustOpen(t, cfg)
 	if _, err := db.Exec(`INSERT INTO kv (key, value) VALUES ('hdr', 'test')`); err != nil {
@@ -1057,26 +1058,74 @@ func TestSnapshot_Checksum_HeaderCorruption(t *testing.T) {
 	}
 	_ = db.Close()
 
-	// Flip a byte inside the SHA-256 field of the header (offset 8).
+	// Flip the first payload byte, just past the [magic][version][walSeq]
+	// header, which the trailing SHA-256 covers.
+	const headerLen = 16
 	path := cfg.FilePath
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	if len(data) < 44 {
-		t.Skipf("snapshot too small (%d bytes) to have a full header", len(data))
+	if len(data) < headerLen+1 {
+		t.Skipf("snapshot too small (%d bytes) to hold a payload byte", len(data))
 	}
-	data[8] ^= 0x01
+	data[headerLen] ^= 0x01
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
 	_, err = memdb.Open(cfg)
 	if err == nil {
-		t.Fatal("expected error from Open with corrupt header, got nil")
+		t.Fatal("expected error from Open with a corrupt first payload byte, got nil")
 	}
 	if !errors.Is(err, memdb.ErrSnapshotCorrupt) {
 		t.Errorf("expected ErrSnapshotCorrupt in chain, got: %v", err)
+	}
+}
+
+// TestSnapshot_HeaderCorruption corrupts the [magic][version] words of the
+// header itself (the payload tests above never touch them) and verifies Open
+// refuses the file each time rather than loading something.
+//
+// The walSeq word is deliberately absent: the trailing SHA-256 covers the
+// payload only, so a flipped checkpoint is not detectable by this format.
+func TestSnapshot_HeaderCorruption(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt func(data []byte)
+		// wantErr is the sentinel Open must return; nil means "any error".
+		wantErr error
+	}{
+		// No longer "MDBK": the file is taken for a legacy raw SQLite file,
+		// which it is not, so SQLite itself rejects it.
+		{"magic", func(d []byte) { d[0] ^= 0xFF }, nil},
+		// 2 → 1: a version-1 reader takes the walSeq word for payload, so the
+		// footer's length and hash no longer match.
+		{"version lowered to 1", func(d []byte) { d[7] = 1 }, memdb.ErrSnapshotCorrupt},
+		// A version this build does not know.
+		{"version raised", func(d []byte) { d[4] ^= 0x80 }, memdb.ErrSnapshotVersion},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, path := writeSnapshotForCorruption(t)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+			tc.corrupt(data)
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			db, err := memdb.Open(cfg)
+			if err == nil {
+				_ = db.Close()
+				t.Fatal("Open succeeded on a snapshot with a corrupt header")
+			}
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Errorf("Open error = %v, want %v in chain", err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -1099,17 +1148,17 @@ func TestSnapshot_Legacy_NoChecksum(t *testing.T) {
 	}
 	_ = db.Close()
 
-	// Strip the snapshot wrapping ([magic][version] prefix at the front,
-	// [payloadLen][sha256] footer at the back), leaving a raw SQLite
-	// file. This simulates a snapshot written by some other tool — or
-	// by a pre-wrapping version of memdb — that begins directly with
-	// the SQLite header bytes.
+	// Strip the snapshot wrapping ([magic][version][walSeq] prefix at the
+	// front, [payloadLen][sha256] footer at the back), leaving a raw SQLite
+	// file. This simulates a snapshot written by some other tool — or by a
+	// pre-wrapping version of memdb — that begins directly with the SQLite
+	// header bytes.
 	path := cfg.FilePath
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	const prefixLen = 8  // snapPrefixLen: magic(4) + version(4)
+	const prefixLen = 16 // snapHeaderLen: magic(4) + version(4) + walSeq(8)
 	const footerLen = 40 // snapFooterLen: payloadLen(8) + sha256(32)
 	if len(data) < prefixLen+footerLen {
 		t.Skipf("snapshot too small (%d bytes) to strip wrapping", len(data))

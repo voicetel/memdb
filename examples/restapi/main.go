@@ -139,7 +139,15 @@ func main() {
 		}()
 	}
 
+	// stopped closes once both servers have fully shut down. Wait on it,
+	// not just on the listeners: pgSrv.ListenAndServe returns as soon as
+	// its listener closes, which can be before the last handler has
+	// unwound, while Stop returns only when every handler has exited (it
+	// terminates live client sessions rather than waiting for them). The
+	// deferred db.Close must not run underneath a live handler.
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		<-quit
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -152,6 +160,9 @@ func main() {
 	}()
 
 	wg.Wait()
+	if *httpAddr != "" || *pgAddr != "" {
+		<-stopped
+	}
 	log.Print("shutdown complete")
 }
 

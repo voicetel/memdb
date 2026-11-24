@@ -17,8 +17,8 @@ go run ./examples/cluster
 ```
 
 A fresh self-signed TLS cert is generated in-process on every run, so
-there's no setup. The data directory is a `t.TempDir()`-style
-ephemeral path unless you pass `-data /some/dir` to persist it across
+there's no setup. The data directory is a fresh temporary directory,
+removed on exit, unless you pass `-data /some/dir` to persist it across
 runs.
 
 ```
@@ -68,13 +68,13 @@ psql / pgx / lib/pq
   └───────┬───────┘
           │  db.Exec
           ▼
-  ┌───────────────┐  OnExec → node.Exec
+  ┌───────────────┐  OnExecContext → node.ExecResultContext
   │   memdb.DB    │ ─────────────────┐
   │  (per node)   │                  │
   └───────────────┘                  │
           ▲                          │
-          │ ExecDirect (FSM apply)   │
-          │                          ▼
+          │ ExecDirectResult         │
+          │ (FSM apply)              ▼
   ┌─────────────────────────────────────┐
   │  hashicorp/raft over mutual TLS     │
   │  Bind / Forward / consensus         │
@@ -82,13 +82,37 @@ psql / pgx / lib/pq
   └─────────────────────────────────────┘
 ```
 
-## Caveat: rows-affected count
+## Rows-affected count
 
-memdb in Raft mode returns a synthetic `0` for `RowsAffected()` (the
-real count would require an extra round-trip on every write to fetch
-the leader's apply result). Drivers that surface this — psql shows
-`INSERT 0 0` / `UPDATE 0` — are reporting that synthetic count, not a
-failed write. The data is committed and visible.
+The command tag is the real count, on every node: `INSERT 0 3`,
+`UPDATE 1`. `OnExecContext` returns the count from the leader's FSM
+apply (`ExecDirectResult`, exposed to Raft through the adapter's
+`ExecLocalResult`), and a follower gets it back in the forwarding
+response. The older `OnExecResult` hook does the same without the
+caller's context; only the legacy error-only `OnExec` hook reports a
+synthetic `0`.
+
+## Shutdown
+
+Ctrl-C stops the three PG servers, then the three Raft nodes, then
+closes the three DBs.
+
+- `Stop` terminates live client sessions rather than waiting for them
+  to disconnect, and returns once every handler has exited — wait on
+  it, not on `ListenAndServe`, before tearing the DB down.
+- The nodes set `DisableShutdownHandover` because the whole cluster
+  stops at once. Leave it unset in a real deployment: `Shutdown` on a
+  leader then hands leadership to another voter first, so a rolling
+  restart does not leave the cluster leaderless for an election
+  timeout.
+
+## Growing the cluster
+
+Not shown here: a fourth node would start with `NodeConfig.Join` (so
+it does not bootstrap a cluster of its own), the leader would add it
+with `AddVoter`, and every node already running would be told its
+forwarding address with `SetForwardPeer` — `ForwardPeers` is only read
+at start. See the join section of the top-level README.
 
 ## Flags
 
